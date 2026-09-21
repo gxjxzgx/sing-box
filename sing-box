@@ -27,7 +27,12 @@ server_name="sing-box"
 work_dir="/etc/sing-box"
 conf_dir="${work_dir}/conf"
 client_dir="${work_dir}/url.txt"
-export vless_port=${PORT:-$(shuf -i 1000-65000 -n 1)}
+# 仅当环境变量 PORT 存在时预设，否则留给交互输入
+if [ -n "$PORT" ]; then
+    export vless_port="$PORT"
+else
+    export vless_port=""
+fi
 export CFIP=${CFIP:-'cdns.doon.eu.org'} 
 export ARGO_PORT=${ARGO_PORT:-'8001'} 
 export CFPORT=${CFPORT:-'443'} 
@@ -289,7 +294,7 @@ install_singbox() {
     fi
 
     # VLESS-Reality 端口
-    if [ -z "$vless_port" ] || [ "$vless_port" = "${PORT:-}" ]; then
+    if [ -z "$vless_port" ]; then
         if [ -t 0 ]; then
             reading "请输入 VLESS-Reality 端口 (回车随机生成 1000-65000): " input_vless_port
             [ -n "$input_vless_port" ] && vless_port=$input_vless_port
@@ -307,17 +312,7 @@ install_singbox() {
     done
     green "VLESS-Reality 端口: ${purple}${vless_port}${re}"
 
-    # Argo 对外端口
-    if [ -t 0 ]; then
-        reading "请输入 Argo 对外端口 (Nginx 入口，回车默认 ${ARGO_PORT}): " input_argo_port
-        if [ -n "$input_argo_port" ]; then
-            while ! [[ "$input_argo_port" =~ ^[0-9]+$ ]] || [ "$input_argo_port" -lt 1 ] || [ "$input_argo_port" -gt 65535 ]; do
-                red "端口必须为 1-65535 的数字"
-                reading "请重新输入 Argo 对外端口: " input_argo_port
-            done
-            ARGO_PORT=$input_argo_port
-        fi
-    fi
+    # Argo 对外端口使用默认值或环境变量，不再交互输入
     green "Argo 对外端口: ${purple}${ARGO_PORT}${re}"
 
     nginx_port=$(($vless_port + 1))
@@ -914,6 +909,8 @@ manage_service() {
             if command_exists rc-service; then
                 rc-service "$service_name" start
             elif command_exists systemctl; then
+                # 清除可能的 failed 状态，解决停止后无法直接启动的问题
+                systemctl reset-failed "$service_name" 2>/dev/null
                 systemctl daemon-reload
                 systemctl start "$service_name"
             fi
@@ -1169,6 +1166,8 @@ change_config() {
     skyblue "------------"
     green "8. 修改节点ip为ipv6"
     skyblue "------------"
+    green "9. 修改节点前缀名称"
+    skyblue "------------"
     purple "0. 返回主菜单"
     skyblue "------------"
     reading "请输入选择: " choice
@@ -1408,6 +1407,62 @@ IEOF
             fi
             base64 -w 0 "$client_dir" > "${work_dir}/sub.txt" 2>/dev/null || base64 "$client_dir" | tr -d '\n' > "${work_dir}/sub.txt"
            ;;
+        9)
+            # 修改节点前缀名称
+            reading "\n请输入新的节点前缀名称 (回车清空前缀，仅使用 ISP): " new_prefix
+            export node_prefix="$new_prefix"
+
+            if [ -z "$new_prefix" ]; then
+                prefix_display="(仅使用 ISP)"
+            else
+                prefix_display="$new_prefix"
+            fi
+            green "节点前缀已设置为: ${purple}${prefix_display}${re}"
+
+            # 重新生成节点名称
+            if [ ! -f "$client_dir" ]; then
+                red "节点文件不存在"
+                return 1
+            fi
+
+            isp=$(curl -sm 3 -H "User-Agent: Mozilla/5.0" "https://api.ip.sb/geoip" | tr -d '\n' | \
+                awk -F\" '{c="";i="";for(x=1;x<=NF;x++){if($x=="country_code")c=$(x+2);if($x=="isp")i=$(x+2)};if(c&&i)print c"-"i}' | \
+                sed 's/ /_/g' || echo "node")
+
+            if [ -z "$node_prefix" ]; then
+                prefix="$isp"
+            else
+                prefix="${node_prefix}-${isp}"
+            fi
+
+            # 更新各协议节点备注
+            sed -i -E "s|(vless://[^#]+)#.*|\1#${prefix}-vless-reality|" "$client_dir"
+            sed -i -E "s|(hysteria2://[^#]+)#.*|\1#${prefix}-hysteria2|" "$client_dir"
+            sed -i -E "s|(tuic://[^#]+)#.*|\1#${prefix}-tuic|" "$client_dir"
+            sed -i -E "s|(trojan://[^#]+)#.*|\1#${prefix}-argo-trojan|" "$client_dir"
+
+            # 更新 vless-ws argo
+            sed -i -E "s|(vless://[^#]*path=%2Fvless-argo[^#]*)#.*|\1#${prefix}-argo-vless|" "$client_dir"
+            sed -i -E "s|(vless://[^#]*path=/vless-argo[^#]*)#.*|\1#${prefix}-argo-vless|" "$client_dir"
+
+            # 更新 vmess ps 字段
+            vmess_url=$(grep -o 'vmess://[^ ]*' "$client_dir" | head -1)
+            if [ -n "$vmess_url" ]; then
+                encoded="${vmess_url#vmess://}"
+                decoded=$(echo "$encoded" | base64 -d 2>/dev/null)
+                if [ -n "$decoded" ]; then
+                    updated=$(echo "$decoded" | jq --arg ps "${prefix}-argo-vmess" '.ps = $ps' 2>/dev/null)
+                    if [ -n "$updated" ]; then
+                        new_encoded=$(echo "$updated" | base64 -w0 2>/dev/null || echo "$updated" | base64 | tr -d '\n')
+                        sed -i "s|$vmess_url|vmess://$new_encoded|" "$client_dir"
+                    fi
+                fi
+            fi
+
+            base64 -w0 "$client_dir" > "${work_dir}/sub.txt" 2>/dev/null || base64 "$client_dir" | tr -d '\n' > "${work_dir}/sub.txt"
+            green "\n节点前缀已更新，可复制以下节点或更新订阅\n"
+            while IFS= read -r line; do yellow "$line"; done < "$client_dir"
+            ;;
         0) menu ;;
         *) red "无效的选项！\n" ;;
     esac
