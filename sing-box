@@ -712,6 +712,9 @@ EOF
     green "\n\nSurge订阅链接：${purple}https://sublink.eooce.com/surge?config=http://${server_ip}:${nginx_port}/${password}${re}\n"
     $work_dir/qrencode "https://sublink.eooce.com/surge?config=http://${server_ip}:${nginx_port}/${password}"
     yellow "\n==========================================================================================\n"
+
+    # 推送节点到 Telegram（若已启用）
+    send_tg_nodes 2>/dev/null || true
 }
 
 # nginx订阅配置 + Argo隧道多协议路径分流（同一端口）
@@ -1054,6 +1057,296 @@ EOF
     [ -s /usr/bin/sb ] && green "\n快捷指令 sb 创建成功\n" || red "\n快捷指令创建失败\n"
 }
 
+
+# =========================
+# Telegram 通知模块
+# =========================
+tg_conf_file="${work_dir}/tg.conf"
+
+load_tg_config() {
+    # 优先配置文件，未设置时再读取环境变量 BOT_TOKEN / CHAT_ID
+    TG_BOT_TOKEN=""
+    TG_CHAT_ID=""
+    TG_ENABLED=""
+    if [ -f "$tg_conf_file" ]; then
+        # shellcheck source=/dev/null
+        source "$tg_conf_file" 2>/dev/null || true
+    fi
+    # 配置文件未设置的项，回退到环境变量
+    [ -z "$TG_BOT_TOKEN" ] && [ -n "${BOT_TOKEN:-}" ] && TG_BOT_TOKEN="$BOT_TOKEN"
+    [ -z "$TG_CHAT_ID" ] && [ -n "${CHAT_ID:-}" ] && TG_CHAT_ID="$CHAT_ID"
+    # TG_ENABLED：配置文件已写则尊重；未写且 Token+ChatID 齐全则默认启用
+    if [ -z "$TG_ENABLED" ]; then
+        if [ -n "$TG_BOT_TOKEN" ] && [ -n "$TG_CHAT_ID" ]; then
+            TG_ENABLED="1"
+        else
+            TG_ENABLED="0"
+        fi
+    fi
+}
+
+save_tg_config() {
+    mkdir -p "$(dirname "$tg_conf_file")"
+    cat > "$tg_conf_file" << TGEOF
+TG_BOT_TOKEN="${TG_BOT_TOKEN}"
+TG_CHAT_ID="${TG_CHAT_ID}"
+TG_ENABLED="${TG_ENABLED}"
+TGEOF
+    chmod 600 "$tg_conf_file"
+}
+
+# 发送 Telegram 文本消息
+send_tg_msg() {
+    local msg="$1"
+    load_tg_config
+    if [ "$TG_ENABLED" != "1" ] || [ -z "$TG_BOT_TOKEN" ] || [ -z "$TG_CHAT_ID" ]; then
+        return 1
+    fi
+    # Telegram 消息最长约 4096，超长截断
+    if [ ${#msg} -gt 4000 ]; then
+        msg="${msg:0:4000}...(已截断)"
+    fi
+    curl -sS -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
+        --data-urlencode "chat_id=${TG_CHAT_ID}" \
+        --data-urlencode "text=${msg}" \
+        --data-urlencode "disable_web_page_preview=true" \
+        >/dev/null 2>&1
+}
+
+# 获取服务纯文本状态（无颜色码，供 TG 推送使用）
+get_plain_status() {
+    local service_name="$1"
+    local service_file="$2"
+    if [ "$service_name" = "nginx" ]; then
+        command_exists nginx || { echo "not installed"; return 2; }
+    else
+        [ -z "$service_file" ] || [ ! -f "$service_file" ] && { echo "not installed"; return 2; }
+    fi
+    if command_exists apk; then
+        rc-service "${service_name}" status 2>/dev/null | grep -q "started" && echo "running" || echo "not running"
+    else
+        systemctl is-active "${service_name}" 2>/dev/null | grep -q "^active$" && echo "running" || echo "not running"
+    fi
+}
+
+# 发送当前节点信息到 Telegram（含 sing-box / Argo / Nginx 状态）
+send_tg_nodes() {
+    load_tg_config
+    if [ "$TG_ENABLED" != "1" ] || [ -z "$TG_BOT_TOKEN" ] || [ -z "$TG_CHAT_ID" ]; then
+        return 1
+    fi
+    if [ ! -f "$client_dir" ]; then
+        return 1
+    fi
+
+    local server_ip hostname_info node_text
+    server_ip=$(get_realip 2>/dev/null || echo "unknown")
+    hostname_info=$(hostname 2>/dev/null || echo "server")
+    node_text=$(cat "$client_dir" 2>/dev/null)
+
+    local sb_status argo_status nginx_status
+    sb_status=$(get_plain_status "sing-box" "${work_dir}/${server_name}")
+    argo_status=$(get_plain_status "argo" "${work_dir}/argo")
+    nginx_status=$(get_plain_status "nginx" "$(command -v nginx 2>/dev/null)")
+
+    local msg
+    msg="📡 sing-box 节点通知
+主机: ${hostname_info}
+IP: ${server_ip}
+时间: $(date '+%Y-%m-%d %H:%M:%S')
+
+—— 服务状态 ——
+sing-box: ${sb_status}
+Argo: ${argo_status}
+Nginx: ${nginx_status}
+
+—— 节点列表 ——
+${node_text}"
+
+    send_tg_msg "$msg" && green "节点信息已推送到 Telegram" || yellow "Telegram 推送失败（请检查 Token/ChatID）"
+}
+
+# 配置 Telegram
+setup_telegram() {
+    load_tg_config
+    clear
+    echo ""
+    green "=== Telegram 通知设置 ===\n"
+    if [ "$TG_ENABLED" = "1" ] && [ -n "$TG_BOT_TOKEN" ]; then
+        green "当前状态: ${green}已启用${re}"
+        yellow "Bot Token: ${TG_BOT_TOKEN:0:10}********"
+        yellow "Chat ID: ${TG_CHAT_ID}"
+    else
+        yellow "当前状态: 未启用"
+    fi
+    echo ""
+    green "1. 配置/修改 Bot Token 与 Chat ID"
+    green "2. 发送测试消息"
+    green "3. 推送当前节点信息"
+    green "4. 开启通知"
+    red   "5. 关闭通知"
+    green "6. 安装/更新离线监控 (可自定义间隔)"
+    red   "7. 卸载离线监控"
+    purple "0. 返回主菜单"
+    skyblue "------------"
+    reading "请输入选择: " tg_choice
+    case "$tg_choice" in
+        1)
+            yellow "配置优先写入 ${work_dir}/tg.conf；未配置时回退读取环境变量 BOT_TOKEN / CHAT_ID"
+            reading "请输入 Telegram Bot Token (回车使用环境变量 BOT_TOKEN): " input_token
+            reading "请输入 Telegram Chat ID (回车使用环境变量 CHAT_ID): " input_chat
+            [ -z "$input_token" ] && input_token="${BOT_TOKEN:-}"
+            [ -z "$input_chat" ] && input_chat="${CHAT_ID:-}"
+            if [ -n "$input_token" ] && [ -n "$input_chat" ]; then
+                TG_BOT_TOKEN="$input_token"
+                TG_CHAT_ID="$input_chat"
+                TG_ENABLED="1"
+                save_tg_config
+                green "已保存到配置文件并启用 Telegram 通知"
+                send_tg_msg "✅ sing-box Telegram 通知已配置成功
+主机: $(hostname)
+时间: $(date '+%Y-%m-%d %H:%M:%S')"
+            else
+                red "Token 或 Chat ID 不能为空（可先 export BOT_TOKEN / CHAT_ID，或写入配置文件）"
+            fi
+            ;;
+        2)
+            load_tg_config
+            if send_tg_msg "🔔 sing-box 测试消息
+主机: $(hostname)
+时间: $(date '+%Y-%m-%d %H:%M:%S')"; then
+                green "测试消息已发送，请检查 Telegram"
+            else
+                red "发送失败，请先完成配置并开启通知"
+            fi
+            ;;
+        3)
+            send_tg_nodes
+            ;;
+        4)
+            load_tg_config
+            if [ -z "$TG_BOT_TOKEN" ] || [ -z "$TG_CHAT_ID" ]; then
+                red "请先配置 Bot Token 与 Chat ID"
+            else
+                TG_ENABLED="1"
+                save_tg_config
+                green "已开启 Telegram 通知"
+            fi
+            ;;
+        5)
+            TG_ENABLED="0"
+            save_tg_config
+            yellow "已关闭 Telegram 通知"
+            ;;
+        6)
+            install_tg_monitor
+            ;;
+        7)
+            uninstall_tg_monitor
+            ;;
+        0) return ;;
+        *) red "无效选项" ;;
+    esac
+    read -n 1 -s -r -p $'\n\033[1;91m按任意键返回...\033[0m'
+    setup_telegram
+}
+
+# 离线监控脚本（供 cron 调用）
+install_tg_monitor() {
+    load_tg_config
+    if [ -z "$TG_BOT_TOKEN" ] || [ -z "$TG_CHAT_ID" ]; then
+        red "请先配置 Bot Token 与 Chat ID"
+        return 1
+    fi
+    TG_ENABLED="1"
+    save_tg_config
+
+    reading "请输入检测间隔(分钟，回车默认2，最小1): " mon_min
+    [ -z "$mon_min" ] && mon_min=2
+    if ! [[ "$mon_min" =~ ^[0-9]+$ ]] || [ "$mon_min" -lt 1 ]; then
+        mon_min=2
+    fi
+    green "离线检测间隔: ${purple}每 ${mon_min} 分钟${re}"
+
+    cat > "${work_dir}/tg_monitor.sh" << 'MONEOF'
+#!/bin/bash
+work_dir="/etc/sing-box"
+tg_conf_file="${work_dir}/tg.conf"
+[ -f "$tg_conf_file" ] || exit 0
+# shellcheck source=/dev/null
+source "$tg_conf_file" 2>/dev/null || exit 0
+[ "$TG_ENABLED" = "1" ] || exit 0
+[ -n "$TG_BOT_TOKEN" ] && [ -n "$TG_CHAT_ID" ] || exit 0
+
+send_msg() {
+    curl -sS -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
+        --data-urlencode "chat_id=${TG_CHAT_ID}" \
+        --data-urlencode "text=$1" \
+        --data-urlencode "disable_web_page_preview=true" >/dev/null 2>&1
+}
+
+is_active() {
+    local name="$1"
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl is-active --quiet "$name" && return 0
+    elif command -v rc-service >/dev/null 2>&1; then
+        rc-service "$name" status 2>/dev/null | grep -q started && return 0
+    fi
+    return 1
+}
+
+host=$(hostname 2>/dev/null || echo server)
+now=$(date '+%Y-%m-%d %H:%M:%S')
+state_file="${work_dir}/tg_monitor.state"
+prev_sb=1; prev_argo=1; prev_nginx=1
+[ -f "$state_file" ] && . "$state_file" 2>/dev/null || true
+
+check_svc() {
+    local name="$1" prev="$2" var="$3"
+    local cur=0
+    is_active "$name" && cur=1
+    if [ "$cur" -eq 0 ] && [ "$prev" -eq 1 ]; then
+        send_msg "⚠️ 服务离线提醒
+主机: ${host}
+服务: ${name}
+状态: 已停止/异常
+时间: ${now}"
+    elif [ "$cur" -eq 1 ] && [ "$prev" -eq 0 ]; then
+        send_msg "✅ 服务恢复通知
+主机: ${host}
+服务: ${name}
+状态: 已恢复运行
+时间: ${now}"
+    fi
+    eval "$var=$cur"
+}
+
+check_svc sing-box "$prev_sb" cur_sb
+check_svc argo "$prev_argo" cur_argo
+check_svc nginx "$prev_nginx" cur_nginx
+
+cat > "$state_file" << SEOF
+prev_sb=${cur_sb:-1}
+prev_argo=${cur_argo:-1}
+prev_nginx=${cur_nginx:-1}
+SEOF
+MONEOF
+    chmod +x "${work_dir}/tg_monitor.sh"
+
+    # 写入 crontab
+    local cron_line="*/${mon_min} * * * * ${work_dir}/tg_monitor.sh >/dev/null 2>&1"
+    (crontab -l 2>/dev/null | grep -v "tg_monitor.sh"; echo "$cron_line") | crontab -
+    green "离线监控已安装（每 ${mon_min} 分钟检测 sing-box / argo / nginx）"
+    yellow "状态变化时会推送离线/恢复通知到 Telegram"
+}
+
+uninstall_tg_monitor() {
+    crontab -l 2>/dev/null | grep -v "tg_monitor.sh" | crontab - 2>/dev/null || true
+    rm -f "${work_dir}/tg_monitor.sh" "${work_dir}/tg_monitor.state"
+    green "离线监控已卸载"
+}
+
+
 # 适配alpine
 change_hosts() {
     sh -c 'echo "0 0" > /proc/sys/net/ipv4/ping_group_range'
@@ -1190,39 +1483,72 @@ change_config() {
                 1)
                     reading "\n请输入vless-reality端口 (回车跳过将使用随机端口): " new_port
                     [ -z "$new_port" ] && new_port=$(shuf -i 2000-65000 -n 1)
-                    jq --arg port "$new_port" \
-                       '(.inbounds[] | select(.type == "vless").listen_port) = ($port | tonumber)' \
-                       "$inbounds_file" > "${inbounds_file}.tmp" && mv "${inbounds_file}.tmp" "$inbounds_file"
-                    restart_singbox
+                    # 仅修改 tag=vless-reality，避免误改 vless-ws
+                    if ! jq --argjson port "$new_port" \
+                        '(.inbounds[] | select(.tag == "vless-reality")).listen_port = $port' \
+                        "$inbounds_file" > "${inbounds_file}.tmp"; then
+                        red "配置修改失败，请检查 jq 与配置文件"
+                        rm -f "${inbounds_file}.tmp"
+                        return 1
+                    fi
+                    # 校验配置合法性
+                    if ! "${work_dir}/sing-box" check -C "${conf_dir}" >/dev/null 2>&1; then
+                        red "配置校验失败，已回滚"
+                        rm -f "${inbounds_file}.tmp"
+                        return 1
+                    fi
+                    mv "${inbounds_file}.tmp" "$inbounds_file"
                     allow_port $new_port/tcp > /dev/null 2>&1
-                    sed -i 's/\(vless:\/\/[^@]*@[^:]*:\)[0-9]\{1,\}/\1'"$new_port"'/' $client_dir
-                    base64 -w0 /etc/sing-box/url.txt > /etc/sing-box/sub.txt
+                    restart_singbox
+                    # 仅更新 reality 直连节点端口（排除 argo 的 vless-ws）
+                    sed -i -E "/vless:\/\/.*flow=xtls-rprx-vision/s/(@[^:]+:)[0-9]+/\1${new_port}/" "$client_dir"
+                    base64 -w0 "$client_dir" > "${work_dir}/sub.txt" 2>/dev/null || base64 "$client_dir" | tr -d '\n' > "${work_dir}/sub.txt"
                     while IFS= read -r line; do yellow "$line"; done < ${work_dir}/url.txt
                     green "\nvless-reality端口已修改成：${purple}$new_port${re}\n"
                     ;;
                 2)
                     reading "\n请输入hysteria2端口 (回车跳过将使用随机端口): " new_port
                     [ -z "$new_port" ] && new_port=$(shuf -i 2000-65000 -n 1)
-                    jq --arg port "$new_port" \
-                       '(.inbounds[] | select(.type == "hysteria2").listen_port) = ($port | tonumber)' \
-                       "$inbounds_file" > "${inbounds_file}.tmp" && mv "${inbounds_file}.tmp" "$inbounds_file"
-                    restart_singbox
+                    if ! jq --argjson port "$new_port" \
+                        '(.inbounds[] | select(.tag == "hysteria2")).listen_port = $port' \
+                        "$inbounds_file" > "${inbounds_file}.tmp"; then
+                        red "配置修改失败"
+                        rm -f "${inbounds_file}.tmp"
+                        return 1
+                    fi
+                    if ! "${work_dir}/sing-box" check -C "${conf_dir}" >/dev/null 2>&1; then
+                        red "配置校验失败，已回滚"
+                        rm -f "${inbounds_file}.tmp"
+                        return 1
+                    fi
+                    mv "${inbounds_file}.tmp" "$inbounds_file"
                     allow_port $new_port/udp > /dev/null 2>&1
-                    sed -i 's/\(hysteria2:\/\/[^@]*@[^:]*:\)[0-9]\{1,\}/\1'"$new_port"'/' $client_dir
-                    base64 -w0 $client_dir > /etc/sing-box/sub.txt
+                    restart_singbox
+                    sed -i -E "s#(hysteria2://[^@]+@[^:]+:)[0-9]+#\1${new_port}#" "$client_dir"
+                    base64 -w0 "$client_dir" > "${work_dir}/sub.txt" 2>/dev/null || base64 "$client_dir" | tr -d '\n' > "${work_dir}/sub.txt"
                     while IFS= read -r line; do yellow "$line"; done < ${work_dir}/url.txt
                     green "\nhysteria2端口已修改为：${purple}${new_port}${re}\n"
                     ;;
                 3)
                     reading "\n请输入tuic端口 (回车跳过将使用随机端口): " new_port
                     [ -z "$new_port" ] && new_port=$(shuf -i 2000-65000 -n 1)
-                    jq --arg port "$new_port" \
-                       '(.inbounds[] | select(.type == "tuic").listen_port) = ($port | tonumber)' \
-                       "$inbounds_file" > "${inbounds_file}.tmp" && mv "${inbounds_file}.tmp" "$inbounds_file"
-                    restart_singbox
+                    if ! jq --argjson port "$new_port" \
+                        '(.inbounds[] | select(.tag == "tuic")).listen_port = $port' \
+                        "$inbounds_file" > "${inbounds_file}.tmp"; then
+                        red "配置修改失败"
+                        rm -f "${inbounds_file}.tmp"
+                        return 1
+                    fi
+                    if ! "${work_dir}/sing-box" check -C "${conf_dir}" >/dev/null 2>&1; then
+                        red "配置校验失败，已回滚"
+                        rm -f "${inbounds_file}.tmp"
+                        return 1
+                    fi
+                    mv "${inbounds_file}.tmp" "$inbounds_file"
                     allow_port $new_port/udp > /dev/null 2>&1
-                    sed -i 's/\(tuic:\/\/[^@]*@[^:]*:\)[0-9]\{1,\}/\1'"$new_port"'/' $client_dir
-                    base64 -w0 $client_dir > /etc/sing-box/sub.txt
+                    restart_singbox
+                    sed -i -E "s#(tuic://[^@]+@[^:]+:)[0-9]+#\1${new_port}#" "$client_dir"
+                    base64 -w0 "$client_dir" > "${work_dir}/sub.txt" 2>/dev/null || base64 "$client_dir" | tr -d '\n' > "${work_dir}/sub.txt"
                     while IFS= read -r line; do yellow "$line"; done < ${work_dir}/url.txt
                     green "\ntuic端口已修改为：${purple}${new_port}${re}\n"
                     ;;
@@ -1721,41 +2047,63 @@ get_quick_tunnel() {
 
 # 更新Argo域名到订阅（同步更新 vmess / vless-ws / trojan-ws）
 change_argo_domain() {
+    if [ -z "$ArgoDomain" ]; then
+        red "ArgoDomain 为空，无法更新节点"
+        return 1
+    fi
+    if [ ! -f "$client_dir" ]; then
+        red "节点文件不存在: $client_dir"
+        return 1
+    fi
+
     content=$(cat "$client_dir")
 
-    # 更新 vmess
-    vmess_url=$(grep -o 'vmess://[^ ]*' "$client_dir" | head -1)
+    # 1. 更新 vmess（host 与 sni）
+    vmess_url=$(grep -o 'vmess://[^[:space:]]*' "$client_dir" | head -1)
     if [ -n "$vmess_url" ]; then
-        vmess_prefix="vmess://"
-        encoded_vmess="${vmess_url#"$vmess_prefix"}"
+        encoded_vmess="${vmess_url#vmess://}"
         decoded_vmess=$(echo "$encoded_vmess" | base64 --decode 2>/dev/null)
-        updated_vmess=$(echo "$decoded_vmess" | jq --arg new_domain "$ArgoDomain" '.host = $new_domain | .sni = $new_domain' 2>/dev/null)
-        if [ -n "$updated_vmess" ]; then
-            encoded_updated_vmess=$(echo "$updated_vmess" | base64 | tr -d '\n')
-            new_vmess_url="${vmess_prefix}${encoded_updated_vmess}"
-            content=$(echo "$content" | sed "s|$vmess_url|$new_vmess_url|")
-            green "vmess节点已更新"
-            purple "$new_vmess_url"
+        if [ -n "$decoded_vmess" ]; then
+            updated_vmess=$(echo "$decoded_vmess" | jq --arg d "$ArgoDomain" '.host = $d | .sni = $d' 2>/dev/null)
+            if [ -n "$updated_vmess" ]; then
+                encoded_updated=$(echo "$updated_vmess" | base64 -w0 2>/dev/null || echo "$updated_vmess" | base64 | tr -d '\n')
+                new_vmess_url="vmess://${encoded_updated}"
+                content=$(echo "$content" | sed "s|$vmess_url|$new_vmess_url|")
+                green "vmess 节点已更新"
+            fi
         fi
     fi
 
-    # 更新 vless-ws 隧道节点 (sni= 与 host=)
-    if grep -q 'path=%2Fvless-argo' "$client_dir" 2>/dev/null || grep -q 'path=/vless-argo' "$client_dir" 2>/dev/null; then
-        content=$(echo "$content" | sed -E "s#(vless://[^@]+@[^:]+:[0-9]+\?[^#]*sni=)[^&]+#\1${ArgoDomain}#g")
-        content=$(echo "$content" | sed -E "s#(vless://[^@]+@[^:]+:[0-9]+\?[^#]*host=)[^&]+#\1${ArgoDomain}#g")
-        green "vless-ws隧道节点已更新"
+    # 2. 更新 vless-ws 隧道节点（sni= 与 host=）
+    if echo "$content" | grep -qE 'path=%2Fvless-argo|path=/vless-argo'; then
+        content=$(echo "$content" | sed -E "s#(vless://[^[:space:]#]*[?&]sni=)[^&[:space:]#]+#\1${ArgoDomain}#g")
+        content=$(echo "$content" | sed -E "s#(vless://[^[:space:]#]*[?&]host=)[^&[:space:]#]+#\1${ArgoDomain}#g")
+        green "vless-ws 隧道节点已更新"
     fi
 
-    # 更新 trojan-ws 隧道节点
-    if grep -q 'path=%2Ftrojan-argo' "$client_dir" 2>/dev/null || grep -q 'path=/trojan-argo' "$client_dir" 2>/dev/null; then
-        content=$(echo "$content" | sed -E "s#(trojan://[^@]+@[^:]+:[0-9]+\?[^#]*sni=)[^&]+#\1${ArgoDomain}#g")
-        content=$(echo "$content" | sed -E "s#(trojan://[^@]+@[^:]+:[0-9]+\?[^#]*host=)[^&]+#\1${ArgoDomain}#g")
-        green "trojan-ws隧道节点已更新"
+    # 3. 更新 trojan-ws 隧道节点（sni= 与 host=）
+    if echo "$content" | grep -qE 'path=%2Ftrojan-argo|path=/trojan-argo'; then
+        content=$(echo "$content" | sed -E "s#(trojan://[^[:space:]#]*[?&]sni=)[^&[:space:]#]+#\1${ArgoDomain}#g")
+        content=$(echo "$content" | sed -E "s#(trojan://[^[:space:]#]*[?&]host=)[^&[:space:]#]+#\1${ArgoDomain}#g")
+        green "trojan-ws 隧道节点已更新"
     fi
 
+    # 写回文件并刷新订阅
     echo "$content" > "$client_dir"
-    base64 -w0 ${work_dir}/url.txt > ${work_dir}/sub.txt
+    base64 -w0 "$client_dir" > "${work_dir}/sub.txt" 2>/dev/null || base64 "$client_dir" | tr -d '\n' > "${work_dir}/sub.txt"
+
+    # 输出全部更新后的节点
     echo ""
+    green "=== 更新后的节点信息 ===\n"
+    while IFS= read -r line; do
+        [ -z "$line" ] && continue
+        echo -e "${purple}${line}${re}"
+    done < "$client_dir"
+    echo ""
+
+
+    # Argo 域名变更后推送节点信息到 Telegram
+    send_tg_nodes 2>/dev/null || true
 }
 
 # 查看节点信息和订阅链接
@@ -2558,6 +2906,115 @@ remove_ss2022() {
 }
 
 # 显示当前已启用的额外协议状态
+
+# ---- VLESS-WS 直连 (path=/vless) ----
+add_vless_ws_direct() {
+    local inbounds_file="${conf_dir}/inbounds.json"
+    local tag="vless-ws-direct"
+
+    if proto_exists "$tag"; then
+        yellow "VLESS-WS 直连协议已存在，无需重复添加。"; sleep 1; return
+    fi
+
+    local current_uuid
+    current_uuid=$(get_current_uuid)
+    if [ -z "$current_uuid" ]; then
+        red "无法获取当前UUID，请确认 sing-box 已正确安装。"; sleep 2; return
+    fi
+
+    while true; do
+        reading "请输入 VLESS-WS 直连监听端口 (回车随机生成): " vw_port
+        if [ -z "$vw_port" ]; then
+            vw_port=$(shuf -i 10000-65000 -n 1)
+            green "VLESS-WS 直连端口：${purple}${vw_port}${re}"
+            break
+        fi
+        if [[ ! "$vw_port" =~ ^[0-9]+$ ]] || [ "$vw_port" -gt 65535 ] || [ "$vw_port" -lt 1 ]; then
+            yellow "错误：端口必须是1-65535之间的数字！"
+            continue
+        fi
+        green "VLESS-WS 直连端口：${purple}${vw_port}${re}"
+        break
+    done
+
+    jq --arg tag "$tag" \
+       --argjson port "$vw_port" \
+       --arg uuid "$current_uuid" \
+       --arg cert "${work_dir}/cert.pem" \
+       --arg key "${work_dir}/private.key" \
+       '.inbounds += [{
+           "type": "vless",
+           "tag": $tag,
+           "listen": "::",
+           "listen_port": $port,
+           "users": [{"uuid": $uuid}],
+           "tls": {
+               "enabled": true,
+               "certificate_path": $cert,
+               "key_path": $key
+           },
+           "transport": {
+               "type": "ws",
+               "path": "/vless",
+               "early_data_header_name": "Sec-WebSocket-Protocol"
+           }
+       }]' "$inbounds_file" > "${inbounds_file}.tmp" && mv "${inbounds_file}.tmp" "$inbounds_file"
+
+    allow_port ${vw_port}/tcp > /dev/null 2>&1
+
+    local server_ip
+    server_ip=$(get_realip)
+    local isp
+    isp=$(curl -sm 3 -H "User-Agent: Mozilla/5.0" "https://api.ip.sb/geoip" | tr -d '\n' \
+        | awk -F\" '{c="";i="";for(x=1;x<=NF;x++){if($x=="country_code")c=$(x+2);if($x=="isp")i=$(x+2)};if(c&&i)print c"-"i}' \
+        | sed 's/ /_/g' || echo "VLESS-WS")
+
+    # 节点前缀
+    local prefix
+    if [ -z "$node_prefix" ]; then
+        prefix="$isp"
+    else
+        prefix="${node_prefix}-${isp}"
+    fi
+
+    local url_line="vless://${current_uuid}@${server_ip}:${vw_port}?encryption=none&security=tls&sni=www.bing.com&fp=firefox&type=ws&host=${server_ip}&path=%2Fvless&allowInsecure=1#${prefix}-vless-ws"
+
+    echo "" >> "${client_dir}"
+    echo "${url_line}" >> "${client_dir}"
+    update_sub
+
+    restart_singbox
+
+    green "\nVLESS-WS 直连协议已添加！"
+    green "端口: ${purple}${vw_port}${re}"
+    green "路径: ${purple}/vless${re}"
+    green "节点链接:\n${purple}${url_line}${re}\n"
+    [ -x "${work_dir}/qrencode" ] && "${work_dir}/qrencode" "$url_line"
+}
+
+remove_vless_ws_direct() {
+    local inbounds_file="${conf_dir}/inbounds.json"
+    local tag="vless-ws-direct"
+
+    if ! proto_exists "$tag"; then
+        yellow "VLESS-WS 直连协议未添加，无需删除。"; sleep 1; return
+    fi
+
+    jq --arg tag "$tag" 'del(.inbounds[] | select(.tag == $tag))' \
+        "$inbounds_file" > "${inbounds_file}.tmp" && mv "${inbounds_file}.tmp" "$inbounds_file"
+
+    # 删除带 path=/vless 或 path=%2Fvless 且非 argo 的直连节点
+    sed -i '/path=%2Fvless[^a-zA-Z]/d; /path=\/vless[^a-zA-Z]/d' "$client_dir" 2>/dev/null
+    # 更精确：删除备注含 vless-ws 且非 argo 的
+    sed -i '/#.*-vless-ws$/d' "$client_dir" 2>/dev/null
+    sed -i '/^$/N;/\n$/D' "$client_dir" 2>/dev/null
+
+    update_sub
+    restart_singbox
+    green "\nVLESS-WS 直连协议已删除\n"
+}
+
+
 show_extra_proto_status() {
     local inbounds_file="${conf_dir}/inbounds.json"
     echo ""
@@ -2593,6 +3050,15 @@ show_extra_proto_status() {
     else
         echo -e " Shadowsocks-2022: ${yellow}未启用${re}"
     fi
+
+    # VLESS-WS 直连
+    if jq -e '.inbounds[] | select(.tag == "vless-ws-direct")' "$inbounds_file" > /dev/null 2>&1; then
+        local vw_port
+        vw_port=$(jq -r '.inbounds[] | select(.tag == "vless-ws-direct") | .listen_port' "$inbounds_file")
+        echo -e " VLESS-WS 直连:    ${green}已启用${re} (端口: ${skyblue}${vw_port}${re}, 路径: ${skyblue}/vless${re})"
+    else
+        echo -e " VLESS-WS 直连:    ${yellow}未启用${re}"
+    fi
     echo ""
 }
 
@@ -2619,6 +3085,10 @@ manage_protocols() {
     green "5. 添加 Shadowsocks-2022 协议"
     red   "6. 删除 Shadowsocks-2022 协议"
     skyblue "-----------------------------"
+    green "--- VLESS-WS 直连 (path=/vless) ---"
+    green "7. 添加 VLESS-WS 直连协议"
+    red   "8. 删除 VLESS-WS 直连协议"
+    skyblue "-----------------------------"
     purple "0. 返回主菜单"
     skyblue "-----------------------------"
     reading "请输入选择: " proto_choice
@@ -2630,6 +3100,8 @@ manage_protocols() {
         4) remove_anytls ;;
         5) add_ss2022 ;;
         6) remove_ss2022 ;;
+        7) add_vless_ws_direct ;;
+        8) remove_vless_ws_direct ;;
         0) menu; return ;;
         *) red "无效的选项！" ;;
     esac
@@ -2665,7 +3137,9 @@ menu() {
     echo "==============="
     green "10. 增加/删除协议"
     echo "==============="
-    purple "11. ssh综合工具箱"
+    green "11. Telegram通知设置"
+    echo "==============="
+    purple "12. ssh综合工具箱"
     echo "==============="
     red "0. 退出脚本"
     echo "==========="
@@ -2711,7 +3185,7 @@ case "$1" in
         # 无参数：进入交互式主菜单
         while true; do
             menu
-            reading "请输入选择(0-11): " choice 
+            reading "请输入选择(0-12): " choice 
             echo ""
             need_pause=true  
             case "${choice}" in
@@ -2752,14 +3226,15 @@ case "$1" in
                 8)  disable_open_sub;   need_pause=true ;;
                 9)  warp_manage;        need_pause=false ;;
                 10) manage_protocols;   need_pause=false ;;
-                11)
+                11) setup_telegram;     need_pause=false ;;
+                12)
                     clear
                     bash <(curl -Ls ssh_tool.eooce.com)
                     need_pause=false
                     ;;
                 0)  exit 0 ;;       
                 *)
-                    red "无效的选项，请输入 0-11"
+                    red "无效的选项，请输入 0-12"
                     need_pause=true
                     ;;
             esac
