@@ -1086,7 +1086,7 @@ create_shortcut() {
 #!/usr/bin/env bash
 # 优先执行本机保存的脚本；不存在时才拉取远程
 LOCAL_SCRIPT="/etc/sing-box/sing-box.sh"
-REMOTE_URL="${SB_REMOTE_URL:-https://raw.githubusercontent.com/eooce/sing-box/main/sing-box.sh}"
+REMOTE_URL="${SB_REMOTE_URL:-https://raw.githubusercontent.com/gxjxzgx/sing-box/refs/heads/main/sing-box1.sh}"
 if [ -f "$LOCAL_SCRIPT" ] && [ -s "$LOCAL_SCRIPT" ]; then
     exec bash "$LOCAL_SCRIPT" "$@"
 else
