@@ -260,6 +260,66 @@ install_singbox() {
         green "cloudflared 版本: ${purple}${argo_ver}${re}"
     fi
 
+    # ---------- 输入：前缀 / UUID / 端口（支持环境变量，交互模式可覆盖） ----------
+    # 前缀
+    if [ -z "$node_prefix" ]; then
+        if [ -t 0 ]; then
+            reading "请输入节点前缀名称 (回车默认使用 ISP 信息): " node_prefix
+        fi
+    fi
+    export node_prefix
+
+    # UUID
+    if [ -z "$uuid" ]; then
+        if [ -t 0 ]; then
+            reading "请输入 UUID (回车随机生成): " uuid
+        fi
+    fi
+    if [ -z "$uuid" ]; then
+        uuid=$(cat /proc/sys/kernel/random/uuid)
+        green "已随机生成 UUID: ${purple}${uuid}${re}"
+    else
+        if ! echo "$uuid" | grep -Eq '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'; then
+            yellow "UUID 格式不正确，已重新随机生成"
+            uuid=$(cat /proc/sys/kernel/random/uuid)
+            green "新 UUID: ${purple}${uuid}${re}"
+        else
+            green "使用 UUID: ${purple}${uuid}${re}"
+        fi
+    fi
+
+    # VLESS-Reality 端口
+    if [ -z "$vless_port" ] || [ "$vless_port" = "${PORT:-}" ]; then
+        if [ -t 0 ]; then
+            reading "请输入 VLESS-Reality 端口 (回车随机生成 1000-65000): " input_vless_port
+            [ -n "$input_vless_port" ] && vless_port=$input_vless_port
+        fi
+    fi
+    if [ -z "$vless_port" ]; then
+        vless_port=$(shuf -i 1000-65000 -n 1)
+    fi
+    while ! [[ "$vless_port" =~ ^[0-9]+$ ]] || [ "$vless_port" -lt 1 ] || [ "$vless_port" -gt 65535 ]; do
+        red "端口必须为 1-65535 的数字"
+        if [ -t 0 ]; then
+            reading "请重新输入 VLESS-Reality 端口: " vless_port
+        fi
+        [ -z "$vless_port" ] && vless_port=$(shuf -i 1000-65000 -n 1)
+    done
+    green "VLESS-Reality 端口: ${purple}${vless_port}${re}"
+
+    # Argo 对外端口
+    if [ -t 0 ]; then
+        reading "请输入 Argo 对外端口 (Nginx 入口，回车默认 ${ARGO_PORT}): " input_argo_port
+        if [ -n "$input_argo_port" ]; then
+            while ! [[ "$input_argo_port" =~ ^[0-9]+$ ]] || [ "$input_argo_port" -lt 1 ] || [ "$input_argo_port" -gt 65535 ]; do
+                red "端口必须为 1-65535 的数字"
+                reading "请重新输入 Argo 对外端口: " input_argo_port
+            done
+            ARGO_PORT=$input_argo_port
+        fi
+    fi
+    green "Argo 对外端口: ${purple}${ARGO_PORT}${re}"
+
     nginx_port=$(($vless_port + 1))
     tuic_port=$(($vless_port + 2))
     hy2_port=$(($vless_port + 3))
@@ -267,7 +327,6 @@ install_singbox() {
     vmess_ws_port=$(($ARGO_PORT + 10))
     vless_ws_port=$(($ARGO_PORT + 11))
     trojan_ws_port=$(($ARGO_PORT + 12))
-    uuid=$(cat /proc/sys/kernel/random/uuid)
     password=$(< /dev/urandom tr -dc 'A-Za-z0-9' | head -c 24)
     output=$(/etc/sing-box/sing-box generate reality-keypair)
     private_key=$(echo "${output}" | awk '/PrivateKey:/ {print $2}')
@@ -605,7 +664,14 @@ get_info() {
 
     green "\nArgoDomain：${purple}$argodomain${re}\n"
 
-    VMESS="{ \"v\": \"2\", \"ps\": \"${isp}\", \"add\": \"${CFIP}\", \"port\": \"${CFPORT}\", \"id\": \"${uuid}\", \"aid\": \"0\", \"scy\": \"auto\", \"net\": \"ws\", \"type\": \"none\", \"host\": \"${argodomain}\", \"path\": \"/vmess-argo?ed=2560\", \"tls\": \"tls\", \"sni\": \"${argodomain}\", \"alpn\": \"\", \"fp\": \"firefox\", \"allowInsecure\": \"false\"}"
+    # 节点前缀处理
+    if [ -z "$node_prefix" ]; then
+        prefix="$isp"
+    else
+        prefix="${node_prefix}-${isp}"
+    fi
+
+    VMESS="{ \"v\": \"2\", \"ps\": \"${prefix}-argo-vmess\", \"add\": \"${CFIP}\", \"port\": \"${CFPORT}\", \"id\": \"${uuid}\", \"aid\": \"0\", \"scy\": \"auto\", \"net\": \"ws\", \"type\": \"none\", \"host\": \"${argodomain}\", \"path\": \"/vmess-argo?ed=2560\", \"tls\": \"tls\", \"sni\": \"${argodomain}\", \"alpn\": \"\", \"fp\": \"firefox\", \"allowInsecure\": \"false\"}"
 
     extra_lines=""
     if [ -f "${client_dir}" ]; then
@@ -614,17 +680,17 @@ get_info() {
 
     # 隧道协议节点（临时隧道默认指向vmess端口；固定隧道可按路径分流到vless/trojan）
     cat > ${work_dir}/url.txt << EOF
-vless://${uuid}@${server_ip}:${vless_port}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=www.iij.ad.jp&fp=firefox&pbk=${public_key}&type=tcp&headerType=none#${isp}
+vless://${uuid}@${server_ip}:${vless_port}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=www.iij.ad.jp&fp=firefox&pbk=${public_key}&type=tcp&headerType=none#${prefix}-vless-reality
 
 vmess://$(echo "$VMESS" | base64 -w0)
 
-vless://${uuid}@${CFIP}:${CFPORT}?encryption=none&security=tls&sni=${argodomain}&fp=firefox&type=ws&host=${argodomain}&path=%2Fvless-argo%3Fed%3D2560#${isp}-vless-ws
+vless://${uuid}@${CFIP}:${CFPORT}?encryption=none&security=tls&sni=${argodomain}&fp=firefox&type=ws&host=${argodomain}&path=%2Fvless-argo%3Fed%3D2560#${prefix}-argo-vless
 
-trojan://${uuid}@${CFIP}:${CFPORT}?security=tls&sni=${argodomain}&fp=firefox&type=ws&host=${argodomain}&path=%2Ftrojan-argo%3Fed%3D2560#${isp}-trojan-ws
+trojan://${uuid}@${CFIP}:${CFPORT}?security=tls&sni=${argodomain}&fp=firefox&type=ws&host=${argodomain}&path=%2Ftrojan-argo%3Fed%3D2560#${prefix}-argo-trojan
 
-hysteria2://${uuid}@${server_ip}:${hy2_port}/?sni=www.bing.com&insecure=1&pinSHA256=${fingerprint}&alpn=h3&obfs=none#${isp}
+hysteria2://${uuid}@${server_ip}:${hy2_port}/?sni=www.bing.com&insecure=1&pinSHA256=${fingerprint}&alpn=h3&obfs=none#${prefix}-hysteria2
 
-tuic://${uuid}:${uuid}@${server_ip}:${tuic_port}?sni=www.bing.com&congestion_control=bbr&udp_relay_mode=native&alpn=h3&allow_insecure=1#${isp}
+tuic://${uuid}:${uuid}@${server_ip}:${tuic_port}?sni=www.bing.com&congestion_control=bbr&udp_relay_mode=native&alpn=h3&allow_insecure=1#${prefix}-tuic
 EOF
 
     if [ -n "$extra_lines" ]; then
@@ -803,42 +869,141 @@ get_current_uuid() {
 }
 
 # 通用服务管理函数
+# 通用服务管理函数（已修复状态检测 + 强制清理残留进程）
 manage_service() {
     local service_name="$1"
     local action="$2"
 
     if [ -z "$service_name" ] || [ -z "$action" ]; then
-        red "缺少服务名或操作参数\n"; return 1
+        red "缺少服务名或操作参数\n"
+        return 1
     fi
 
-    local status=$(check_service "$service_name" 2>/dev/null)
+    # 根据服务名确定检测文件
+    local service_file=""
+    case "$service_name" in
+        "sing-box")
+            service_file="${work_dir}/${server_name}"
+            ;;
+        "argo")
+            service_file="${work_dir}/argo"
+            ;;
+        "nginx")
+            service_file="$(command -v nginx 2>/dev/null)"
+            ;;
+        *)
+            service_file=""
+            ;;
+    esac
+
+    local status
+    status=$(check_service "$service_name" "$service_file" 2>/dev/null)
 
     case "$action" in
         "start")
-            [ "$status" == "running" ] && { yellow "${service_name} 正在运行\n"; return 0; }
-            [ "$status" == "not installed" ] && { yellow "${service_name} 尚未安装!\n"; return 1; }
-            yellow "正在启动 ${service_name} 服务\n"
-            if command_exists rc-service; then rc-service "$service_name" start
-            elif command_exists systemctl; then systemctl daemon-reload && systemctl start "$service_name"; fi
-            [ $? -eq 0 ] && green "${service_name} 服务已成功启动\n" || red "${service_name} 服务启动失败\n"
+            if [[ "$status" == *"running"* ]]; then
+                yellow "${service_name} 已在运行中\n"
+                return 0
+            fi
+            if [[ "$status" == *"not installed"* ]]; then
+                yellow "${service_name} 尚未安装！\n"
+                return 1
+            fi
+
+            yellow "正在启动 ${service_name} 服务...\n"
+            if command_exists rc-service; then
+                rc-service "$service_name" start
+            elif command_exists systemctl; then
+                systemctl daemon-reload
+                systemctl start "$service_name"
+            fi
+
+            sleep 1
+            if pgrep -f "${service_file}" >/dev/null 2>&1 || [[ "$(check_service "$service_name" "$service_file" 2>/dev/null)" == *"running"* ]]; then
+                green "${service_name} 服务已成功启动\n"
+            else
+                red "${service_name} 服务启动失败\n"
+            fi
             ;;
+
         "stop")
-            [ "$status" == "not installed" ] && { yellow "${service_name} 尚未安装！\n"; return 2; }
-            [ "$status" == "not running" ]   && { yellow "${service_name} 未运行\n"; return 1; }
-            yellow "正在停止 ${service_name} 服务\n"
-            if command_exists rc-service; then rc-service "$service_name" stop
-            elif command_exists systemctl; then systemctl stop "$service_name"; fi
-            [ $? -eq 0 ] && green "${service_name} 服务已成功停止\n" || red "${service_name} 服务停止失败\n"
+            if [[ "$status" == *"not installed"* ]]; then
+                yellow "${service_name} 尚未安装！\n"
+                return 2
+            fi
+            if [[ "$status" == *"not running"* ]]; then
+                yellow "${service_name} 当前未运行\n"
+                return 1
+            fi
+
+            yellow "正在停止 ${service_name} 服务...\n"
+
+            # 先正常停止
+            if command_exists rc-service; then
+                rc-service "$service_name" stop
+            elif command_exists systemctl; then
+                systemctl stop "$service_name"
+            fi
+
+            sleep 1
+
+            # 检查并强制清理残留进程
+            local process_pattern=""
+            case "$service_name" in
+                "sing-box") process_pattern="${work_dir}/sing-box" ;;
+                "argo")     process_pattern="${work_dir}/argo" ;;
+                "nginx")    process_pattern="nginx: master process" ;;
+            esac
+
+            if [ -n "$process_pattern" ] && pgrep -f "$process_pattern" >/dev/null 2>&1; then
+                yellow "检测到残留进程，正在强制终止...\n"
+                pkill -15 -f "$process_pattern" 2>/dev/null
+                sleep 1
+                pkill -9 -f "$process_pattern" 2>/dev/null
+                sleep 0.5
+            fi
+
+            # 最终确认
+            if [ -n "$process_pattern" ] && pgrep -f "$process_pattern" >/dev/null 2>&1; then
+                red "${service_name} 停止失败，仍有进程残留，请手动检查\n"
+            else
+                green "${service_name} 服务已彻底停止\n"
+            fi
             ;;
+
         "restart")
-            [ "$status" == "not installed" ] && { yellow "${service_name} 尚未安装！\n"; return 1; }
-            yellow "正在重启 ${service_name} 服务\n"
-            if command_exists rc-service; then rc-service "$service_name" restart
-            elif command_exists systemctl; then systemctl daemon-reload && systemctl restart "$service_name"; fi
-            [ $? -eq 0 ] && green "${service_name} 服务已成功重启\n" || red "${service_name} 服务重启失败\n"
+            if [[ "$status" == *"not installed"* ]]; then
+                yellow "${service_name} 尚未安装！\n"
+                return 1
+            fi
+
+            yellow "正在重启 ${service_name} 服务...\n"
+
+            # 先执行完整停止（含强制清理）
+            manage_service "$service_name" "stop" >/dev/null 2>&1
+
+            sleep 1
+
+            # 再启动
+            if command_exists rc-service; then
+                rc-service "$service_name" start
+            elif command_exists systemctl; then
+                systemctl daemon-reload
+                systemctl start "$service_name"
+            fi
+
+            sleep 1
+            if pgrep -f "${service_file}" >/dev/null 2>&1 || [[ "$(check_service "$service_name" "$service_file" 2>/dev/null)" == *"running"* ]]; then
+                green "${service_name} 服务已成功重启\n"
+            else
+                red "${service_name} 服务重启失败\n"
+            fi
             ;;
+
         *)
-            red "无效的操作: $action\n"; return 1 ;;
+            red "无效的操作: $action\n"
+            return 1
+            ;;
     esac
 }
 
@@ -927,6 +1092,10 @@ auto_install() {
     get_info
     add_nginx_conf
     create_shortcut
+    if command_exists nginx; then
+        restart_nginx
+        green "Nginx 已重启完成"
+    fi
     green "\nsing-box 安装完成\n"
 }
 
@@ -1321,29 +1490,66 @@ disable_open_sub() {
     read -n 1 -s -r -p $'\n\033[1;91m按任意键返回...\033[0m\n'
 }
 
-# singbox 管理
+# singbox 管理（优化版：循环 + 状态刷新）
 manage_singbox() {
-    local singbox_status=$(check_singbox 2>/dev/null)
-    clear; echo ""
-    green "=== sing-box 管理 ===\n"
-    green "sing-box当前状态: $singbox_status\n"
-    green "1. 启动sing-box服务"
-    skyblue "-------------------"
-    green "2. 停止sing-box服务"
-    skyblue "-------------------"
-    green "3. 重启sing-box服务"
-    skyblue "-------------------"
-    purple "0. 返回主菜单"
-    skyblue "------------"
-    reading "\n请输入选择: " choice
-    case "${choice}" in
-        1) start_singbox ;;
-        2) stop_singbox ;;
-        3) restart_singbox ;;
-        0) menu ;;
-        *) red "无效的选项！" && sleep 1 && manage_singbox ;;
-    esac
-    read -n 1 -s -r -p $'\n\033[1;91m按任意键返回...\033[0m\n'
+    while true; do
+        local singbox_status
+        singbox_status=$(check_singbox 2>/dev/null)
+        clear
+        echo ""
+        green "=== sing-box 管理 ===\n"
+        green "当前状态: ${singbox_status}\n"
+        green "1. 启动 sing-box 服务"
+        skyblue "-------------------"
+        green "2. 停止 sing-box 服务"
+        skyblue "-------------------"
+        green "3. 重启 sing-box 服务"
+        skyblue "-------------------"
+        purple "0. 返回主菜单"
+        skyblue "------------"
+        reading "\n请输入选择: " choice
+        echo ""
+        case "${choice}" in
+            1) start_singbox ;;
+            2) stop_singbox ;;
+            3) restart_singbox ;;
+            0) return ;;
+            *) red "无效的选项，请重新输入"; sleep 1; continue ;;
+        esac
+        echo ""
+        read -n 1 -s -r -p $'\033[1;91m按任意键继续...\033[0m'
+    done
+}
+
+# Nginx 管理（与 sing-box 管理风格统一）
+manage_nginx() {
+    while true; do
+        local nginx_status
+        nginx_status=$(check_nginx 2>/dev/null)
+        clear
+        echo ""
+        green "=== Nginx 管理 ===\n"
+        green "当前状态: ${nginx_status}\n"
+        green "1. 启动 Nginx 服务"
+        skyblue "-------------------"
+        green "2. 停止 Nginx 服务"
+        skyblue "-------------------"
+        green "3. 重启 Nginx 服务"
+        skyblue "-------------------"
+        purple "0. 返回主菜单"
+        skyblue "------------"
+        reading "\n请输入选择: " choice
+        echo ""
+        case "${choice}" in
+            1) start_nginx ;;
+            2) manage_service "nginx" "stop" ;;
+            3) restart_nginx ;;
+            0) return ;;
+            *) red "无效的选项，请重新输入"; sleep 1; continue ;;
+        esac
+        echo ""
+        read -n 1 -s -r -p $'\033[1;91m按任意键继续...\033[0m'
+    done
 }
 
 # Argo 管理
@@ -2395,19 +2601,19 @@ menu() {
     echo "==============="
     green "3. sing-box管理"
     green "4. Argo隧道管理"
+    green "5. Nginx管理"
     echo "==============="
-    green "5. 查看节点信息"
-    green "6. 修改节点配置"
-    green "7. 管理节点订阅"
-    green "8. WARP分流管理"
+    green "6. 查看节点信息"
+    green "7. 修改节点配置"
+    green "8. 管理节点订阅"
+    green "9. WARP分流管理"
     echo "==============="
-    green "9. 增加/删除协议"
+    green "10. 增加/删除协议"
     echo "==============="
-    purple "10. ssh综合工具箱"
+    purple "11. ssh综合工具箱"
     echo "==============="
     red "0. 退出脚本"
     echo "==========="
-    # ← 去掉 reading，只负责显示
 }
 
 # 捕获 Ctrl+C
@@ -2450,7 +2656,7 @@ case "$1" in
         # 无参数：进入交互式主菜单
         while true; do
             menu
-            reading "请输入选择(0-10): " choice 
+            reading "请输入选择(0-11): " choice 
             echo ""
             need_pause=true  
             case "${choice}" in
@@ -2475,24 +2681,30 @@ case "$1" in
                         get_info
                         add_nginx_conf
                         create_shortcut
+                        # 安装完成后明确重启 Nginx
+                        if command_exists nginx; then
+                            restart_nginx
+                            green "Nginx 已重启完成"
+                        fi
                     fi
                     ;;
                 2)  uninstall_singbox;  need_pause=false ;;
                 3)  manage_singbox;     need_pause=false ;;
                 4)  manage_argo;        need_pause=true ;;
-                5)  check_nodes;        need_pause=true ;;
-                6)  change_config;      need_pause=true ;;
-                7)  disable_open_sub;   need_pause=true ;;
-                8)  warp_manage;        need_pause=false ;;
-                9)  manage_protocols;   need_pause=false ;;
-                10)
+                5)  manage_nginx;       need_pause=false ;;
+                6)  check_nodes;        need_pause=true ;;
+                7)  change_config;      need_pause=true ;;
+                8)  disable_open_sub;   need_pause=true ;;
+                9)  warp_manage;        need_pause=false ;;
+                10) manage_protocols;   need_pause=false ;;
+                11)
                     clear
                     bash <(curl -Ls ssh_tool.eooce.com)
                     need_pause=false
                     ;;
                 0)  exit 0 ;;       
                 *)
-                    red "无效的选项，请输入 0-10"
+                    red "无效的选项，请输入 0-11"
                     need_pause=true
                     ;;
             esac
