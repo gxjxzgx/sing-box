@@ -367,7 +367,7 @@ install_singbox() {
     # VLESS-Reality 端口（将占用 vless_port ~ +3，以及 ARGO_PORT+13 订阅端口）
     while true; do
         if [ -z "$vless_port" ] && [ -t 0 ]; then
-            reading "请输入 VLESS-Reality 端口 (回车随机；将占用 +0~+3 共4个端口): " input_vless_port
+            reading "请输入端口 (回车随机；将占用 +0~+3 共4个端口): " input_vless_port
             [ -n "$input_vless_port" ] && vless_port=$input_vless_port
         fi
         if [ -z "$vless_port" ]; then
@@ -393,11 +393,11 @@ install_singbox() {
         fi
         break
     done
-    green "VLESS-Reality 端口: ${purple}${vless_port}${re}"
+    green "端口: ${purple}${vless_port}${re}"
     green "将使用端口: Reality=${vless_port}  HY2=$((vless_port+1))  TUIC=$((vless_port+2))  WS直连=$((vless_port+3))  订阅=$((ARGO_PORT+13))"
 
     # Argo 对外端口使用默认值或环境变量，不再交互输入
-    green "Argo 对外端口: ${purple}${ARGO_PORT}${re}"
+    green "Argo 端口: ${purple}${ARGO_PORT}${re}"
 
     # 公网协议端口：Reality / Hysteria2 / TUIC / VLESS-WS直连
     # Reality = vless_port
@@ -790,17 +790,18 @@ get_info() {
     cat > ${work_dir}/url.txt << EOF
 vless://${uuid}@${server_ip}:${vless_port}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=www.iij.ad.jp&fp=firefox&pbk=${public_key}&type=tcp&headerType=none#${prefix}-vless-reality
 
+hysteria2://${uuid}@${server_ip}:${hy2_port}/?sni=www.bing.com&insecure=1&pinSHA256=${fingerprint}&alpn=h3&obfs=none#${prefix}-hysteria2
+
+vless://${uuid}@${server_ip}:${vless_ws_direct_port}?encryption=none&security=tls&sni=www.bing.com&fp=firefox&type=ws&host=${server_ip}&path=%2Fvless&allowInsecure=1#${prefix}-vless-ws
+
+tuic://${uuid}:${uuid}@${server_ip}:${tuic_port}?sni=www.bing.com&congestion_control=bbr&udp_relay_mode=native&alpn=h3&allow_insecure=1#${prefix}-tuic
+
 vmess://$(echo "$VMESS" | base64 -w0)
 
 vless://${uuid}@${CFIP}:${CFPORT}?encryption=none&security=tls&sni=${argodomain}&fp=firefox&type=ws&host=${argodomain}&path=%2Fvless-argo%3Fed%3D2560#${prefix}-argo-vless
 
 trojan://${uuid}@${CFIP}:${CFPORT}?security=tls&sni=${argodomain}&fp=firefox&type=ws&host=${argodomain}&path=%2Ftrojan-argo%3Fed%3D2560#${prefix}-argo-trojan
 
-hysteria2://${uuid}@${server_ip}:${hy2_port}/?sni=www.bing.com&insecure=1&pinSHA256=${fingerprint}&alpn=h3&obfs=none#${prefix}-hysteria2
-
-vless://${uuid}@${server_ip}:${vless_ws_direct_port}?encryption=none&security=tls&sni=www.bing.com&fp=firefox&type=ws&host=${server_ip}&path=%2Fvless&allowInsecure=1#${prefix}-vless-ws
-
-tuic://${uuid}:${uuid}@${server_ip}:${tuic_port}?sni=www.bing.com&congestion_control=bbr&udp_relay_mode=native&alpn=h3&allow_insecure=1#${prefix}-tuic
 EOF
 
     if [ -n "$extra_lines" ]; then
@@ -1178,7 +1179,7 @@ create_shortcut() {
 #!/usr/bin/env bash
 # 优先执行本机保存的脚本；不存在时才拉取远程
 LOCAL_SCRIPT="/etc/sing-box/sing-box.sh"
-REMOTE_URL="${SB_REMOTE_URL:-https://raw.githubusercontent.com/eooce/sing-box/main/sing-box.sh}"
+REMOTE_URL="${SB_REMOTE_URL:-https://raw.githubusercontent.com/gxjxzgx/sing-box/refs/heads/main/sing-box1.sh}"
 if [ -f "$LOCAL_SCRIPT" ] && [ -s "$LOCAL_SCRIPT" ]; then
     exec bash "$LOCAL_SCRIPT" "$@"
 else
