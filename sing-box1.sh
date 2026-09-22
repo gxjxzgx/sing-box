@@ -194,20 +194,33 @@ manage_packages() {
 
 # 获取ip
 get_realip() {
-    ip=$(curl -4 -sm 2 ip.sb)
-    ipv6() { curl -6 -sm 2 ip.sb; }
-    if [ -z "$ip" ]; then
-        echo "[$(ipv6)]"
-    else
-        if curl -4 -sm 2 http://ipinfo.io/org | grep -qE 'Cloudflare|UnReal|AEZA|Andrei'; then
-            echo "[$(ipv6)]"
-        else
-            if grep -qE '^\s*precedence\s+::ffff:0:0/96\s+100' "/etc/gai.conf" 2>/dev/null; then
-                echo "$ip"
+    # 优先返回 IPv4（节点/订阅地址默认用 IPv4）
+    # 仅当无可用 IPv4，或 IPv4 为 WARP/特殊线路不可直连时，才回退到 IPv6
+    local ip v6 org
+    ip=$(curl -4 -sm 2 ip.sb 2>/dev/null)
+    ipv6() { curl -6 -sm 2 ip.sb 2>/dev/null; }
+
+    if [ -n "$ip" ]; then
+        # 检测 IPv4 是否为 Cloudflare WARP 等不可作直连地址的 IP
+        org=$(curl -4 -sm 2 http://ipinfo.io/org 2>/dev/null)
+        if echo "$org" | grep -qE 'Cloudflare|UnReal|AEZA|Andrei'; then
+            # IPv4 不可用，尝试 IPv6
+            v6=$(ipv6)
+            if [ -n "$v6" ]; then
+                echo "[$v6]"
             else
-                v6=$(ipv6)
-                [ -n "$v6" ] && echo "[$v6]" || echo "$ip"
+                echo "$ip"   # 没有 IPv6 时仍返回 IPv4
             fi
+        else
+            echo "$ip"       # 正常 IPv4，优先使用
+        fi
+    else
+        # 无 IPv4，使用 IPv6
+        v6=$(ipv6)
+        if [ -n "$v6" ]; then
+            echo "[$v6]"
+        else
+            echo "127.0.0.1"
         fi
     fi
 }
@@ -308,11 +321,79 @@ install_singbox() {
 
     [ ! -d "${work_dir}" ] && mkdir -p "${work_dir}" && chmod 777 "${work_dir}" && mkdir -p "${conf_dir}"
 
-    # sing-box 与 qrencode 仍使用镜像
-    curl -sLo "${work_dir}/qrencode" "https://$ARCH.eooce.com/qrencode"
-    curl -sLo "${work_dir}/sing-box" "https://$ARCH.eooce.com/sb"
+    # ---------- 下载 sing-box（优先官方 GitHub，失败回退镜像） ----------
+    purple "正在下载最新版 sing-box (官方优先)..."
+    SB_ARCH="${ARCH}"
+    download_singbox_official() {
+        local tmpdir version tarball url bin
+        tmpdir=$(mktemp -d)
+        # 获取最新稳定版 tag
+        version=$(curl -sL --connect-timeout 10 --max-time 30 \
+            "https://api.github.com/repos/SagerNet/sing-box/releases/latest" 2>/dev/null \
+            | grep -o '"tag_name":[[:space:]]*"[^"]*"' | head -1 | cut -d'"' -f4 | sed 's/^v//')
+        if [ -z "$version" ]; then
+            version=$(curl -sL --connect-timeout 10 --max-time 30 \
+                "https://github.com/SagerNet/sing-box/releases/latest" 2>/dev/null \
+                | grep -oE 'tag/v[0-9]+\.[0-9]+\.[0-9]+' | head -1 | sed 's|tag/v||')
+        fi
+        [ -z "$version" ] && { rm -rf "$tmpdir"; return 1; }
+        tarball="sing-box-${version}-linux-${SB_ARCH}.tar.gz"
+        url="https://github.com/SagerNet/sing-box/releases/download/v${version}/${tarball}"
+        purple "  版本: ${version}  架构: ${SB_ARCH}"
+        if curl -sL --connect-timeout 15 --max-time 120 -o "${tmpdir}/${tarball}" "$url"; then
+            if tar -tzf "${tmpdir}/${tarball}" >/dev/null 2>&1; then
+                # 解压（兼容是否带目录层级）
+                tar -xzf "${tmpdir}/${tarball}" -C "$tmpdir" 2>/dev/null
+                bin=$(find "$tmpdir" -type f -name "sing-box" 2>/dev/null | head -1)
+                if [ -n "$bin" ] && [ -f "$bin" ]; then
+                    cp -f "$bin" "${work_dir}/sing-box"
+                    chmod +x "${work_dir}/sing-box"
+                    rm -rf "$tmpdir"
+                    return 0
+                fi
+            fi
+        fi
+        rm -rf "$tmpdir"
+        return 1
+    }
+    if download_singbox_official; then
+        sb_ver=$("${work_dir}/sing-box" version 2>/dev/null | head -1 || echo "unknown")
+        green "sing-box 官方下载成功: ${purple}${sb_ver}${re}"
+    else
+        yellow "官方下载失败，回退到镜像源..."
+        if curl -sL --connect-timeout 15 --max-time 120 -o "${work_dir}/sing-box" "https://${ARCH}.eooce.com/sb"; then
+            chmod +x "${work_dir}/sing-box"
+            green "sing-box 镜像下载成功"
+        else
+            red "sing-box 下载失败，请检查网络后重试"
+            exit 1
+        fi
+    fi
 
-    # 隧道(cloudflared)使用 GitHub 官方最新版
+    # ---------- 下载 qrencode（优先系统包，失败回退镜像） ----------
+    purple "正在准备 qrencode..."
+    if command_exists qrencode; then
+        cp "$(command -v qrencode)" "${work_dir}/qrencode" 2>/dev/null || true
+        green "使用系统已安装的 qrencode"
+    else
+        if manage_packages install qrencode 2>/dev/null; then
+            if command_exists qrencode; then
+                cp "$(command -v qrencode)" "${work_dir}/qrencode" 2>/dev/null || true
+                green "已通过包管理器安装 qrencode"
+            fi
+        fi
+    fi
+    if [ ! -x "${work_dir}/qrencode" ]; then
+        yellow "系统安装失败，回退到镜像源下载 qrencode..."
+        if curl -sL --connect-timeout 15 --max-time 60 -o "${work_dir}/qrencode" "https://${ARCH}.eooce.com/qrencode"; then
+            chmod +x "${work_dir}/qrencode"
+            green "qrencode 镜像下载成功"
+        else
+            yellow "qrencode 下载失败，二维码功能将不可用（不影响核心功能）"
+        fi
+    fi
+
+    # ---------- 下载 cloudflared（优先官方，失败回退镜像） ----------
     case "${ARCH}" in
         amd64)  CF_ARCH="amd64" ;;
         386)    CF_ARCH="386" ;;
@@ -325,12 +406,18 @@ install_singbox() {
         -o "${work_dir}/argo" \
         "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${CF_ARCH}"; then
         yellow "官方下载失败，回退到镜像源..."
-        curl -sLo "${work_dir}/argo" "https://$ARCH.eooce.com/bot"
+        curl -sLo "${work_dir}/argo" "https://${ARCH}.eooce.com/bot"
     fi
 
-    chown root:root ${work_dir} && chmod +x ${work_dir}/${server_name} ${work_dir}/argo ${work_dir}/qrencode
+    chown root:root ${work_dir} 2>/dev/null || true
+    chmod +x "${work_dir}/${server_name}" "${work_dir}/argo" 2>/dev/null || true
+    [ -f "${work_dir}/qrencode" ] && chmod +x "${work_dir}/qrencode" 2>/dev/null || true
 
-    # 显示隧道版本
+    # 显示版本信息
+    if [ -x "${work_dir}/sing-box" ]; then
+        sb_ver=$("${work_dir}/sing-box" version 2>/dev/null | head -1 || echo "unknown")
+        green "sing-box 版本: ${purple}${sb_ver}${re}"
+    fi
     if [ -x "${work_dir}/argo" ]; then
         argo_ver=$("${work_dir}/argo" version 2>/dev/null | head -1 || echo "unknown")
         green "cloudflared 版本: ${purple}${argo_ver}${re}"
@@ -816,16 +903,16 @@ EOF
     yellow "如果节点里的ip是ipv6的，可在 修改节点配置 菜单切换ipv4后重新订阅节点\n"
     red "如果hysteria2或tuic不通，请尝试将节点里的 "跳过证书验证" 设置为 "true" 或切换内核\n"
     green "V2rayN,Shadowrocket,Nekobox,Loon,Karing,Sterisand订阅链接：${purple}http://${server_ip}:${nginx_port}/${password}${re}\n"
-    $work_dir/qrencode "http://${server_ip}:${nginx_port}/${password}"
+    [ -x "${work_dir}/qrencode" ] && "${work_dir}/qrencode" "http://${server_ip}:${nginx_port}/${password}"
     yellow "\n=========================================================================================="
     green "\n\nClash,Mihomo系列订阅链接：${purple}https://sublink.eooce.com/clash?config=http://${server_ip}:${nginx_port}/${password}${re}\n"
-    $work_dir/qrencode "https://sublink.eooce.com/clash?config=http://${server_ip}:${nginx_port}/${password}"
+    [ -x "${work_dir}/qrencode" ] && "${work_dir}/qrencode" "https://sublink.eooce.com/clash?config=http://${server_ip}:${nginx_port}/${password}"
     yellow "\n=========================================================================================="
     green "\n\nSing-box订阅链接：${purple}https://sublink.eooce.com/singbox?config=http://${server_ip}:${nginx_port}/${password}${re}\n"
-    $work_dir/qrencode "https://sublink.eooce.com/singbox?config=http://${server_ip}:${nginx_port}/${password}"
+    [ -x "${work_dir}/qrencode" ] && "${work_dir}/qrencode" "https://sublink.eooce.com/singbox?config=http://${server_ip}:${nginx_port}/${password}"
     yellow "\n=========================================================================================="
     green "\n\nSurge订阅链接：${purple}https://sublink.eooce.com/surge?config=http://${server_ip}:${nginx_port}/${password}${re}\n"
-    $work_dir/qrencode "https://sublink.eooce.com/surge?config=http://${server_ip}:${nginx_port}/${password}"
+    [ -x "${work_dir}/qrencode" ] && "${work_dir}/qrencode" "https://sublink.eooce.com/surge?config=http://${server_ip}:${nginx_port}/${password}"
     yellow "\n==========================================================================================\n"
 
     # 推送节点到 Telegram（若已启用）
