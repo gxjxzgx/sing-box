@@ -610,13 +610,14 @@ install_singbox() {
         purple "=== Argo 隧道配置 ==="
         yellow "临时隧道：自动生成 *.trycloudflare.com，无需域名与令牌"
         yellow "固定隧道：需在 Cloudflare Zero Trust 创建隧道，并提供域名 + Token/JSON"
+        yellow "提示：选择固定隧道时，若域名或令牌留空，将自动回退为临时隧道"
         echo ""
         if [ -n "$ARGO_DOMAIN" ] && [ -n "$ARGO_TOKEN" ]; then
             green "检测到环境变量已设置固定隧道域名与令牌，将直接使用"
             ARGO_USE_FIXED=1
         else
-            green "1. 使用临时隧道 (默认，回车即可)"
-            green "2. 使用固定隧道 (需输入域名与令牌)"
+            green "1. 使用临时隧道 (回车默认)"
+            green "2. 使用固定隧道 (可输入域名与令牌；留空则回退临时隧道)"
             reading "请选择隧道类型 [1/2，回车默认1]: " tunnel_choice
             case "${tunnel_choice}" in
                 2)
@@ -629,50 +630,53 @@ install_singbox() {
         fi
 
         if [ "$ARGO_USE_FIXED" = "1" ]; then
-            # 隧道域名
+            # 隧道域名（允许留空，留空则回退）
             if [ -z "$ARGO_DOMAIN" ]; then
-                reading "请输入固定隧道域名 (例如: argo.example.com): " ARGO_DOMAIN
+                reading "请输入固定隧道域名 (例如: argo.example.com，直接回车则回退临时隧道): " ARGO_DOMAIN
             fi
-            while [ -z "$ARGO_DOMAIN" ]; do
-                red "隧道域名不能为空"
-                reading "请输入固定隧道域名: " ARGO_DOMAIN
-            done
-            # 简单校验：不含空格，含点
-            if ! echo "$ARGO_DOMAIN" | grep -Eq '^[a-zA-Z0-9]([a-zA-Z0-9.-]*[a-zA-Z0-9])?(\.[a-zA-Z]{2,})+$'; then
-                yellow "域名格式可能不正确，仍将继续使用: ${ARGO_DOMAIN}"
-            fi
-            green "隧道域名: ${purple}${ARGO_DOMAIN}${re}"
 
-            # 隧道令牌 / JSON
+            # 隧道令牌 / JSON（允许留空，留空则回退）
             if [ -z "$ARGO_TOKEN" ]; then
                 yellow "令牌获取方式："
                 yellow "  - Token: Cloudflare Dashboard → Zero Trust → Networks → Tunnels → 复制 Token"
                 yellow "  - JSON: 可使用 https://fscarmen.cloudflare.now.cc 生成"
-                reading "请输入隧道令牌 (Token) 或 JSON 凭证: " ARGO_TOKEN
+                reading "请输入隧道令牌 (Token) 或 JSON 凭证 (直接回车则回退临时隧道): " ARGO_TOKEN
             fi
-            while [ -z "$ARGO_TOKEN" ]; do
-                red "隧道令牌/凭证不能为空"
-                reading "请输入隧道令牌 (Token) 或 JSON: " ARGO_TOKEN
-            done
-            # 判断类型提示
-            if echo "$ARGO_TOKEN" | grep -q 'TunnelSecret'; then
-                green "检测到 JSON 凭证格式"
-            elif echo "$ARGO_TOKEN" | grep -Eq '^[A-Za-z0-9=]{100,}$'; then
-                green "检测到 Token 格式"
-            else
-                yellow "令牌格式未明确识别，将按输入内容配置，请确认正确性"
-            fi
-            green "已记录固定隧道配置"
 
-            # 持久化到配置文件，供服务启动与后续管理使用
-            mkdir -p "${work_dir}"
-            cat > "${work_dir}/argo_fixed.conf" << ARGOEOF
+            # 域名或令牌为空 → 自动回退临时隧道
+            if [ -z "$ARGO_DOMAIN" ] || [ -z "$ARGO_TOKEN" ]; then
+                yellow "域名或令牌为空，已自动回退为临时隧道 (trycloudflare.com)"
+                ARGO_USE_FIXED=0
+                ARGO_DOMAIN=""
+                ARGO_TOKEN=""
+                rm -f "${work_dir}/argo_fixed.conf" 2>/dev/null || true
+            else
+                # 简单域名格式提示（不强制）
+                if ! echo "$ARGO_DOMAIN" | grep -Eq '^[a-zA-Z0-9]([a-zA-Z0-9.-]*[a-zA-Z0-9])?(\.[a-zA-Z]{2,})+$'; then
+                    yellow "域名格式可能不正确，仍将尝试使用: ${ARGO_DOMAIN}"
+                fi
+                green "隧道域名: ${purple}${ARGO_DOMAIN}${re}"
+
+                # 判断类型提示
+                if echo "$ARGO_TOKEN" | grep -q 'TunnelSecret'; then
+                    green "检测到 JSON 凭证格式"
+                elif echo "$ARGO_TOKEN" | grep -Eq '^[A-Za-z0-9=]{100,}$'; then
+                    green "检测到 Token 格式"
+                else
+                    yellow "令牌格式未明确识别，将按输入内容配置，请确认正确性"
+                fi
+                green "已记录固定隧道配置"
+
+                # 持久化到配置文件
+                mkdir -p "${work_dir}"
+                cat > "${work_dir}/argo_fixed.conf" << ARGOEOF
 ARGO_USE_FIXED=1
 ARGO_DOMAIN="${ARGO_DOMAIN}"
 ARGO_TOKEN='${ARGO_TOKEN}'
 ARGO_PORT="${ARGO_PORT}"
 ARGOEOF
-            chmod 600 "${work_dir}/argo_fixed.conf"
+                chmod 600 "${work_dir}/argo_fixed.conf"
+            fi
         else
             ARGO_USE_FIXED=0
             ARGO_DOMAIN=""
@@ -682,7 +686,7 @@ ARGOEOF
         fi
         export ARGO_USE_FIXED ARGO_DOMAIN ARGO_TOKEN
     else
-        # 非交互模式：若环境变量已提供域名+令牌则启用固定隧道
+        # 非交互模式：若环境变量已提供完整域名+令牌则启用固定隧道，否则临时
         if [ -n "$ARGO_DOMAIN" ] && [ -n "$ARGO_TOKEN" ]; then
             ARGO_USE_FIXED=1
             mkdir -p "${work_dir}"
@@ -978,7 +982,12 @@ _prepare_argo_exec() {
             local tunnel_id
             tunnel_id=$(echo "$ARGO_TOKEN" | grep -o '"TunnelID":"[^"]*"' | head -1 | cut -d'"' -f4)
             [ -z "$tunnel_id" ] && tunnel_id=$(cut -d\" -f12 <<< "$ARGO_TOKEN" 2>/dev/null || true)
-            cat > "${work_dir}/tunnel.yml" << YMLEOF
+            if [ -z "$tunnel_id" ]; then
+                yellow "无法从 JSON 中解析 TunnelID，已回退为临时隧道"
+                ARGO_USE_FIXED=0
+                _ARGO_EXEC_CMD="/etc/sing-box/argo tunnel --url http://localhost:${ARGO_PORT} --no-autoupdate --edge-ip-version auto --protocol http2"
+            else
+                cat > "${work_dir}/tunnel.yml" << YMLEOF
 tunnel: ${tunnel_id}
 credentials-file: ${work_dir}/tunnel.json
 protocol: http2
@@ -990,15 +999,21 @@ ingress:
       noTLSVerify: true
   - service: http_status:404
 YMLEOF
-            _ARGO_EXEC_CMD="/etc/sing-box/argo tunnel --edge-ip-version auto --config /etc/sing-box/tunnel.yml run"
-            green "Argo 服务将使用固定隧道 (JSON) → ${ARGO_DOMAIN}"
+                _ARGO_EXEC_CMD="/etc/sing-box/argo tunnel --edge-ip-version auto --config /etc/sing-box/tunnel.yml run"
+                green "Argo 服务将使用固定隧道 (JSON) → ${ARGO_DOMAIN}"
+            fi
         else
             # Token 方式
             _ARGO_EXEC_CMD="/etc/sing-box/argo tunnel --edge-ip-version auto --no-autoupdate --protocol http2 run --token ${ARGO_TOKEN}"
             green "Argo 服务将使用固定隧道 (Token) → ${ARGO_DOMAIN:-未指定域名}"
         fi
     else
-        # 临时隧道
+        # 临时隧道（含固定配置不完整时的回退）
+        if [ "$ARGO_USE_FIXED" = "1" ]; then
+            yellow "固定隧道配置不完整（缺少令牌），已自动回退为临时隧道"
+            ARGO_USE_FIXED=0
+            rm -f "${work_dir}/argo_fixed.conf" 2>/dev/null || true
+        fi
         _ARGO_EXEC_CMD="/etc/sing-box/argo tunnel --url http://localhost:${ARGO_PORT} --no-autoupdate --edge-ip-version auto --protocol http2"
         green "Argo 服务将使用临时隧道"
     fi
@@ -2508,19 +2523,17 @@ manage_argo() {
                 export ARGO_PORT
             fi
 
-            reading "请输入固定隧道域名 (例如: argo.example.com): " argo_domain
-            while [ -z "$argo_domain" ]; do
-                red "域名不能为空"
-                reading "请输入固定隧道域名: " argo_domain
-            done
+            reading "请输入固定隧道域名 (例如: argo.example.com，直接回车则取消并回退临时隧道): " argo_domain
+            reading "请输入隧道令牌 (Token) 或 JSON 凭证 (直接回车则取消并回退临时隧道): " argo_auth
+
+            if [ -z "$argo_domain" ] || [ -z "$argo_auth" ]; then
+                yellow "域名或令牌为空，已取消固定隧道配置，保持/回退为临时隧道"
+                # 不修改现有服务，直接返回
+                return
+            fi
+
             ArgoDomain=$argo_domain
             ARGO_DOMAIN="$argo_domain"
-
-            reading "请输入隧道令牌 (Token) 或 JSON 凭证: " argo_auth
-            while [ -z "$argo_auth" ]; do
-                red "令牌/凭证不能为空"
-                reading "请输入隧道令牌或 JSON: " argo_auth
-            done
             ARGO_TOKEN="$argo_auth"
             ARGO_USE_FIXED=1
 
