@@ -19,6 +19,8 @@
 #   5. 去掉 ARGO_PORT+13 独立订阅监听
 #   6. 安装时支持交互式输入：隧道端口、固定隧道域名、隧道令牌(Token/JSON)
 #   7. 固定隧道：域名留空直接回退临时隧道，不再询问令牌；令牌留空同样回退
+#   8. 令牌输入支持自动剥离前缀：sudo cloudflared service install / cloudflared.exe ... 等，仅保留 eyJ 开头有效 Token
+#   9. 保持 Argo→Nginx→三WS 架构；统一 Argo 配置辅助函数，清理重复代码
 #
 # 基于: eooce/sing-box  修改日期: 2026.9.22
 # 版本: v2
@@ -62,20 +64,90 @@ command_exists() {
     command -v "$1" >/dev/null 2>&1
 }
 
+# 自动清理 Argo 隧道令牌：去除常见前缀，仅保留有效 Token（通常以 eyJ 开头）
+# 支持粘贴完整命令，例如：
+#   sudo cloudflared service install eyJhbGciOi...
+#   cloudflared.exe service install eyJhbGciOi...
+#   cloudflared tunnel run --token eyJhbGciOi...
+clean_argo_token() {
+    local raw="$1"
+    [ -z "$raw" ] && { echo ""; return; }
+
+    # 若为 JSON 凭证（含 TunnelSecret），原样返回
+    if echo "$raw" | grep -q 'TunnelSecret'; then
+        printf '%s' "$raw"
+        return
+    fi
+
+    # 优先提取以 eyJ 开头的 JWT/Token 片段
+    local token
+    token=$(printf '%s' "$raw" | grep -oE 'eyJ[A-Za-z0-9+/=._-]+' | head -1)
+
+    if [ -n "$token" ]; then
+        # 若提取结果与原始输入不同，说明发生了前缀剥离
+        if [ "$token" != "$raw" ]; then
+            yellow "已自动去除命令前缀，仅保留有效令牌 (eyJ...)" >&2
+        fi
+        printf '%s' "$token"
+        return
+    fi
+
+    # 未匹配到 eyJ：尝试去掉常见 cloudflared install 前缀后返回剩余部分
+    token=$(printf '%s' "$raw" | sed -E \
+        -e 's/^[[:space:]]*//' \
+        -e 's/[[:space:]]*$//' \
+        -e 's/.*(cloudflared(\.exe)?[[:space:]]+service[[:space:]]+install[[:space:]]+)//' \
+        -e 's/.*(cloudflared(\.exe)?[[:space:]]+tunnel[[:space:]]+run[[:space:]]+--token[[:space:]]+)//' \
+        -e 's/^sudo[[:space:]]+//' \
+        -e 's/^[[:space:]]*//' \
+        -e 's/[[:space:]]*$//')
+    printf '%s' "$token"
+}
+
 # 检测端口是否已被占用（tcp/udp 监听）
+# 检测端口是否已被占用（tcp/udp 监听）
+# 优先 /proc/net（Alpine/LXD 容器更可靠），避免 ss/lsof 宽松匹配导致「全端口占用」误报
 port_in_use() {
     local port="$1"
     [ -z "$port" ] && return 1
+    if ! [[ "$port" =~ ^[0-9]+$ ]] || [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
+        return 1
+    fi
+
+    # 1) /proc/net（地址格式: 0100007F:1F90，端口为四位十六进制）
+    local hex
+    hex=$(printf '%04X' "$port" 2>/dev/null) || hex=""
+    if [ -n "$hex" ]; then
+        # 匹配 local_address 或 rem_address 中的 :PORT
+        if grep -qhE ":${hex} " /proc/net/tcp /proc/net/tcp6 /proc/net/udp /proc/net/udp6 2>/dev/null; then
+            return 0
+        fi
+    fi
+
+    # 2) ss：端口后须为非数字或行尾，避免 443 误匹配 4430/1443
     if command_exists ss; then
-        ss -tuln 2>/dev/null | grep -qE "[:.]${port}[[:space:]]" && return 0
+        if ss -tuln 2>/dev/null | grep -qE "[:.]${port}([^0-9]|$)"; then
+            return 0
+        fi
     fi
-    if command_exists lsof; then
-        lsof -iTCP:"$port" -sTCP:LISTEN -t >/dev/null 2>&1 && return 0
-        lsof -iUDP:"$port" -t >/dev/null 2>&1 && return 0
-    fi
+
+    # 3) netstat
     if command_exists netstat; then
-        netstat -tuln 2>/dev/null | grep -qE "[:.]${port}[[:space:]]" && return 0
+        if netstat -tuln 2>/dev/null | grep -qE "[:.]${port}([^0-9]|$)"; then
+            return 0
+        fi
     fi
+
+    # 4) lsof：必须有 PID 输出，不能只看退出码（部分环境无监听也返回 0）
+    if command_exists lsof; then
+        if [ -n "$(lsof -iTCP:"$port" -sTCP:LISTEN -t 2>/dev/null)" ]; then
+            return 0
+        fi
+        if [ -n "$(lsof -iUDP:"$port" -t 2>/dev/null)" ]; then
+            return 0
+        fi
+    fi
+
     return 1
 }
 
@@ -605,6 +677,8 @@ install_singbox() {
     # 交互模式下可覆盖；非交互（-i）时若未设置则默认临时隧道
     export ARGO_DOMAIN="${ARGO_DOMAIN:-}"
     export ARGO_TOKEN="${ARGO_TOKEN:-}"
+    # 环境变量中的令牌同样做前缀清理
+    [ -n "$ARGO_TOKEN" ] && ARGO_TOKEN=$(clean_argo_token "$ARGO_TOKEN")
     export ARGO_USE_FIXED="${ARGO_USE_FIXED:-0}"
 
     if [ -t 0 ]; then
@@ -625,74 +699,48 @@ install_singbox() {
 
             if [ -z "$ARGO_DOMAIN" ]; then
                 yellow "域名为空，已自动回退为临时隧道 (trycloudflare.com)"
-                ARGO_USE_FIXED=0
-                ARGO_TOKEN=""
-                rm -f "${work_dir}/argo_fixed.conf" 2>/dev/null || true
+                clear_argo_fixed_conf
             else
-                # 域名已填写，再询问令牌
                 if [ -z "$ARGO_TOKEN" ]; then
                     yellow "令牌获取：Cloudflare Zero Trust → Networks → Tunnels → 复制 Token；或使用 JSON 凭证"
+                    yellow "可直接粘贴完整命令，脚本会自动去除前缀仅保留 eyJ 开头的有效令牌"
                     reading "请输入隧道令牌 (Token) 或 JSON 凭证 (直接回车则使用临时隧道): " ARGO_TOKEN
+                    ARGO_TOKEN=$(clean_argo_token "$ARGO_TOKEN")
                 fi
-
                 if [ -z "$ARGO_TOKEN" ]; then
                     yellow "令牌为空，已自动回退为临时隧道 (trycloudflare.com)"
-                    ARGO_USE_FIXED=0
-                    ARGO_DOMAIN=""
-                    ARGO_TOKEN=""
-                    rm -f "${work_dir}/argo_fixed.conf" 2>/dev/null || true
+                    clear_argo_fixed_conf
                 else
                     ARGO_USE_FIXED=1
                 fi
             fi
         fi
 
-        # 最终确认并保存固定隧道配置
         if [ "$ARGO_USE_FIXED" = "1" ] && [ -n "$ARGO_DOMAIN" ] && [ -n "$ARGO_TOKEN" ]; then
             if ! echo "$ARGO_DOMAIN" | grep -Eq '^[a-zA-Z0-9]([a-zA-Z0-9.-]*[a-zA-Z0-9])?(\.[a-zA-Z]{2,})+$'; then
                 yellow "域名格式可能不正确，仍将尝试使用: ${ARGO_DOMAIN}"
             fi
             green "隧道域名: ${purple}${ARGO_DOMAIN}${re}"
-
             if echo "$ARGO_TOKEN" | grep -q 'TunnelSecret'; then
                 green "检测到 JSON 凭证格式"
             elif echo "$ARGO_TOKEN" | grep -Eq '^[A-Za-z0-9=]{100,}$'; then
                 green "检测到 Token 格式"
             else
-                yellow "令牌格式未明确识别，将按输入内容配置，请确认正确性"
+                yellow "令牌格式未明确识别，将按输入内容配置"
             fi
-            green "已记录固定隧道配置"
-
-            mkdir -p "${work_dir}"
-            cat > "${work_dir}/argo_fixed.conf" << ARGOEOF
-ARGO_USE_FIXED=1
-ARGO_DOMAIN="${ARGO_DOMAIN}"
-ARGO_TOKEN='${ARGO_TOKEN}'
-ARGO_PORT="${ARGO_PORT}"
-ARGOEOF
-            chmod 600 "${work_dir}/argo_fixed.conf"
+            save_argo_fixed_conf
+            green "已记录固定隧道配置（流量: Cloudflare → Nginx:${ARGO_PORT} → 三协议）"
         else
-            ARGO_USE_FIXED=0
-            ARGO_DOMAIN=""
-            ARGO_TOKEN=""
-            rm -f "${work_dir}/argo_fixed.conf" 2>/dev/null || true
+            clear_argo_fixed_conf
         fi
         export ARGO_USE_FIXED ARGO_DOMAIN ARGO_TOKEN
     else
-        # 非交互模式：环境变量完整则固定隧道，否则临时
         if [ -n "$ARGO_DOMAIN" ] && [ -n "$ARGO_TOKEN" ]; then
             ARGO_USE_FIXED=1
-            mkdir -p "${work_dir}"
-            cat > "${work_dir}/argo_fixed.conf" << ARGOEOF
-ARGO_USE_FIXED=1
-ARGO_DOMAIN="${ARGO_DOMAIN}"
-ARGO_TOKEN='${ARGO_TOKEN}'
-ARGO_PORT="${ARGO_PORT}"
-ARGOEOF
-            chmod 600 "${work_dir}/argo_fixed.conf"
+            save_argo_fixed_conf
             green "非交互模式：已启用固定隧道 ${purple}${ARGO_DOMAIN}${re}"
         else
-            ARGO_USE_FIXED=0
+            clear_argo_fixed_conf
             green "非交互模式：使用临时隧道"
         fi
         export ARGO_USE_FIXED
@@ -957,27 +1005,54 @@ EOF
 EOF
 }
 
-# 根据当前 ARGO_USE_FIXED / ARGO_TOKEN 生成 argo 服务配置内容
-# 输出：设置全局变量 _ARGO_EXEC_CMD（供 systemd / openrc 使用）
-_prepare_argo_exec() {
-    # 优先读取持久化配置
+# ---------- Argo 配置辅助（统一入口，避免多处重复写 conf / 服务单元）----------
+# 架构固定：cloudflared → Nginx(ARGO_PORT) → 三个本机 WS 端口
+
+# 保存固定隧道配置
+save_argo_fixed_conf() {
+    mkdir -p "${work_dir}"
+    cat > "${work_dir}/argo_fixed.conf" << ARGOEOF
+ARGO_USE_FIXED=1
+ARGO_DOMAIN="${ARGO_DOMAIN}"
+ARGO_TOKEN='${ARGO_TOKEN}'
+ARGO_PORT="${ARGO_PORT}"
+ARGOEOF
+    chmod 600 "${work_dir}/argo_fixed.conf"
+}
+
+# 清除固定隧道配置（切回临时隧道时调用）
+clear_argo_fixed_conf() {
+    ARGO_USE_FIXED=0
+    ARGO_DOMAIN=""
+    ARGO_TOKEN=""
+    export ARGO_USE_FIXED ARGO_DOMAIN ARGO_TOKEN
+    rm -f "${work_dir}/argo_fixed.conf" "${work_dir}/tunnel.json" "${work_dir}/tunnel.yml" 2>/dev/null || true
+}
+
+# 加载已保存的固定隧道配置（若存在）
+load_argo_fixed_conf() {
     if [ -f "${work_dir}/argo_fixed.conf" ]; then
         # shellcheck source=/dev/null
         source "${work_dir}/argo_fixed.conf" 2>/dev/null || true
     fi
     ARGO_USE_FIXED="${ARGO_USE_FIXED:-0}"
     ARGO_PORT="${ARGO_PORT:-8001}"
+}
+
+# 根据当前 ARGO_USE_FIXED / ARGO_TOKEN 生成 argo 启动命令
+# 输出：全局变量 _ARGO_EXEC_CMD（始终指向 Nginx 入口 ARGO_PORT）
+_prepare_argo_exec() {
+    load_argo_fixed_conf
 
     if [ "$ARGO_USE_FIXED" = "1" ] && [ -n "${ARGO_TOKEN:-}" ]; then
         if echo "$ARGO_TOKEN" | grep -q 'TunnelSecret'; then
-            # JSON 凭证方式
             echo "$ARGO_TOKEN" > "${work_dir}/tunnel.json"
             local tunnel_id
             tunnel_id=$(echo "$ARGO_TOKEN" | grep -o '"TunnelID":"[^"]*"' | head -1 | cut -d'"' -f4)
             [ -z "$tunnel_id" ] && tunnel_id=$(cut -d\" -f12 <<< "$ARGO_TOKEN" 2>/dev/null || true)
             if [ -z "$tunnel_id" ]; then
                 yellow "无法从 JSON 中解析 TunnelID，已回退为临时隧道"
-                ARGO_USE_FIXED=0
+                clear_argo_fixed_conf
                 _ARGO_EXEC_CMD="/etc/sing-box/argo tunnel --url http://localhost:${ARGO_PORT} --no-autoupdate --edge-ip-version auto --protocol http2"
             else
                 cat > "${work_dir}/tunnel.yml" << YMLEOF
@@ -993,22 +1068,65 @@ ingress:
   - service: http_status:404
 YMLEOF
                 _ARGO_EXEC_CMD="/etc/sing-box/argo tunnel --edge-ip-version auto --config /etc/sing-box/tunnel.yml run"
-                green "Argo 服务将使用固定隧道 (JSON) → ${ARGO_DOMAIN}"
+                green "Argo 服务将使用固定隧道 (JSON) → ${ARGO_DOMAIN} → Nginx:${ARGO_PORT}"
             fi
         else
-            # Token 方式
-            _ARGO_EXEC_CMD="/etc/sing-box/argo tunnel --edge-ip-version auto --no-autoupdate --protocol http2 run --token ${ARGO_TOKEN}"
-            green "Argo 服务将使用固定隧道 (Token) → ${ARGO_DOMAIN:-未指定域名}"
+            local safe_token
+            safe_token=$(printf '%s' "$ARGO_TOKEN" | sed "s/'/'\\\\''/g")
+            _ARGO_EXEC_CMD="/etc/sing-box/argo tunnel --edge-ip-version auto --no-autoupdate --protocol http2 run --token '${safe_token}'"
+            green "Argo 服务将使用固定隧道 (Token) → ${ARGO_DOMAIN:-未指定域名} → Nginx:${ARGO_PORT}"
         fi
     else
-        # 临时隧道（含固定配置不完整时的回退）
         if [ "$ARGO_USE_FIXED" = "1" ]; then
-            yellow "固定隧道配置不完整（缺少令牌），已自动回退为临时隧道"
-            ARGO_USE_FIXED=0
-            rm -f "${work_dir}/argo_fixed.conf" 2>/dev/null || true
+            yellow "固定隧道配置不完整，已回退为临时隧道"
+            clear_argo_fixed_conf
         fi
         _ARGO_EXEC_CMD="/etc/sing-box/argo tunnel --url http://localhost:${ARGO_PORT} --no-autoupdate --edge-ip-version auto --protocol http2"
-        green "Argo 服务将使用临时隧道"
+        green "Argo 服务将使用临时隧道 → Nginx:${ARGO_PORT}"
+    fi
+}
+
+# 写入 argo 启动脚本（避免服务单元中嵌套引号问题），再重写服务单元
+rewrite_argo_service() {
+    _prepare_argo_exec
+    # 启动脚本：单一入口，systemd/openrc 均调用此文件
+    cat > "${work_dir}/argo-start.sh" << 'STARTEOF'
+#!/bin/sh
+exec >> /etc/sing-box/argo.log 2>&1
+STARTEOF
+    # 将实际命令追加（不经过 shell 二次解析服务单元）
+    printf '%s\n' "exec ${_ARGO_EXEC_CMD}" >> "${work_dir}/argo-start.sh"
+    chmod +x "${work_dir}/argo-start.sh"
+
+    if command_exists rc-service 2>/dev/null; then
+        cat > /etc/init.d/argo << 'EOF'
+#!/sbin/openrc-run
+description="Cloudflare Tunnel"
+command="/etc/sing-box/argo-start.sh"
+command_background=true
+pidfile="/var/run/argo.pid"
+EOF
+        chmod +x /etc/init.d/argo
+        rc-update add argo default >/dev/null 2>&1 || true
+    else
+        cat > /etc/systemd/system/argo.service << 'EOF'
+[Unit]
+Description=Cloudflare Tunnel
+After=network.target
+
+[Service]
+Type=simple
+NoNewPrivileges=yes
+TimeoutStartSec=0
+ExecStart=/etc/sing-box/argo-start.sh
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target
+EOF
+        systemctl daemon-reload
+        systemctl enable argo >/dev/null 2>&1 || true
     fi
 }
 
@@ -1035,24 +1153,7 @@ LimitNOFILE=infinity
 WantedBy=multi-user.target
 EOF
 
-    _prepare_argo_exec
-
-    cat > /etc/systemd/system/argo.service << EOF
-[Unit]
-Description=Cloudflare Tunnel
-After=network.target
-
-[Service]
-Type=simple
-NoNewPrivileges=yes
-TimeoutStartSec=0
-ExecStart=/bin/sh -c "${_ARGO_EXEC_CMD} > /etc/sing-box/argo.log 2>&1"
-Restart=on-failure
-RestartSec=5s
-
-[Install]
-WantedBy=multi-user.target
-EOF
+    rewrite_argo_service
     if [ -f /etc/centos-release ]; then
         yum install -y chrony
         systemctl start chronyd
@@ -1079,21 +1180,9 @@ command_background=true
 pidfile="/var/run/sing-box.pid"
 EOF
 
-    _prepare_argo_exec
-
-    cat > /etc/init.d/argo << EOF
-#!/sbin/openrc-run
-description="Cloudflare Tunnel"
-command="/bin/sh"
-command_args="-c '${_ARGO_EXEC_CMD} > /etc/sing-box/argo.log 2>&1'"
-command_background=true
-pidfile="/var/run/argo.pid"
-EOF
-
+    rewrite_argo_service
     chmod +x /etc/init.d/sing-box
-    chmod +x /etc/init.d/argo
     rc-update add sing-box default > /dev/null 2>&1
-    rc-update add argo default     > /dev/null 2>&1
 }
 
 # 生成节点链接并写入 url.txt / sub.txt（不再打印 HTTP 订阅地址）
@@ -1105,13 +1194,10 @@ get_info() {
 
     # 优先使用固定隧道域名（若安装时已配置）
     argodomain=""
-    if [ -f "${work_dir}/argo_fixed.conf" ]; then
-        # shellcheck source=/dev/null
-        source "${work_dir}/argo_fixed.conf" 2>/dev/null || true
-        if [ "${ARGO_USE_FIXED:-0}" = "1" ] && [ -n "${ARGO_DOMAIN:-}" ]; then
-            argodomain="$ARGO_DOMAIN"
-            green "使用固定隧道域名: ${purple}${argodomain}${re}"
-        fi
+    load_argo_fixed_conf
+    if [ "${ARGO_USE_FIXED:-0}" = "1" ] && [ -n "${ARGO_DOMAIN:-}" ]; then
+        argodomain="$ARGO_DOMAIN"
+        green "使用固定隧道域名: ${purple}${argodomain}${re}"
     fi
 
     # 若无固定域名，则从临时隧道日志解析
@@ -2073,26 +2159,27 @@ change_config() {
                     # Argo 对外端口 = Nginx 监听端口（内部三个协议端口不变）
                     reading "\n请输入Argo对外端口 (当前Nginx入口, 回车跳过将使用随机端口): " new_port
                     [ -z "$new_port" ] && new_port=$(shuf -i 2000-65000 -n 1)
+                    if ! [[ "$new_port" =~ ^[0-9]+$ ]] || [ "$new_port" -lt 1 ] || [ "$new_port" -gt 65535 ]; then
+                        red "端口无效"; return 1
+                    fi
                     allow_port $new_port/tcp > /dev/null 2>&1
-                    # 更新 Nginx argo-ws.conf 监听端口
                     if [ -f /etc/nginx/conf.d/argo-ws.conf ]; then
                         sed -i "s/listen [0-9]\+;/listen ${new_port};/g" /etc/nginx/conf.d/argo-ws.conf
                         sed -i "s/listen \[::\]:[0-9]\+;/listen [::]:${new_port};/g" /etc/nginx/conf.d/argo-ws.conf
                         nginx -t >/dev/null 2>&1 && nginx -s reload >/dev/null 2>&1 || restart_nginx >/dev/null 2>&1
                     fi
-                    # 更新 Argo 服务指向新端口
-                    if command_exists rc-service; then
-                        grep -q "localhost:" /etc/init.d/argo && \
-                            sed -i 's/localhost:[0-9]\{1,\}/localhost:'"$new_port"'/' /etc/init.d/argo
-                    else
-                        grep -q "localhost:" /etc/systemd/system/argo.service && \
-                            sed -i 's/localhost:[0-9]\{1,\}/localhost:'"$new_port"'/' /etc/systemd/system/argo.service
-                    fi
-                    # 同步环境变量便于后续使用
                     export ARGO_PORT=$new_port
+                    # 同步到固定配置（若有）并重写 argo 启动脚本
+                    if [ -f "${work_dir}/argo_fixed.conf" ]; then
+                        sed -i "s/^ARGO_PORT=.*/ARGO_PORT=\"${new_port}\"/" "${work_dir}/argo_fixed.conf"
+                    fi
+                    rewrite_argo_service
                     restart_argo
                     sleep 2
-                    get_quick_tunnel && change_argo_domain
+                    # 仅临时隧道需要重新拉取域名
+                    if [ -f "${work_dir}/argo-start.sh" ] && grep -q -- '--url http://localhost' "${work_dir}/argo-start.sh" 2>/dev/null; then
+                        get_quick_tunnel && change_argo_domain
+                    fi
                     green "\nArgo对外端口已修改为：${purple}${new_port}${re}（三个协议仍共用此入口）\n"
                     ;;
                 0) change_config ;;
@@ -2474,35 +2561,28 @@ manage_argo() {
         2) stop_argo ;;
         3)
             clear
-            if command_exists rc-service 2>/dev/null; then
-                grep -Fq -- '--url http://localhost' /etc/init.d/argo && get_quick_tunnel && change_argo_domain || \
-                    { green "\n当前使用固定隧道,无需获取临时域名"; sleep 2; menu; }
+            # 通过 argo-start.sh 或配置文件判断是否为临时隧道
+            if [ -f "${work_dir}/argo-start.sh" ] && grep -q -- '--url http://localhost' "${work_dir}/argo-start.sh" 2>/dev/null; then
+                get_quick_tunnel && change_argo_domain
+            elif [ ! -f "${work_dir}/argo_fixed.conf" ]; then
+                get_quick_tunnel && change_argo_domain
             else
-                grep -q 'ExecStart=.*--url http://localhost' /etc/systemd/system/argo.service && get_quick_tunnel && change_argo_domain || \
-                    { green "\n当前使用固定隧道,无需获取临时域名"; sleep 2; menu; }
+                green "\n当前使用固定隧道,无需获取临时域名"; sleep 2; menu
             fi
             ;;
         4)
             clear
-            yellow "\n固定隧道可为 JSON 或 Token，使用 Token 请在 Cloudflare 中配置一致的 Public Hostname\n"
-            yellow "JSON 获取参考: ${purple}https://fscarmen.cloudflare.now.cc${re}"
-            yellow "Argo 统一指向 Nginx 入口端口，由 Nginx 按路径分流到 VMess / VLESS / Trojan\n"
+            yellow "\n固定隧道（JSON 或 Token）。Token 请在 Cloudflare 配置一致的 Public Hostname"
+            yellow "JSON 参考: ${purple}https://fscarmen.cloudflare.now.cc${re}"
+            yellow "架构: Cloudflare → Nginx(入口) → VMess/VLESS/Trojan 三个 WS 端口\n"
 
-            # 交互输入隧道端口（可保持当前）
+            load_argo_fixed_conf
             local current_argo_port="${ARGO_PORT:-8001}"
-            if [ -f "${work_dir}/argo_fixed.conf" ]; then
-                # shellcheck source=/dev/null
-                source "${work_dir}/argo_fixed.conf" 2>/dev/null || true
-                current_argo_port="${ARGO_PORT:-$current_argo_port}"
-            fi
-            reading "请输入 Argo 隧道入口端口 (当前: ${current_argo_port}，回车保持): " input_port
+            reading "请输入 Argo 入口端口 (当前: ${current_argo_port}，回车保持): " input_port
             if [ -n "$input_port" ]; then
-                if ! [[ "$input_port" =~ ^[0-9]+$ ]] || [ "$input_port" -lt 1 ] || [ "$input_port" -gt 65535 ]; then
-                    red "端口无效，将保持原端口 ${current_argo_port}"
-                else
+                if [[ "$input_port" =~ ^[0-9]+$ ]] && [ "$input_port" -ge 1 ] && [ "$input_port" -le 65535 ]; then
                     ARGO_PORT="$input_port"
                     export ARGO_PORT
-                    # 同步更新 Nginx 监听
                     if [ -f /etc/nginx/conf.d/argo-ws.conf ]; then
                         sed -i "s/listen [0-9]\+;/listen ${ARGO_PORT};/g" /etc/nginx/conf.d/argo-ws.conf
                         sed -i "s/listen \[::\]:[0-9]\+;/listen [::]:${ARGO_PORT};/g" /etc/nginx/conf.d/argo-ws.conf
@@ -2510,91 +2590,50 @@ manage_argo() {
                     fi
                     allow_port ${ARGO_PORT}/tcp >/dev/null 2>&1
                     green "Argo 入口端口已更新为: ${purple}${ARGO_PORT}${re}"
+                else
+                    red "端口无效，保持 ${current_argo_port}"
+                    ARGO_PORT="$current_argo_port"
                 fi
             else
                 ARGO_PORT="$current_argo_port"
-                export ARGO_PORT
             fi
+            export ARGO_PORT
 
-            reading "请输入固定隧道域名 (例如: argo.example.com，直接回车则取消并回退临时隧道): " argo_domain
-            reading "请输入隧道令牌 (Token) 或 JSON 凭证 (直接回车则取消并回退临时隧道): " argo_auth
+            reading "请输入固定隧道域名 (回车取消): " argo_domain
+            [ -z "$argo_domain" ] && { yellow "已取消"; return; }
 
-            if [ -z "$argo_domain" ] || [ -z "$argo_auth" ]; then
-                yellow "域名或令牌为空，已取消固定隧道配置，保持/回退为临时隧道"
-                # 不修改现有服务，直接返回
-                return
-            fi
+            yellow "可粘贴完整命令，将自动去除前缀仅保留 eyJ 令牌"
+            reading "请输入隧道令牌/JSON (回车取消): " argo_auth
+            argo_auth=$(clean_argo_token "$argo_auth")
+            [ -z "$argo_auth" ] && { yellow "已取消"; return; }
 
-            ArgoDomain=$argo_domain
             ARGO_DOMAIN="$argo_domain"
             ARGO_TOKEN="$argo_auth"
             ARGO_USE_FIXED=1
+            ArgoDomain="$argo_domain"
+            export ARGO_DOMAIN ARGO_TOKEN ARGO_USE_FIXED
 
-            # 持久化
-            cat > "${work_dir}/argo_fixed.conf" << ARGOEOF
-ARGO_USE_FIXED=1
-ARGO_DOMAIN="${ARGO_DOMAIN}"
-ARGO_TOKEN='${ARGO_TOKEN}'
-ARGO_PORT="${ARGO_PORT}"
-ARGOEOF
-            chmod 600 "${work_dir}/argo_fixed.conf"
-
-            if [[ $argo_auth =~ TunnelSecret ]]; then
-                echo "$argo_auth" > ${work_dir}/tunnel.json
-                local tid
-                tid=$(echo "$argo_auth" | grep -o '"TunnelID":"[^"]*"' | head -1 | cut -d'"' -f4)
-                [ -z "$tid" ] && tid=$(cut -d\" -f12 <<< "$argo_auth" 2>/dev/null || true)
-                cat > ${work_dir}/tunnel.yml << EOF
-tunnel: ${tid}
-credentials-file: ${work_dir}/tunnel.json
-protocol: http2
-
-ingress:
-  - hostname: $ArgoDomain
-    service: http://localhost:${ARGO_PORT}
-    originRequest:
-      noTLSVerify: true
-  - service: http_status:404
-EOF
-                if command_exists rc-service 2>/dev/null; then
-                    sed -i '/^command_args=/c\command_args="-c '\''/etc/sing-box/argo tunnel --edge-ip-version auto --config /etc/sing-box/tunnel.yml run 2>&1'\''"' /etc/init.d/argo
-                else
-                    sed -i '/^ExecStart=/c ExecStart=/bin/sh -c "/etc/sing-box/argo tunnel --edge-ip-version auto --config /etc/sing-box/tunnel.yml run 2>&1"' /etc/systemd/system/argo.service
-                    systemctl daemon-reload
-                fi
-                restart_argo; sleep 1; change_argo_domain
-            elif [[ $argo_auth =~ ^[A-Z0-9a-z=]{100,}$ ]]; then
-                if command_exists rc-service 2>/dev/null; then
-                    sed -i "/^command_args=/c\command_args=\"-c '/etc/sing-box/argo tunnel --edge-ip-version auto --no-autoupdate --protocol http2 run --token $argo_auth 2>&1'\"" /etc/init.d/argo
-                else
-                    sed -i '/^ExecStart=/c ExecStart=/bin/sh -c "/etc/sing-box/argo tunnel --edge-ip-version auto --no-autoupdate --protocol http2 run --token '"$argo_auth"' 2>&1"' /etc/systemd/system/argo.service
-                    systemctl daemon-reload
-                fi
-                restart_argo; sleep 1; change_argo_domain
-            else
-                yellow "输入格式未识别为有效 Token 或 JSON，请重新输入"
-                manage_argo
-            fi
+            save_argo_fixed_conf
+            rewrite_argo_service
+            restart_argo
+            sleep 1
+            change_argo_domain
             ;;
         5)
             clear
-            # 切换回临时隧道：清除固定配置并重建服务
-            rm -f "${work_dir}/argo_fixed.conf" "${work_dir}/tunnel.json" "${work_dir}/tunnel.yml" 2>/dev/null || true
-            ARGO_USE_FIXED=0
-            ARGO_DOMAIN=""
-            ARGO_TOKEN=""
-            export ARGO_USE_FIXED
-            if command_exists rc-service 2>/dev/null; then alpine_openrc_services
-            else main_systemd_services; fi
-            get_quick_tunnel; change_argo_domain
+            clear_argo_fixed_conf
+            rewrite_argo_service
+            restart_argo
+            get_quick_tunnel
+            change_argo_domain
             ;;
         6)
-            if command_exists rc-service 2>/dev/null; then
-                grep -Fq -- '--url http://localhost' "/etc/init.d/argo" && get_quick_tunnel && change_argo_domain || \
-                    { yellow "当前使用固定隧道，无法获取临时隧道"; sleep 2; menu; }
+            if [ -f "${work_dir}/argo-start.sh" ] && grep -q -- '--url http://localhost' "${work_dir}/argo-start.sh" 2>/dev/null; then
+                get_quick_tunnel && change_argo_domain
+            elif [ ! -f "${work_dir}/argo_fixed.conf" ]; then
+                get_quick_tunnel && change_argo_domain
             else
-                grep -q 'ExecStart=.*--url http://localhost' "/etc/systemd/system/argo.service" && get_quick_tunnel && change_argo_domain || \
-                    { yellow "当前使用固定隧道，无法获取临时隧道"; sleep 2; menu; }
+                yellow "当前使用固定隧道，无法获取临时隧道"; sleep 2; menu
             fi
             ;;
         0) menu ;;
