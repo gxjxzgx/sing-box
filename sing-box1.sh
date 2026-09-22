@@ -105,45 +105,63 @@ clean_argo_token() {
 }
 
 # 检测端口是否已被占用（tcp/udp 监听）
-# 检测端口是否已被占用（tcp/udp 监听）
-# 优先 /proc/net（Alpine/LXD 容器更可靠），避免 ss/lsof 宽松匹配导致「全端口占用」误报
+# 检测端口是否已被占用
+# 以实际 bind 为准；可用 SKIP_PORT_CHECK=1 跳过检测（应急）
 port_in_use() {
     local port="$1"
     [ -z "$port" ] && return 1
+    # 应急：跳过检测（确认无冲突时使用）
+    [ "${SKIP_PORT_CHECK:-0}" = "1" ] && return 1
     if ! [[ "$port" =~ ^[0-9]+$ ]] || [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
         return 1
     fi
 
-    # 1) /proc/net（地址格式: 0100007F:1F90，端口为四位十六进制）
+    local py=""
+    command_exists python3 && py=python3
+    [ -z "$py" ] && command_exists python && py=python
+
+    # 方法1：实际 bind（最可靠；有 python 时优先）
+    if [ -n "$py" ]; then
+        if $py -c "
+import socket, sys
+p = int(sys.argv[1])
+try:
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind(('0.0.0.0', p))
+    s.close()
+    sys.exit(1)
+except Exception:
+    sys.exit(0)
+" "$port" 2>/dev/null; then
+            return 0
+        else
+            return 1
+        fi
+    fi
+
+    # 方法2：/proc/net 只比较 local_address 端口（第2列末段），不扫整行
     local hex
     hex=$(printf '%04X' "$port" 2>/dev/null) || hex=""
     if [ -n "$hex" ]; then
-        # 匹配 local_address 或 rem_address 中的 :PORT
-        if grep -qhE ":${hex} " /proc/net/tcp /proc/net/tcp6 /proc/net/udp /proc/net/udp6 2>/dev/null; then
+        if awk -v h="$hex" '
+            NR > 1 {
+                n = split($2, a, ":")
+                if (n >= 2 && toupper(a[n]) == h) exit 0
+            }
+            END { exit 1 }
+        ' /proc/net/tcp /proc/net/tcp6 /proc/net/udp /proc/net/udp6 2>/dev/null; then
             return 0
+        fi
+        # /proc 可读且未命中 → 视为空闲（避免再被 ss 误报）
+        if [ -r /proc/net/tcp ]; then
+            return 1
         fi
     fi
 
-    # 2) ss：端口后须为非数字或行尾，避免 443 误匹配 4430/1443
+    # 方法3：ss 回退
     if command_exists ss; then
-        if ss -tuln 2>/dev/null | grep -qE "[:.]${port}([^0-9]|$)"; then
-            return 0
-        fi
-    fi
-
-    # 3) netstat
-    if command_exists netstat; then
-        if netstat -tuln 2>/dev/null | grep -qE "[:.]${port}([^0-9]|$)"; then
-            return 0
-        fi
-    fi
-
-    # 4) lsof：必须有 PID 输出，不能只看退出码（部分环境无监听也返回 0）
-    if command_exists lsof; then
-        if [ -n "$(lsof -iTCP:"$port" -sTCP:LISTEN -t 2>/dev/null)" ]; then
-            return 0
-        fi
-        if [ -n "$(lsof -iUDP:"$port" -t 2>/dev/null)" ]; then
+        if ss -tuln 2>/dev/null | grep -E 'LISTEN|UNCONN' | grep -qE "[:.]${port}([^0-9]|$)"; then
             return 0
         fi
     fi
