@@ -1,11 +1,24 @@
 #!/bin/bash
 
 # =========================
-# 老王sing-box四合一安装脚本
-# vless-reality|hysteria2|vless-ws(直连)|tuic5|vmess-ws-tls(tunnel)|vless-ws-tls(tunnel)|trojan-ws-tls(tunnel)
-# [可额外添加Anytls，socks5，ss2022等协议]
-# 端口: Reality=vless_port  hy2=+1  tuic=+2  vless-ws直连=+3  订阅=ARGO_PORT+13
-# 最后更新时间: 2026.9.18[隧道协议新增vless-ws/trojan-ws，Nginx同端口分流，cloudflared使用官方最新版]
+# 老王sing-box多协议安装脚本（个人修改版）
+# 协议: vless-reality | hysteria2 | tuic | vless-ws(直连)
+#       vmess-ws / vless-ws / trojan-ws (Argo 隧道)
+# 可额外添加: anytls / socks5 / ss2022
+#
+# 端口规划:
+#   直连: Reality=vless_port  HY2=+1  TUIC=+2  VLESS-WS直连=+3
+#   Argo: ARGO_PORT(入口)  内部WS=+10~+12 (仅本机，不对外)
+#   已去掉独立 HTTP 订阅端口与订阅链接/二维码输出
+#
+# 本修改版变更摘要:
+#   1. sing-box / cloudflared 优先官方下载，失败回退镜像
+#   2. 节点 IP 优先使用 IPv4
+#   3. 去除终端订阅链接与二维码输出；本地仍写 url.txt / sub.txt
+#   4. 端口冲突时明确提示占用端口，并支持交互修改
+#   5. 去掉 ARGO_PORT+13 独立订阅监听
+#
+# 基于: eooce/sing-box  修改日期: 2026.9.22
 # =========================
 
 export LANG=en_US.UTF-8
@@ -194,7 +207,7 @@ manage_packages() {
 
 # 获取ip
 get_realip() {
-    # 优先返回 IPv4（节点/订阅地址默认用 IPv4）
+    # 优先返回 IPv4（节点链接默认用 IPv4）
     # 仅当无可用 IPv4，或 IPv4 为 WARP/特殊线路不可直连时，才回退到 IPv6
     local ip v6 org
     ip=$(curl -4 -sm 2 ip.sb 2>/dev/null)
@@ -241,7 +254,7 @@ get_isp() {
     echo "${result:-$fallback}"
 }
 
-# 刷新订阅文件（兼容 GNU / BusyBox base64）
+# 刷新本地 sub.txt（base64 节点列表，兼容 GNU / BusyBox base64；不再对外提供 HTTP 订阅）
 refresh_sub() {
     local src="${1:-$client_dir}"
     [ -f "$src" ] || return 1
@@ -451,10 +464,10 @@ install_singbox() {
         fi
     fi
 
-    # VLESS-Reality 端口（将占用 vless_port ~ +3，以及 ARGO_PORT+13 订阅端口）
+    # ---------- 直连协议端口（vless_port ~ +3）----------
     while true; do
         if [ -z "$vless_port" ] && [ -t 0 ]; then
-            reading "请输入端口 (回车随机；将占用 +0~+3 共4个端口): " input_vless_port
+            reading "请输入直连起始端口 (回车随机；将占用 +0~+3 共4个端口): " input_vless_port
             [ -n "$input_vless_port" ] && vless_port=$input_vless_port
         fi
         if [ -z "$vless_port" ]; then
@@ -465,35 +478,130 @@ install_singbox() {
             vless_port=""
             continue
         fi
-        local_conflict=0
-        for p in "$vless_port" "$((vless_port+1))" "$((vless_port+2))" "$((vless_port+3))" "$((ARGO_PORT+13))"; do
+        conflict_list=""
+        for p in "$vless_port" "$((vless_port+1))" "$((vless_port+2))" "$((vless_port+3))"; do
             if port_in_use "$p"; then
-                red "端口 ${p} 已被占用"
-                local_conflict=1
+                conflict_list="${conflict_list} ${p}"
             fi
         done
-        if [ "$local_conflict" -eq 1 ]; then
-            red "存在端口冲突，请重新输入起始端口"
-            vless_port=""
-            [ -t 0 ] || vless_port=$(shuf -i 1000-65000 -n 1)
+        if [ -n "$conflict_list" ]; then
+            red "以下直连端口已被占用:${conflict_list}"
+            yellow "说明: 起始端口 ${vless_port} 会同时占用 Reality/HY2/TUIC/WS = ${vless_port}~$((vless_port+3))"
+            if [ -t 0 ]; then
+                reading "请重新输入起始端口 (回车随机): " input_vless_port
+                if [ -n "$input_vless_port" ]; then
+                    vless_port=$input_vless_port
+                else
+                    vless_port=$(shuf -i 1000-65000 -n 1)
+                    green "已随机: ${purple}${vless_port}${re}"
+                fi
+            else
+                vless_port=$(shuf -i 1000-65000 -n 1)
+            fi
             continue
         fi
         break
     done
-    green "端口: ${purple}${vless_port}${re}"
-    green "将使用端口: Reality=${vless_port}  HY2=$((vless_port+1))  TUIC=$((vless_port+2))  WS直连=$((vless_port+3))  订阅=$((ARGO_PORT+13))"
+    green "直连端口: Reality=${purple}${vless_port}${re}  HY2=$((vless_port+1))  TUIC=$((vless_port+2))  WS直连=$((vless_port+3))"
 
-    # Argo 对外端口使用默认值或环境变量，不再交互输入
+    # ---------- Argo 端口（ARGO_PORT 及 +10~+12，无独立订阅端口）----------
+    # 被占用时明确提示哪个端口，并交互式输入新的 ARGO 起始端口
+    while true; do
+        base="${ARGO_PORT:-8001}"
+        conflict_list=""
+        conflict_detail=""
+        for offset_name in "0:Argo入口" "10:VMess内部" "11:VLESS内部" "12:Trojan内部"; do
+            off="${offset_name%%:*}"
+            name="${offset_name#*:}"
+            p=$((base + off))
+            # 与直连端口重叠也算冲突
+            if [ "$p" = "$vless_port" ] || [ "$p" = "$((vless_port+1))" ] || [ "$p" = "$((vless_port+2))" ] || [ "$p" = "$((vless_port+3))" ]; then
+                conflict_list="${conflict_list} ${p}"
+                conflict_detail="${conflict_detail}\n  - ${p} (${name}) 与直连端口重叠"
+                continue
+            fi
+            if port_in_use "$p"; then
+                conflict_list="${conflict_list} ${p}"
+                conflict_detail="${conflict_detail}\n  - ${p} (${name}) 已被占用"
+            fi
+        done
+        if [ -z "$conflict_list" ]; then
+            ARGO_PORT="$base"
+            export ARGO_PORT
+            break
+        fi
+        red "Argo 相关端口冲突 (当前 ARGO 起始=${base}):"
+        echo -e "${red}${conflict_detail}${re}"
+        yellow "将占用: Argo=${base}  内部WS=${base}+10~+12"
+        if [ -t 0 ]; then
+            reading "请输入新的 Argo 起始端口 (回车自动随机空闲端口): " input_argo
+            if [ -n "$input_argo" ]; then
+                if ! [[ "$input_argo" =~ ^[0-9]+$ ]] || [ "$input_argo" -lt 1 ] || [ "$input_argo" -gt 65522 ]; then
+                    red "端口无效，请输入 1-65522"
+                    continue
+                fi
+                ARGO_PORT="$input_argo"
+            else
+                # 自动找一组空闲
+                found=""
+                for _ in $(seq 1 80); do
+                    cand=$(shuf -i 2000-64000 -n 1)
+                    ok=1
+                    for off in 0 10 11 12; do
+                        p=$((cand + off))
+                        if [ "$p" = "$vless_port" ] || [ "$p" = "$((vless_port+1))" ] || [ "$p" = "$((vless_port+2))" ] || [ "$p" = "$((vless_port+3))" ]; then
+                            ok=0; break
+                        fi
+                        port_in_use "$p" && { ok=0; break; }
+                    done
+                    if [ "$ok" -eq 1 ]; then
+                        found=$cand
+                        break
+                    fi
+                done
+                if [ -n "$found" ]; then
+                    ARGO_PORT="$found"
+                    green "已自动分配 Argo 起始端口: ${purple}${ARGO_PORT}${re}"
+                else
+                    red "自动分配失败，请手动输入"
+                    continue
+                fi
+            fi
+            export ARGO_PORT
+        else
+            # 非交互：自动随机
+            found=""
+            for _ in $(seq 1 80); do
+                cand=$(shuf -i 2000-64000 -n 1)
+                ok=1
+                for off in 0 10 11 12; do
+                    p=$((cand + off))
+                    if [ "$p" = "$vless_port" ] || [ "$p" = "$((vless_port+1))" ] || [ "$p" = "$((vless_port+2))" ] || [ "$p" = "$((vless_port+3))" ]; then
+                        ok=0; break
+                    fi
+                    port_in_use "$p" && { ok=0; break; }
+                done
+                [ "$ok" -eq 1 ] && { found=$cand; break; }
+            done
+            if [ -n "$found" ]; then
+                ARGO_PORT="$found"
+                export ARGO_PORT
+                green "已自动分配 Argo 起始端口: ${purple}${ARGO_PORT}${re}"
+                break
+            else
+                red "无法分配可用的 Argo 端口，请手动指定"
+                exit 1
+            fi
+        fi
+    done
     green "Argo 端口: ${purple}${ARGO_PORT}${re}"
+    green "将使用端口: Reality=${vless_port}  HY2=$((vless_port+1))  TUIC=$((vless_port+2))  WS直连=$((vless_port+3))  Argo=${ARGO_PORT}"
 
     # 公网协议端口：Reality / Hysteria2 / TUIC / VLESS-WS直连
-    # Reality = vless_port
     hy2_port=$(($vless_port + 1))
     tuic_port=$(($vless_port + 2))
     vless_ws_direct_port=$(($vless_port + 3))
-    # 订阅端口与 Argo 内部端口（基于 ARGO_PORT）
-    nginx_port=$(($ARGO_PORT + 13))
-    # 三个隧道协议内部端口（仅本机访问，由 Nginx 统一对外监听 ARGO_PORT）
+    # Argo 内部端口（仅本机访问，由 Nginx 统一对外监听 ARGO_PORT；已去掉独立订阅端口）
     vmess_ws_port=$(($ARGO_PORT + 10))
     vless_ws_port=$(($ARGO_PORT + 11))
     trojan_ws_port=$(($ARGO_PORT + 12))
@@ -503,7 +611,7 @@ install_singbox() {
     public_key=$(echo "${output}" | awk '/PublicKey:/ {print $2}')
 
     # 仅开放对外端口；Argo 内部 WS 端口只监听 127.0.0.1，无需公网放行
-    allow_port $vless_port/tcp $hy2_port/udp $tuic_port/udp $vless_ws_direct_port/tcp $nginx_port/tcp ${ARGO_PORT}/tcp > /dev/null 2>&1
+    allow_port $vless_port/tcp $hy2_port/udp $tuic_port/udp $vless_ws_direct_port/tcp ${ARGO_PORT}/tcp > /dev/null 2>&1
 
     openssl ecparam -genkey -name prime256v1 -out "${work_dir}/private.key"
     openssl req -new -x509 -days 3650 -key "${work_dir}/private.key" -out "${work_dir}/cert.pem" -subj "/CN=bing.com"
@@ -828,7 +936,7 @@ EOF
     rc-update add argo default     > /dev/null 2>&1
 }
 
-# 生成节点和订阅链接
+# 生成节点链接并写入 url.txt / sub.txt（不再打印 HTTP 订阅地址）
 get_info() {
     yellow "\nip检测中,请稍等...\n"
     server_ip=$(get_realip)
@@ -857,7 +965,7 @@ get_info() {
         [ -z "$tuic_port" ] && tuic_port=$(jq -r '.inbounds[] | select(.tag=="tuic") | .listen_port' "${conf_dir}/inbounds.json" 2>/dev/null)
         [ -z "$vless_ws_direct_port" ] && vless_ws_direct_port=$(jq -r '.inbounds[] | select(.tag=="vless-ws-direct") | .listen_port' "${conf_dir}/inbounds.json" 2>/dev/null)
     fi
-    [ -z "$nginx_port" ] && nginx_port=$((${ARGO_PORT:-8001} + 13))
+    # nginx_port 已废弃（无独立订阅端口）
 
     # 节点前缀处理
     if [ -z "$node_prefix" ]; then
@@ -900,29 +1008,18 @@ EOF
     while IFS= read -r line; do echo -e "${purple}$line"; done < ${work_dir}/url.txt
     refresh_sub
     yellow "\n温馨提醒:"
-    yellow "如果节点里的ip是ipv6的，可在 修改节点配置 菜单切换ipv4后重新订阅节点\n"
-    red "如果hysteria2或tuic不通，请尝试将节点里的 "跳过证书验证" 设置为 "true" 或切换内核\n"
-    green "V2rayN,Shadowrocket,Nekobox,Loon,Karing,Sterisand订阅链接：${purple}http://${server_ip}:${nginx_port}/${password}${re}\n"
-    [ -x "${work_dir}/qrencode" ] && "${work_dir}/qrencode" "http://${server_ip}:${nginx_port}/${password}"
-    yellow "\n=========================================================================================="
-    green "\n\nClash,Mihomo系列订阅链接：${purple}https://sublink.eooce.com/clash?config=http://${server_ip}:${nginx_port}/${password}${re}\n"
-    [ -x "${work_dir}/qrencode" ] && "${work_dir}/qrencode" "https://sublink.eooce.com/clash?config=http://${server_ip}:${nginx_port}/${password}"
-    yellow "\n=========================================================================================="
-    green "\n\nSing-box订阅链接：${purple}https://sublink.eooce.com/singbox?config=http://${server_ip}:${nginx_port}/${password}${re}\n"
-    [ -x "${work_dir}/qrencode" ] && "${work_dir}/qrencode" "https://sublink.eooce.com/singbox?config=http://${server_ip}:${nginx_port}/${password}"
-    yellow "\n=========================================================================================="
-    green "\n\nSurge订阅链接：${purple}https://sublink.eooce.com/surge?config=http://${server_ip}:${nginx_port}/${password}${re}\n"
-    [ -x "${work_dir}/qrencode" ] && "${work_dir}/qrencode" "https://sublink.eooce.com/surge?config=http://${server_ip}:${nginx_port}/${password}"
-    yellow "\n==========================================================================================\n"
+    yellow "节点默认优先 IPv4；若仍为 IPv6，可在「修改节点配置」中切换\n"
+    red "若 hysteria2/tuic 不通，请将客户端「跳过证书验证」设为 true 或更换内核\n"
+    yellow "节点已写入: ${work_dir}/url.txt  本地 base64: ${work_dir}/sub.txt\n"
 
     # 推送节点到 Telegram（若已启用）
     send_tg_nodes 2>/dev/null || true
 }
 
-# nginx订阅配置 + Argo隧道多协议路径分流（同一端口）
+# Nginx：仅配置 Argo 隧道多协议路径分流（已无独立订阅端口）
 add_nginx_conf() {
     if ! command_exists nginx; then
-        red "nginx未安装,无法配置订阅服务与隧道分流"
+        red "nginx 未安装，无法配置 Argo 隧道路径分流"
         return 1
     else
         manage_service "nginx" "stop" > /dev/null 2>&1
@@ -937,34 +1034,8 @@ add_nginx_conf() {
     local vless_ws_port=$((ARGO_PORT + 11))
     local trojan_ws_port=$((ARGO_PORT + 12))
 
-    # 订阅服务（独立端口）
-    cat > /etc/nginx/conf.d/sing-box.conf << EOF
-server {
-    listen $nginx_port;
-    listen [::]:$nginx_port;
-    server_name _;
-
-    add_header X-Frame-Options DENY;
-    add_header X-Content-Type-Options nosniff;
-    add_header X-XSS-Protection "1; mode=block";
-
-    location = /$password {
-        alias /etc/sing-box/sub.txt;
-        default_type 'text/plain; charset=utf-8';
-        add_header Cache-Control "no-cache, no-store, must-revalidate";
-        add_header Pragma "no-cache";
-        add_header Expires "0";
-    }
-
-    location / { return 404; }
-
-    location ~ /\. {
-        deny all;
-        access_log off;
-        log_not_found off;
-    }
-}
-EOF
+    # 已去掉独立订阅端口；删除旧订阅配置（若存在）
+    rm -f /etc/nginx/conf.d/sing-box.conf
 
     # Argo 统一入口：同一端口按路径分流到三个协议（临时隧道/固定隧道均可）
     cat > /etc/nginx/conf.d/argo-ws.conf << EOF
@@ -1594,7 +1665,7 @@ change_hosts() {
     sed -i '2s/.*/::1         localhost/' /etc/hosts
 }
 
-# 非交互静默安装（-i 参数）
+# 非交互静默安装（-i 参数；仍走官方优先下载与 IPv4 逻辑）
 auto_install() {
     check_singbox &>/dev/null
     if [ $? -eq 0 ]; then
@@ -2066,6 +2137,8 @@ disable_open_sub() {
 
     clear; echo ""
     green "=== 管理节点订阅 ===\n"
+    yellow "提示: 本修改版已去掉独立 HTTP 订阅端口，以下选项基本不可用。\n"
+    yellow "请直接查看/复制: /etc/sing-box/url.txt  或  /etc/sing-box/sub.txt\n"
     skyblue "------------"
     green "1. 关闭节点订阅"
     skyblue "------------"
@@ -2368,7 +2441,7 @@ change_argo_domain() {
     send_tg_nodes 2>/dev/null || true
 }
 
-# 查看节点信息和订阅链接
+# 查看当前节点信息（仅打印节点链接，无订阅地址）
 check_nodes() {
     if [ ! -f "${work_dir}/url.txt" ]; then
         red "节点信息文件不存在，请先安装 sing-box"; return 1
@@ -2391,24 +2464,8 @@ check_nodes() {
         echo -e "${purple}${line}${re}\n"
     done < "${work_dir}/url.txt"
 
-    yellow "\n温馨提醒: 如果hysteria2或tuic不通，请尝试将节点里的 "跳过证书验证" 设置为 "true" 或切换内核\n"
-    green "\n=== 订阅链接 ===\n"
-
-    green "V2rayN/Shadowrocket/Nekobox/Karing 订阅链接:\n${purple}${base64_url}${re}\n"
-    [ -x "${work_dir}/qrencode" ] && "${work_dir}/qrencode" "${base64_url}"
-    yellow "\n=========================================================================================="
-
-    green "\nClash/Mihomo 订阅链接:\n${purple}https://sublink.eooce.com/clash?config=${base64_url}${re}\n"
-    [ -x "${work_dir}/qrencode" ] && "${work_dir}/qrencode" "https://sublink.eooce.com/clash?config=${base64_url}"
-    yellow "\n=========================================================================================="
-
-    green "\nSing-box 订阅链接:\n${purple}https://sublink.eooce.com/singbox?config=${base64_url}${re}\n"
-    [ -x "${work_dir}/qrencode" ] && "${work_dir}/qrencode" "https://sublink.eooce.com/singbox?config=${base64_url}"
-    yellow "\n=========================================================================================="
-
-    green "\nSurge 订阅链接:\n${purple}https://sublink.eooce.com/surge?config=${base64_url}${re}\n"
-    [ -x "${work_dir}/qrencode" ] && "${work_dir}/qrencode" "https://sublink.eooce.com/surge?config=${base64_url}"
-    yellow "\n==========================================================================================\n"
+    yellow "\n温馨提醒: 若 hysteria2/tuic 不通，请将客户端「跳过证书验证」设为 true 或更换内核\n"
+    yellow "节点文件: ${work_dir}/url.txt\n"
 }
 
 change_cfip() {
@@ -3182,10 +3239,11 @@ menu() {
     green "Telegram群组: ${purple}https://t.me/eooceu${re}"
     green "YouTube频道: ${purple}https://youtube.com/@eooce${re}"
     green "Github地址: ${purple}https://github.com/eooce/sing-box${re}\n"
-    purple "=== 老王sing-box四合一安装脚本 ===\n"
+    purple "=== sing-box 多协议安装脚本（个人修改版） ===\n"
     purple "---Argo 状态: ${argo_status}"
     purple "--Nginx 状态: ${nginx_status}"
     purple "singbox 状态: ${singbox_status}\n"
+    yellow "节点优先 IPv4 | 二进制官方优先 | 无独立订阅端口\n"
     green "1. 安装sing-box"
     red   "2. 卸载sing-box"
     echo "==============="
@@ -3195,7 +3253,7 @@ menu() {
     echo "==============="
     green "6. 查看节点信息"
     green "7. 修改节点配置"
-    green "8. 管理节点订阅"
+    green "8. 管理节点订阅(已弱化)"
     green "9. WARP分流管理"
     echo "==============="
     green "10. 增加/删除协议"
@@ -3232,15 +3290,17 @@ case "$1" in
         ;;
     -h | --help)
         echo ""
-        green "用法: [sb或脚本] [参数], 示例: sb -c(查看节点信息)"
+        green "用法: [sb或脚本] [参数], 示例: sb -c"
         echo ""
-        green "  -i, --install     无交互安装sing-box"
-        green "  -c, --check       查看节点信息和订阅链接"
-        green "  -r, --restart     重新获取argo临时隧道并更新到订阅"
-        green "  -u, --uninstall   无交互卸载sing-box（含 nginx)"
+        green "  -i, --install     无交互安装 sing-box"
+        green "  -c, --check       查看节点信息（url.txt）"
+        green "  -r, --restart     重新获取 Argo 临时隧道并更新节点"
+        green "  -u, --uninstall   无交互卸载 sing-box（含 nginx）"
         green "  -h, --help        显示此帮助信息"
         echo ""
         green "  不带参数          进入交互式主菜单"
+        echo ""
+        yellow "修改版: 官方二进制优先 | 节点优先 IPv4 | 无独立订阅端口"
         echo ""
         exit 0
         ;;
@@ -3307,7 +3367,7 @@ case "$1" in
     *)
         red "未知参数: $1"
         echo ""
-        green "用法: sb [参数],相关参数:[-i|-u|-c|-r|-h], 首次安装：bash脚本 -i(前面可带环境变量)"
+        green "用法: sb [-i|-u|-c|-r|-h]，首次安装可用: bash 脚本 -i（可带环境变量）"
         exit 1
         ;;
 esac
