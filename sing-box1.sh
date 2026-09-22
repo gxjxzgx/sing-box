@@ -2,8 +2,9 @@
 
 # =========================
 # 老王sing-box四合一安装脚本
-# vless-reality|vmess-ws-tls(tunnel)|vless-ws-tls(tunnel)|trojan-ws-tls(tunnel)|hysteria2|tuic5
+# vless-reality|hysteria2|vless-ws(直连)|tuic5|vmess-ws-tls(tunnel)|vless-ws-tls(tunnel)|trojan-ws-tls(tunnel)
 # [可额外添加Anytls，socks5，ss2022等协议]
+# 端口: Reality=vless_port  hy2=+1  tuic=+2  vless-ws直连=+3  订阅=ARGO_PORT+13
 # 最后更新时间: 2026.9.18[隧道协议新增vless-ws/trojan-ws，Nginx同端口分流，cloudflared使用官方最新版]
 # =========================
 
@@ -43,6 +44,48 @@ export CFPORT=${CFPORT:-'443'}
 # 检查命令是否存在函数
 command_exists() {
     command -v "$1" >/dev/null 2>&1
+}
+
+# 检测端口是否已被占用（tcp/udp 监听）
+port_in_use() {
+    local port="$1"
+    [ -z "$port" ] && return 1
+    if command_exists ss; then
+        ss -tuln 2>/dev/null | grep -qE "[:.]${port}[[:space:]]" && return 0
+    fi
+    if command_exists lsof; then
+        lsof -iTCP:"$port" -sTCP:LISTEN -t >/dev/null 2>&1 && return 0
+        lsof -iUDP:"$port" -t >/dev/null 2>&1 && return 0
+    fi
+    if command_exists netstat; then
+        netstat -tuln 2>/dev/null | grep -qE "[:.]${port}[[:space:]]" && return 0
+    fi
+    return 1
+}
+
+# 交互获取可用端口；参数: 提示语 默认空则随机
+# 返回值写入变量名（第三个参数，默认 new_port）
+read_available_port() {
+    local prompt="$1"
+    local varname="${2:-new_port}"
+    local port=""
+    while true; do
+        reading "$prompt" port
+        if [ -z "$port" ]; then
+            port=$(shuf -i 10000-65000 -n 1)
+        fi
+        if ! [[ "$port" =~ ^[0-9]+$ ]] || [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
+            red "端口必须为 1-65535 的数字"
+            continue
+        fi
+        if port_in_use "$port"; then
+            red "端口 ${port} 已被占用，请重新输入"
+            continue
+        fi
+        green "端口 ${purple}${port}${re} 可用"
+        eval "$varname=\"$port\""
+        break
+    done
 }
 
 # 检查服务状态通用函数
@@ -321,31 +364,48 @@ install_singbox() {
         fi
     fi
 
-    # VLESS-Reality 端口
-    if [ -z "$vless_port" ]; then
-        if [ -t 0 ]; then
-            reading "请输入 VLESS-Reality 端口 (回车随机生成 1000-65000): " input_vless_port
+    # VLESS-Reality 端口（将占用 vless_port ~ +3，以及 ARGO_PORT+13 订阅端口）
+    while true; do
+        if [ -z "$vless_port" ] && [ -t 0 ]; then
+            reading "请输入 VLESS-Reality 端口 (回车随机；将占用 +0~+3 共4个端口): " input_vless_port
             [ -n "$input_vless_port" ] && vless_port=$input_vless_port
         fi
-    fi
-    if [ -z "$vless_port" ]; then
-        vless_port=$(shuf -i 1000-65000 -n 1)
-    fi
-    while ! [[ "$vless_port" =~ ^[0-9]+$ ]] || [ "$vless_port" -lt 1 ] || [ "$vless_port" -gt 65535 ]; do
-        red "端口必须为 1-65535 的数字"
-        if [ -t 0 ]; then
-            reading "请重新输入 VLESS-Reality 端口: " vless_port
+        if [ -z "$vless_port" ]; then
+            vless_port=$(shuf -i 1000-65000 -n 1)
         fi
-        [ -z "$vless_port" ] && vless_port=$(shuf -i 1000-65000 -n 1)
+        if ! [[ "$vless_port" =~ ^[0-9]+$ ]] || [ "$vless_port" -lt 1 ] || [ "$vless_port" -gt 65532 ]; then
+            red "端口必须为 1-65532 的数字（需预留 +3）"
+            vless_port=""
+            continue
+        fi
+        local_conflict=0
+        for p in "$vless_port" "$((vless_port+1))" "$((vless_port+2))" "$((vless_port+3))" "$((ARGO_PORT+13))"; do
+            if port_in_use "$p"; then
+                red "端口 ${p} 已被占用"
+                local_conflict=1
+            fi
+        done
+        if [ "$local_conflict" -eq 1 ]; then
+            red "存在端口冲突，请重新输入起始端口"
+            vless_port=""
+            [ -t 0 ] || vless_port=$(shuf -i 1000-65000 -n 1)
+            continue
+        fi
+        break
     done
     green "VLESS-Reality 端口: ${purple}${vless_port}${re}"
+    green "将使用端口: Reality=${vless_port}  HY2=$((vless_port+1))  TUIC=$((vless_port+2))  WS直连=$((vless_port+3))  订阅=$((ARGO_PORT+13))"
 
     # Argo 对外端口使用默认值或环境变量，不再交互输入
     green "Argo 对外端口: ${purple}${ARGO_PORT}${re}"
 
-    nginx_port=$(($vless_port + 1))
+    # 公网协议端口：Reality / Hysteria2 / TUIC / VLESS-WS直连
+    # Reality = vless_port
+    hy2_port=$(($vless_port + 1))
     tuic_port=$(($vless_port + 2))
-    hy2_port=$(($vless_port + 3))
+    vless_ws_direct_port=$(($vless_port + 3))
+    # 订阅端口与 Argo 内部端口（基于 ARGO_PORT）
+    nginx_port=$(($ARGO_PORT + 13))
     # 三个隧道协议内部端口（仅本机访问，由 Nginx 统一对外监听 ARGO_PORT）
     vmess_ws_port=$(($ARGO_PORT + 10))
     vless_ws_port=$(($ARGO_PORT + 11))
@@ -355,8 +415,8 @@ install_singbox() {
     private_key=$(echo "${output}" | awk '/PrivateKey:/ {print $2}')
     public_key=$(echo "${output}" | awk '/PublicKey:/ {print $2}')
 
-    # 仅开放对外端口；内部 WS 端口只监听 127.0.0.1，无需公网放行
-    allow_port $vless_port/tcp $nginx_port/tcp $tuic_port/udp $hy2_port/udp ${ARGO_PORT}/tcp > /dev/null 2>&1
+    # 仅开放对外端口；Argo 内部 WS 端口只监听 127.0.0.1，无需公网放行
+    allow_port $vless_port/tcp $hy2_port/udp $tuic_port/udp $vless_ws_direct_port/tcp $nginx_port/tcp ${ARGO_PORT}/tcp > /dev/null 2>&1
 
     openssl ecparam -genkey -name prime256v1 -out "${work_dir}/private.key"
     openssl req -new -x509 -days 3650 -key "${work_dir}/private.key" -out "${work_dir}/cert.pem" -subj "/CN=bing.com"
@@ -497,6 +557,27 @@ EOF
         "max_version": "1.3",
         "certificate_path": "$work_dir/cert.pem",
         "key_path": "$work_dir/private.key"
+      }
+    },
+    {
+      "type": "vless",
+      "tag": "vless-ws-direct",
+      "listen": "::",
+      "listen_port": $vless_ws_direct_port,
+      "users": [
+        {
+          "uuid": "$uuid"
+        }
+      ],
+      "tls": {
+        "enabled": true,
+        "certificate_path": "$work_dir/cert.pem",
+        "key_path": "$work_dir/private.key"
+      },
+      "transport": {
+        "type": "ws",
+        "path": "/vless",
+        "early_data_header_name": "Sec-WebSocket-Protocol"
       }
     },
     {
@@ -682,6 +763,15 @@ get_info() {
 
     green "\nArgoDomain：${purple}$argodomain${re}\n"
 
+    # 若未在安装流程中赋值，从配置读取端口
+    if [ -z "$vless_port" ] || [ -z "$hy2_port" ] || [ -z "$tuic_port" ] || [ -z "$vless_ws_direct_port" ]; then
+        [ -z "$vless_port" ] && vless_port=$(jq -r '.inbounds[] | select(.tag=="vless-reality") | .listen_port' "${conf_dir}/inbounds.json" 2>/dev/null)
+        [ -z "$hy2_port" ] && hy2_port=$(jq -r '.inbounds[] | select(.tag=="hysteria2") | .listen_port' "${conf_dir}/inbounds.json" 2>/dev/null)
+        [ -z "$tuic_port" ] && tuic_port=$(jq -r '.inbounds[] | select(.tag=="tuic") | .listen_port' "${conf_dir}/inbounds.json" 2>/dev/null)
+        [ -z "$vless_ws_direct_port" ] && vless_ws_direct_port=$(jq -r '.inbounds[] | select(.tag=="vless-ws-direct") | .listen_port' "${conf_dir}/inbounds.json" 2>/dev/null)
+    fi
+    [ -z "$nginx_port" ] && nginx_port=$((${ARGO_PORT:-8001} + 13))
+
     # 节点前缀处理
     if [ -z "$node_prefix" ]; then
         prefix="$isp"
@@ -707,6 +797,8 @@ vless://${uuid}@${CFIP}:${CFPORT}?encryption=none&security=tls&sni=${argodomain}
 trojan://${uuid}@${CFIP}:${CFPORT}?security=tls&sni=${argodomain}&fp=firefox&type=ws&host=${argodomain}&path=%2Ftrojan-argo%3Fed%3D2560#${prefix}-argo-trojan
 
 hysteria2://${uuid}@${server_ip}:${hy2_port}/?sni=www.bing.com&insecure=1&pinSHA256=${fingerprint}&alpn=h3&obfs=none#${prefix}-hysteria2
+
+vless://${uuid}@${server_ip}:${vless_ws_direct_port}?encryption=none&security=tls&sni=www.bing.com&fp=firefox&type=ws&host=${server_ip}&path=%2Fvless&allowInsecure=1#${prefix}-vless-ws
 
 tuic://${uuid}:${uuid}@${server_ip}:${tuic_port}?sni=www.bing.com&congestion_control=bbr&udp_relay_mode=native&alpn=h3&allow_insecure=1#${prefix}-tuic
 EOF
@@ -1086,7 +1178,7 @@ create_shortcut() {
 #!/usr/bin/env bash
 # 优先执行本机保存的脚本；不存在时才拉取远程
 LOCAL_SCRIPT="/etc/sing-box/sing-box.sh"
-REMOTE_URL="${SB_REMOTE_URL:-https://raw.githubusercontent.com/gxjxzgx/sing-box/refs/heads/main/sing-box1.sh}"
+REMOTE_URL="${SB_REMOTE_URL:-https://raw.githubusercontent.com/eooce/sing-box/main/sing-box.sh}"
 if [ -f "$LOCAL_SCRIPT" ] && [ -s "$LOCAL_SCRIPT" ]; then
     exec bash "$LOCAL_SCRIPT" "$@"
 else
@@ -1541,8 +1633,17 @@ change_config() {
             local inbounds_file="${conf_dir}/inbounds.json"
             case "${choice}" in
                 1)
-                    reading "\n请输入vless-reality端口 (回车跳过将使用随机端口): " new_port
-                    [ -z "$new_port" ] && new_port=$(shuf -i 2000-65000 -n 1)
+                    while true; do
+                        reading "\n请输入vless-reality端口 (回车跳过将使用随机端口): " new_port
+                        [ -z "$new_port" ] && new_port=$(shuf -i 2000-65000 -n 1)
+                        if ! [[ "$new_port" =~ ^[0-9]+$ ]] || [ "$new_port" -lt 1 ] || [ "$new_port" -gt 65535 ]; then
+                            red "端口无效"; continue
+                        fi
+                        if port_in_use "$new_port"; then
+                            red "端口 ${new_port} 已被占用，请重新输入"; continue
+                        fi
+                        break
+                    done
                     # 仅修改 tag=vless-reality，避免误改 vless-ws
                     if ! jq --argjson port "$new_port" \
                         '(.inbounds[] | select(.tag == "vless-reality")).listen_port = $port' \
@@ -1567,8 +1668,17 @@ change_config() {
                     green "\nvless-reality端口已修改成：${purple}$new_port${re}\n"
                     ;;
                 2)
-                    reading "\n请输入hysteria2端口 (回车跳过将使用随机端口): " new_port
-                    [ -z "$new_port" ] && new_port=$(shuf -i 2000-65000 -n 1)
+                    while true; do
+                        reading "\n请输入hysteria2端口 (回车跳过将使用随机端口): " new_port
+                        [ -z "$new_port" ] && new_port=$(shuf -i 2000-65000 -n 1)
+                        if ! [[ "$new_port" =~ ^[0-9]+$ ]] || [ "$new_port" -lt 1 ] || [ "$new_port" -gt 65535 ]; then
+                            red "端口无效"; continue
+                        fi
+                        if port_in_use "$new_port"; then
+                            red "端口 ${new_port} 已被占用，请重新输入"; continue
+                        fi
+                        break
+                    done
                     if ! jq --argjson port "$new_port" \
                         '(.inbounds[] | select(.tag == "hysteria2")).listen_port = $port' \
                         "$inbounds_file" > "${inbounds_file}.tmp"; then
@@ -1590,8 +1700,17 @@ change_config() {
                     green "\nhysteria2端口已修改为：${purple}${new_port}${re}\n"
                     ;;
                 3)
-                    reading "\n请输入tuic端口 (回车跳过将使用随机端口): " new_port
-                    [ -z "$new_port" ] && new_port=$(shuf -i 2000-65000 -n 1)
+                    while true; do
+                        reading "\n请输入tuic端口 (回车跳过将使用随机端口): " new_port
+                        [ -z "$new_port" ] && new_port=$(shuf -i 2000-65000 -n 1)
+                        if ! [[ "$new_port" =~ ^[0-9]+$ ]] || [ "$new_port" -lt 1 ] || [ "$new_port" -gt 65535 ]; then
+                            red "端口无效"; continue
+                        fi
+                        if port_in_use "$new_port"; then
+                            red "端口 ${new_port} 已被占用，请重新输入"; continue
+                        fi
+                        break
+                    done
                     if ! jq --argjson port "$new_port" \
                         '(.inbounds[] | select(.tag == "tuic")).listen_port = $port' \
                         "$inbounds_file" > "${inbounds_file}.tmp"; then
@@ -2649,6 +2768,33 @@ update_sub() {
     refresh_sub "$client_dir"
 }
 
+# 通用：把新节点链接写入订阅文件并生效（供各 add_* 协议函数复用）
+publish_node_url() {
+    local url_line="$1"
+    echo "" >> "${client_dir}"
+    echo "${url_line}" >> "${client_dir}"
+    update_sub
+    restart_singbox
+}
+
+# 通用：按 tag 删除协议入站并从订阅中移除（供各 remove_* 协议函数复用）
+remove_protocol() {
+    local tag="$1" url_prefix="$2" label="$3"
+    local inbounds_file="${conf_dir}/inbounds.json"
+
+    if ! proto_exists "$tag"; then
+        yellow "${label} 协议未添加，无需删除。"; sleep 1; return
+    fi
+
+    jq --arg tag "$tag" 'del(.inbounds[] | select(.tag == $tag))' \
+        "$inbounds_file" > "${inbounds_file}.tmp" && mv "${inbounds_file}.tmp" "$inbounds_file"
+
+    remove_url_by_tag "$url_prefix"
+    update_sub
+    restart_singbox
+    green "\n${label} 协议已删除\n"
+}
+
 # ---- Socks5 入站 ----
 add_socks5_inbound() {
     local inbounds_file="${conf_dir}/inbounds.json"
@@ -2662,24 +2808,9 @@ add_socks5_inbound() {
     local current_uuid
     current_uuid=$(get_current_uuid | tr -d '\n\r')
 
-    # 端口输入验证循环
-    while true; do
-        reading "请输入 Socks5 监听端口 (回车随机生成): " sk_port
-        if [ -z "$sk_port" ]; then
-            sk_port=$(shuf -i 10000-65000 -n 1)
-            green "socks5监听端口：${purple}${sk_port}${re}"
-            break
-        fi
-
-        # 统一验证端口格式和范围
-        if [[ ! "$sk_port" =~ ^[0-9]+$ ]] || [ "$sk_port" -gt 65535 ] || [ "$sk_port" -lt 1 ]; then
-            yellow "错误：端口必须是1-65535之间的数字！"
-            continue
-        fi
-
-        green "socks5监听端口：${purple}${sk_port}${re}"
-        break
-    done
+    # 端口输入验证（含占用检测，复用通用端口选择函数）
+    read_available_port "请输入 Socks5 监听端口 (回车随机生成): " sk_port
+    green "socks5监听端口：${purple}${sk_port}${re}"
 
     reading "请输入 Socks5 用户名 (回车自动使用UUID前8位): " sk_user
     if [ -n "$sk_user" ]; then
@@ -2730,11 +2861,7 @@ add_socks5_inbound() {
 
     local url_line="socks://$(printf '%s' "${sk_user}:${sk_pass}" | base64 -w0)@${server_ip}:${sk_port}#${isp}"
 
-    echo "" >> "${client_dir}"
-    echo "${url_line}" >> "${client_dir}"
-    update_sub
-
-    restart_singbox
+    publish_node_url "$url_line"
 
     green "\nSocks5 协议已添加！"
     green "端口: ${purple}${sk_port}${re}"
@@ -2744,20 +2871,7 @@ add_socks5_inbound() {
 }
 
 remove_socks5_inbound() {
-    local inbounds_file="${conf_dir}/inbounds.json"
-    local tag="socks5-in"
-
-    if ! proto_exists "$tag"; then
-        yellow "Socks5 协议未添加，无需删除。"; sleep 1; return
-    fi
-
-    jq --arg tag "$tag" 'del(.inbounds[] | select(.tag == $tag))' \
-        "$inbounds_file" > "${inbounds_file}.tmp" && mv "${inbounds_file}.tmp" "$inbounds_file"
-
-    remove_url_by_tag "socks"
-    update_sub
-    restart_singbox
-    green "\nSocks5 协议已删除\n"
+    remove_protocol "socks5-in" "socks" "Socks5"
 }
 
 # ---- AnyTLS ----
@@ -2776,24 +2890,9 @@ add_anytls() {
         red "无法获取当前UUID，请确认 sing-box 已正确安装并配置。"; sleep 2; return
     fi
 
-    # 端口输入验证循环
-    while true; do
-        reading "请输入 AnyTLS 监听端口 (回车随机生成): " at_port
-
-        if [ -z "$at_port" ]; then
-            at_port=$(shuf -i 10000-65000 -n 1)
-            green "Anytls监听端口：${purple}${at_port}${re}"
-            break
-        fi
-
-        if [[ ! "$at_port" =~ ^[0-9]+$ ]] || [ "$at_port" -gt 65535 ] || [ "$at_port" -lt 1 ]; then
-            yellow "错误：端口必须是1-65535之间的数字！"
-            continue
-        fi
-
-        green "Anytls监听端口：${purple}${at_port}${re}"
-        break
-    done
+    # 端口输入验证（含占用检测，复用通用端口选择函数）
+    read_available_port "请输入 AnyTLS 监听端口 (回车随机生成): " at_port
+    green "Anytls监听端口：${purple}${at_port}${re}"
 
     jq --arg tag "$tag" \
        --argjson port "$at_port" \
@@ -2822,11 +2921,7 @@ add_anytls() {
 
     local url_line="anytls://${current_uuid}@${server_ip}:${at_port}?insecure=1&sni=bing.com#${isp}"
 
-    echo "" >> "${client_dir}"
-    echo "${url_line}" >> "${client_dir}"
-    update_sub
-
-    restart_singbox
+    publish_node_url "$url_line"
 
     green "\nAnyTLS 协议已添加！"
     green "密码(UUID): ${purple}${current_uuid}${re}"
@@ -2836,20 +2931,7 @@ add_anytls() {
 }
 
 remove_anytls() {
-    local inbounds_file="${conf_dir}/inbounds.json"
-    local tag="anytls"
-
-    if ! proto_exists "$tag"; then
-        yellow "AnyTLS 协议未添加，无需删除。"; sleep 1; return
-    fi
-
-    jq --arg tag "$tag" 'del(.inbounds[] | select(.tag == $tag))' \
-        "$inbounds_file" > "${inbounds_file}.tmp" && mv "${inbounds_file}.tmp" "$inbounds_file"
-
-    remove_url_by_tag "anytls"
-    update_sub
-    restart_singbox
-    green "\nAnyTLS 协议已删除\n"
+    remove_protocol "anytls" "anytls" "AnyTLS"
 }
 
 # ---- Shadowsocks-2022 ----
@@ -2861,24 +2943,9 @@ add_ss2022() {
         yellow "Shadowsocks-2022 协议已存在，无需重复添加。"; sleep 1; return
     fi
 
-    # 端口输入验证循环
-    while true; do
-        reading "请输入 Shadowsocks-2022 监听端口 (回车随机生成): " ss_port
-
-        if [ -z "$ss_port" ]; then
-            ss_port=$(shuf -i 10000-65000 -n 1)
-            green "Shadowsocks-2022监听端口：${purple}${ss_port}${re}"
-            break
-        fi
-
-        if [[ ! "$ss_port" =~ ^[0-9]+$ ]] || [ "$ss_port" -gt 65535 ] || [ "$ss_port" -lt 1 ]; then
-            yellow "错误：端口必须是1-65535之间的数字！"
-            continue
-        fi
-
-        green "Shadowsocks-2022监听端口：${purple}${ss_port}${re}"
-        break
-    done
+    # 端口输入验证（含占用检测，复用通用端口选择函数）
+    read_available_port "请输入 Shadowsocks-2022 监听端口 (回车随机生成): " ss_port
+    green "Shadowsocks-2022监听端口：${purple}${ss_port}${re}"
 
     echo ""
     green "请选择加密方式:"
@@ -2921,11 +2988,7 @@ add_ss2022() {
     ss_userinfo=$(printf '%s:%s' "${ss_method}" "${ss_key}" | base64 -w0)
     local url_line="ss://${ss_userinfo}@${server_ip}:${ss_port}#${isp}"
 
-    echo "" >> "${client_dir}"
-    echo "${url_line}" >> "${client_dir}"
-    update_sub
-
-    restart_singbox
+    publish_node_url "$url_line"
 
     green "\nShadowsocks-2022 协议已添加！"
     green "加密方式: ${purple}${ss_method}${re}"
@@ -2936,129 +2999,10 @@ add_ss2022() {
 }
 
 remove_ss2022() {
-    local inbounds_file="${conf_dir}/inbounds.json"
-    local tag="shadowsocks-2022"
-
-    if ! proto_exists "$tag"; then
-        yellow "Shadowsocks-2022 协议未添加，无需删除。"; sleep 1; return
-    fi
-
-    jq --arg tag "$tag" 'del(.inbounds[] | select(.tag == $tag))' \
-        "$inbounds_file" > "${inbounds_file}.tmp" && mv "${inbounds_file}.tmp" "$inbounds_file"
-
-    remove_url_by_tag "ss"
-    update_sub
-    restart_singbox
-    green "\nShadowsocks-2022 协议已删除\n"
+    remove_protocol "shadowsocks-2022" "ss" "Shadowsocks-2022"
 }
 
 # 显示当前已启用的额外协议状态
-
-# ---- VLESS-WS 直连 (path=/vless) ----
-add_vless_ws_direct() {
-    local inbounds_file="${conf_dir}/inbounds.json"
-    local tag="vless-ws-direct"
-
-    if proto_exists "$tag"; then
-        yellow "VLESS-WS 直连协议已存在，无需重复添加。"; sleep 1; return
-    fi
-
-    local current_uuid
-    current_uuid=$(get_current_uuid)
-    if [ -z "$current_uuid" ]; then
-        red "无法获取当前UUID，请确认 sing-box 已正确安装。"; sleep 2; return
-    fi
-
-    while true; do
-        reading "请输入 VLESS-WS 直连监听端口 (回车随机生成): " vw_port
-        if [ -z "$vw_port" ]; then
-            vw_port=$(shuf -i 10000-65000 -n 1)
-            green "VLESS-WS 直连端口：${purple}${vw_port}${re}"
-            break
-        fi
-        if [[ ! "$vw_port" =~ ^[0-9]+$ ]] || [ "$vw_port" -gt 65535 ] || [ "$vw_port" -lt 1 ]; then
-            yellow "错误：端口必须是1-65535之间的数字！"
-            continue
-        fi
-        green "VLESS-WS 直连端口：${purple}${vw_port}${re}"
-        break
-    done
-
-    jq --arg tag "$tag" \
-       --argjson port "$vw_port" \
-       --arg uuid "$current_uuid" \
-       --arg cert "${work_dir}/cert.pem" \
-       --arg key "${work_dir}/private.key" \
-       '.inbounds += [{
-           "type": "vless",
-           "tag": $tag,
-           "listen": "::",
-           "listen_port": $port,
-           "users": [{"uuid": $uuid}],
-           "tls": {
-               "enabled": true,
-               "certificate_path": $cert,
-               "key_path": $key
-           },
-           "transport": {
-               "type": "ws",
-               "path": "/vless",
-               "early_data_header_name": "Sec-WebSocket-Protocol"
-           }
-       }]' "$inbounds_file" > "${inbounds_file}.tmp" && mv "${inbounds_file}.tmp" "$inbounds_file"
-
-    allow_port ${vw_port}/tcp > /dev/null 2>&1
-
-    local server_ip
-    server_ip=$(get_realip)
-    local isp
-    isp=$(get_isp "VLESS-WS")
-
-    # 节点前缀
-    local prefix
-    if [ -z "$node_prefix" ]; then
-        prefix="$isp"
-    else
-        prefix="${node_prefix}-${isp}"
-    fi
-
-    local url_line="vless://${current_uuid}@${server_ip}:${vw_port}?encryption=none&security=tls&sni=www.bing.com&fp=firefox&type=ws&host=${server_ip}&path=%2Fvless&allowInsecure=1#${prefix}-vless-ws"
-
-    echo "" >> "${client_dir}"
-    echo "${url_line}" >> "${client_dir}"
-    update_sub
-
-    restart_singbox
-
-    green "\nVLESS-WS 直连协议已添加！"
-    green "端口: ${purple}${vw_port}${re}"
-    green "路径: ${purple}/vless${re}"
-    green "节点链接:\n${purple}${url_line}${re}\n"
-    [ -x "${work_dir}/qrencode" ] && "${work_dir}/qrencode" "$url_line"
-}
-
-remove_vless_ws_direct() {
-    local inbounds_file="${conf_dir}/inbounds.json"
-    local tag="vless-ws-direct"
-
-    if ! proto_exists "$tag"; then
-        yellow "VLESS-WS 直连协议未添加，无需删除。"; sleep 1; return
-    fi
-
-    jq --arg tag "$tag" 'del(.inbounds[] | select(.tag == $tag))' \
-        "$inbounds_file" > "${inbounds_file}.tmp" && mv "${inbounds_file}.tmp" "$inbounds_file"
-
-    # 删除带 path=/vless 或 path=%2Fvless 且非 argo 的直连节点
-    sed -i '/path=%2Fvless[^a-zA-Z]/d; /path=\/vless[^a-zA-Z]/d' "$client_dir" 2>/dev/null
-    # 更精确：删除备注含 vless-ws 且非 argo 的
-    sed -i '/#.*-vless-ws$/d' "$client_dir" 2>/dev/null
-    sed -i '/^$/N;/\n$/D' "$client_dir" 2>/dev/null
-
-    update_sub
-    restart_singbox
-    green "\nVLESS-WS 直连协议已删除\n"
-}
-
 
 show_extra_proto_status() {
     local inbounds_file="${conf_dir}/inbounds.json"
@@ -3096,14 +3040,6 @@ show_extra_proto_status() {
         echo -e " Shadowsocks-2022: ${yellow}未启用${re}"
     fi
 
-    # VLESS-WS 直连
-    if jq -e '.inbounds[] | select(.tag == "vless-ws-direct")' "$inbounds_file" > /dev/null 2>&1; then
-        local vw_port
-        vw_port=$(jq -r '.inbounds[] | select(.tag == "vless-ws-direct") | .listen_port' "$inbounds_file")
-        echo -e " VLESS-WS 直连:    ${green}已启用${re} (端口: ${skyblue}${vw_port}${re}, 路径: ${skyblue}/vless${re})"
-    else
-        echo -e " VLESS-WS 直连:    ${yellow}未启用${re}"
-    fi
     echo ""
 }
 
@@ -3130,10 +3066,6 @@ manage_protocols() {
     green "5. 添加 Shadowsocks-2022 协议"
     red   "6. 删除 Shadowsocks-2022 协议"
     skyblue "-----------------------------"
-    green "--- VLESS-WS 直连 (path=/vless) ---"
-    green "7. 添加 VLESS-WS 直连协议"
-    red   "8. 删除 VLESS-WS 直连协议"
-    skyblue "-----------------------------"
     purple "0. 返回主菜单"
     skyblue "-----------------------------"
     reading "请输入选择: " proto_choice
@@ -3145,8 +3077,6 @@ manage_protocols() {
         4) remove_anytls ;;
         5) add_ss2022 ;;
         6) remove_ss2022 ;;
-        7) add_vless_ws_direct ;;
-        8) remove_vless_ws_direct ;;
         0) menu; return ;;
         *) red "无效的选项！" ;;
     esac
