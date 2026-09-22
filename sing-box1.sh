@@ -438,13 +438,22 @@ install_singbox() {
 
     [ ! -d "${work_dir}" ] && mkdir -p "${work_dir}" && chmod 777 "${work_dir}" && mkdir -p "${conf_dir}"
 
-    # ---------- 下载 sing-box（优先官方 GitHub，失败回退镜像） ----------
-    purple "正在下载最新版 sing-box (官方优先)..."
+    # ---------- 下载 sing-box（下载后必须能实际执行，否则回退） ----------
+    # Alpine/musl 上官方 glibc 构建会出现: cannot execute: required file not found
+    purple "正在下载最新版 sing-box..."
     SB_ARCH="${ARCH}"
+
+    # 校验二进制是否真能运行（避免假成功）
+    _singbox_bin_ok() {
+        [ -f "${work_dir}/sing-box" ] || return 1
+        chmod +x "${work_dir}/sing-box" 2>/dev/null || true
+        # 能打印 version 才算成功
+        "${work_dir}/sing-box" version >/dev/null 2>&1
+    }
+
     download_singbox_official() {
         local tmpdir version tarball url bin
         tmpdir=$(mktemp -d)
-        # 获取最新稳定版 tag
         version=$(curl -sL --connect-timeout 10 --max-time 30 \
             "https://api.github.com/repos/SagerNet/sing-box/releases/latest" 2>/dev/null \
             | grep -o '"tag_name":[[:space:]]*"[^"]*"' | head -1 | cut -d'"' -f4 | sed 's/^v//')
@@ -456,35 +465,65 @@ install_singbox() {
         [ -z "$version" ] && { rm -rf "$tmpdir"; return 1; }
         tarball="sing-box-${version}-linux-${SB_ARCH}.tar.gz"
         url="https://github.com/SagerNet/sing-box/releases/download/v${version}/${tarball}"
-        purple "  版本: ${version}  架构: ${SB_ARCH}"
+        purple "  官方版本: ${version}  架构: ${SB_ARCH}"
         if curl -sL --connect-timeout 15 --max-time 120 -o "${tmpdir}/${tarball}" "$url"; then
             if tar -tzf "${tmpdir}/${tarball}" >/dev/null 2>&1; then
-                # 解压（兼容是否带目录层级）
                 tar -xzf "${tmpdir}/${tarball}" -C "$tmpdir" 2>/dev/null
                 bin=$(find "$tmpdir" -type f -name "sing-box" 2>/dev/null | head -1)
                 if [ -n "$bin" ] && [ -f "$bin" ]; then
                     cp -f "$bin" "${work_dir}/sing-box"
                     chmod +x "${work_dir}/sing-box"
                     rm -rf "$tmpdir"
-                    return 0
+                    # 必须能执行，否则视为失败（Alpine musl 常见）
+                    if _singbox_bin_ok; then
+                        return 0
+                    fi
+                    yellow "官方二进制无法在本系统执行（多为 Alpine/musl 不兼容）"
+                    rm -f "${work_dir}/sing-box"
+                    return 1
                 fi
             fi
         fi
         rm -rf "$tmpdir"
         return 1
     }
-    if download_singbox_official; then
-        sb_ver=$("${work_dir}/sing-box" version 2>/dev/null | head -1 || echo "unknown")
-        green "sing-box 官方下载成功: ${purple}${sb_ver}${re}"
-    else
-        yellow "官方下载失败，回退到镜像源..."
+
+    download_singbox_mirror() {
+        yellow "尝试镜像源: https://${ARCH}.eooce.com/sb"
         if curl -sL --connect-timeout 15 --max-time 120 -o "${work_dir}/sing-box" "https://${ARCH}.eooce.com/sb"; then
             chmod +x "${work_dir}/sing-box"
-            green "sing-box 镜像下载成功"
-        else
-            red "sing-box 下载失败，请检查网络后重试"
-            exit 1
+            if _singbox_bin_ok; then
+                return 0
+            fi
+            yellow "镜像二进制无法执行"
+            rm -f "${work_dir}/sing-box"
         fi
+        return 1
+    }
+
+    # Alpine：优先镜像（通常为可运行构建）；其它系统优先官方
+    sb_got=0
+    if command_exists apk 2>/dev/null; then
+        if download_singbox_mirror; then
+            sb_got=1
+        elif download_singbox_official; then
+            sb_got=1
+        fi
+    else
+        if download_singbox_official; then
+            sb_got=1
+        elif download_singbox_mirror; then
+            sb_got=1
+        fi
+    fi
+
+    if [ "$sb_got" -eq 1 ] && _singbox_bin_ok; then
+        sb_ver=$("${work_dir}/sing-box" version 2>/dev/null | head -1)
+        green "sing-box 下载成功: ${purple}${sb_ver}${re}"
+    else
+        red "sing-box 下载失败或无法在本系统执行"
+        red "Alpine 用户请确认网络可访问镜像，或手动放入兼容的 sing-box 到 /etc/sing-box/sing-box"
+        exit 1
     fi
 
     # ---------- 下载 qrencode（优先系统包，失败回退镜像） ----------
