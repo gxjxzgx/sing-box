@@ -13,6 +13,8 @@
 #
 # 本修改版变更摘要:
 #   1. sing-box / cloudflared 优先官方下载，失败回退镜像
+#      - Alpine/musl：优先官方 -musl 构建 → 默认官方 → 镜像
+#      - 其它系统：优先官方默认 → 镜像
 #   2. 节点 IP 优先使用 IPv4
 #   3. 去除终端订阅链接与二维码输出；本地仍写 url.txt / sub.txt
 #   4. 端口冲突时明确提示占用端口，并支持交互修改
@@ -23,7 +25,7 @@
 #   9. 保持 Argo→Nginx→三WS 架构；统一 Argo 配置辅助函数，清理重复代码
 #
 # 基于: eooce/sing-box  修改日期: 2026.9.22
-# 版本: v2
+# 版本: v2.1 (Alpine 官方 musl 优先)
 # =========================
 
 export LANG=en_US.UTF-8
@@ -439,7 +441,8 @@ install_singbox() {
     [ ! -d "${work_dir}" ] && mkdir -p "${work_dir}" && chmod 777 "${work_dir}" && mkdir -p "${conf_dir}"
 
     # ---------- 下载 sing-box（下载后必须能实际执行，否则回退） ----------
-    # Alpine/musl 上官方 glibc 构建会出现: cannot execute: required file not found
+    # Alpine/musl 上官方默认 glibc 构建会出现: cannot execute: required file not found
+    # 官方现已提供 -musl 变体，Alpine 优先尝试官方 musl，再默认官方，最后镜像
     purple "正在下载最新版 sing-box..."
     SB_ARCH="${ARCH}"
 
@@ -451,21 +454,42 @@ install_singbox() {
         "${work_dir}/sing-box" version >/dev/null 2>&1
     }
 
-    download_singbox_official() {
-        local tmpdir version tarball url bin
-        tmpdir=$(mktemp -d)
-        version=$(curl -sL --connect-timeout 10 --max-time 30 \
+    # 获取最新版本号（只查一次，供后续多次尝试复用）
+    _sb_get_latest_version() {
+        local ver
+        ver=$(curl -sL --connect-timeout 10 --max-time 30 \
             "https://api.github.com/repos/SagerNet/sing-box/releases/latest" 2>/dev/null \
             | grep -o '"tag_name":[[:space:]]*"[^"]*"' | head -1 | cut -d'"' -f4 | sed 's/^v//')
-        if [ -z "$version" ]; then
-            version=$(curl -sL --connect-timeout 10 --max-time 30 \
+        if [ -z "$ver" ]; then
+            ver=$(curl -sL --connect-timeout 10 --max-time 30 \
                 "https://github.com/SagerNet/sing-box/releases/latest" 2>/dev/null \
                 | grep -oE 'tag/v[0-9]+\.[0-9]+\.[0-9]+' | head -1 | sed 's|tag/v||')
         fi
+        printf '%s' "$ver"
+    }
+
+    # 从官方下载指定变体；参数: 可选后缀，如 "musl"（实际文件名为 linux-${ARCH}-musl）
+    # 无参数则下载默认 linux-${ARCH}.tar.gz
+    download_singbox_official() {
+        local variant="${1:-}"
+        local tmpdir version tarball url bin suffix_label
+        tmpdir=$(mktemp -d)
+        version="${SB_LATEST_VERSION:-}"
+        if [ -z "$version" ]; then
+            version=$(_sb_get_latest_version)
+            SB_LATEST_VERSION="$version"
+        fi
         [ -z "$version" ] && { rm -rf "$tmpdir"; return 1; }
-        tarball="sing-box-${version}-linux-${SB_ARCH}.tar.gz"
+
+        if [ -n "$variant" ]; then
+            tarball="sing-box-${version}-linux-${SB_ARCH}-${variant}.tar.gz"
+            suffix_label=" (${variant})"
+        else
+            tarball="sing-box-${version}-linux-${SB_ARCH}.tar.gz"
+            suffix_label=""
+        fi
         url="https://github.com/SagerNet/sing-box/releases/download/v${version}/${tarball}"
-        purple "  官方版本: ${version}  架构: ${SB_ARCH}"
+        purple "  官方版本: ${version}  架构: ${SB_ARCH}${suffix_label}"
         if curl -sL --connect-timeout 15 --max-time 120 -o "${tmpdir}/${tarball}" "$url"; then
             if tar -tzf "${tmpdir}/${tarball}" >/dev/null 2>&1; then
                 tar -xzf "${tmpdir}/${tarball}" -C "$tmpdir" 2>/dev/null
@@ -478,7 +502,7 @@ install_singbox() {
                     if _singbox_bin_ok; then
                         return 0
                     fi
-                    yellow "官方二进制无法在本系统执行（多为 Alpine/musl 不兼容）"
+                    yellow "官方二进制${suffix_label}无法在本系统执行"
                     rm -f "${work_dir}/sing-box"
                     return 1
                 fi
@@ -501,12 +525,17 @@ install_singbox() {
         return 1
     }
 
-    # Alpine：优先镜像（通常为可运行构建）；其它系统优先官方
+    # Alpine(musl)：优先官方 musl → 官方默认 → 镜像
+    # 其它系统：优先官方默认 → 镜像
     sb_got=0
+    SB_LATEST_VERSION=""
     if command_exists apk 2>/dev/null; then
-        if download_singbox_mirror; then
+        purple "检测到 Alpine/musl，优先尝试官方 musl 构建..."
+        if download_singbox_official "musl"; then
             sb_got=1
         elif download_singbox_official; then
+            sb_got=1
+        elif download_singbox_mirror; then
             sb_got=1
         fi
     else
@@ -522,7 +551,7 @@ install_singbox() {
         green "sing-box 下载成功: ${purple}${sb_ver}${re}"
     else
         red "sing-box 下载失败或无法在本系统执行"
-        red "Alpine 用户请确认网络可访问镜像，或手动放入兼容的 sing-box 到 /etc/sing-box/sing-box"
+        red "Alpine 用户可尝试: apk add sing-box，或手动放入兼容的 sing-box 到 /etc/sing-box/sing-box"
         exit 1
     fi
 
@@ -3624,7 +3653,7 @@ menu() {
     purple "---Argo 状态: ${argo_status}"
     purple "--Nginx 状态: ${nginx_status}"
     purple "singbox 状态: ${singbox_status}\n"
-    yellow "节点优先 IPv4 | 二进制官方优先 | 无独立订阅端口 | 支持固定隧道交互配置\n"
+    yellow "节点优先 IPv4 | 官方优先(Alpine用musl) | 无独立订阅端口 | 支持固定隧道交互配置\n"
     green "1. 安装sing-box"
     red   "2. 卸载sing-box"
     echo "==============="
@@ -3681,7 +3710,7 @@ case "$1" in
         echo ""
         green "  不带参数          进入交互式主菜单"
         echo ""
-        yellow "修改版: 官方二进制优先 | 节点优先 IPv4 | 无独立订阅端口"
+        yellow "修改版: 官方优先(Alpine→musl) | 节点优先 IPv4 | 无独立订阅端口"
         yellow "支持环境变量: PORT / ARGO_PORT / ARGO_DOMAIN / ARGO_TOKEN / CFIP / CFPORT / uuid / node_prefix / BOT_TOKEN / CHAT_ID"
         yellow "安装时交互输入: 直连起始端口、Argo 入口端口、隧道类型、固定隧道域名、隧道令牌"
         echo ""
