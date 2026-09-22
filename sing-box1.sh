@@ -773,9 +773,21 @@ install_singbox() {
     vless_ws_port=$(($ARGO_PORT + 11))
     trojan_ws_port=$(($ARGO_PORT + 12))
     password=$(< /dev/urandom tr -dc 'A-Za-z0-9' | head -c 24)
-    output=$(/etc/sing-box/sing-box generate reality-keypair)
-    private_key=$(echo "${output}" | awk '/PrivateKey:/ {print $2}')
-    public_key=$(echo "${output}" | awk '/PublicKey:/ {print $2}')
+    output=$(/etc/sing-box/sing-box generate reality-keypair 2>/dev/null)
+    private_key=$(echo "${output}" | grep -i 'PrivateKey' | awk '{print $NF}' | tr -d '\r')
+    public_key=$(echo "${output}" | grep -i 'PublicKey' | awk '{print $NF}' | tr -d '\r')
+    if [ -z "$private_key" ] || [ -z "$public_key" ]; then
+        # 兼容不同版本输出格式，再试一次
+        output=$(/etc/sing-box/sing-box generate reality-keypair 2>&1)
+        private_key=$(echo "${output}" | sed -n 's/.*PrivateKey:[[:space:]]*//p' | head -1 | tr -d '\r')
+        public_key=$(echo "${output}" | sed -n 's/.*PublicKey:[[:space:]]*//p' | head -1 | tr -d '\r')
+    fi
+    if [ -z "$private_key" ] || [ -z "$public_key" ]; then
+        red "Reality 密钥生成失败，请检查 sing-box 二进制是否正常"
+        red "输出: ${output}"
+        exit 1
+    fi
+    green "Reality 密钥已生成"
 
     # 仅开放对外端口；Argo 内部 WS 端口只监听 127.0.0.1，无需公网放行
     allow_port $vless_port/tcp $hy2_port/udp $tuic_port/udp $vless_ws_direct_port/tcp ${ARGO_PORT}/tcp > /dev/null 2>&1
@@ -1189,13 +1201,39 @@ EOF
 
 # 适配alpine 守护进程
 alpine_openrc_services() {
+    # OpenRC：使用 supervise-daemon，避免 pidfile 残留导致「已启动但未运行」
     cat > /etc/init.d/sing-box << 'EOF'
 #!/sbin/openrc-run
+name="sing-box"
 description="sing-box service"
 command="/etc/sing-box/sing-box"
 command_args="run -C /etc/sing-box/conf"
+command_user="root"
+directory="/etc/sing-box"
+pidfile="/run/sing-box.pid"
 command_background=true
-pidfile="/var/run/sing-box.pid"
+# 崩溃后自动拉起
+supervisor=supervise-daemon
+respawn_delay=3
+output_log="/etc/sing-box/sb-stdout.log"
+error_log="/etc/sing-box/sb-stderr.log"
+
+depend() {
+    need net
+    after firewall
+}
+
+start_pre() {
+    # 清理陈旧 pidfile，避免误判为已启动
+    if [ -f "$pidfile" ] && ! pgrep -f "/etc/sing-box/sing-box run" >/dev/null 2>&1; then
+        rm -f "$pidfile"
+    fi
+    # 启动前快速校验配置
+    if ! /etc/sing-box/sing-box check -C /etc/sing-box/conf >/dev/null 2>&1; then
+        eerror "sing-box 配置校验失败，请检查 /etc/sing-box/conf"
+        return 1
+    fi
+}
 EOF
 
     rewrite_argo_service
