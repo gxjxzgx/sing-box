@@ -202,11 +202,22 @@ check_service() {
     [[ ! -f "${service_file}" ]] && { red "not installed"; return 2; }
 
     if command_exists apk; then
-        rc-service "${service_name}" status | grep -q "started" && green "running" || yellow "not running"
+        if rc-service "${service_name}" status 2>/dev/null | grep -q "started"; then
+            green "running"
+            return 0
+        else
+            yellow "not running"
+            return 1
+        fi
     else
-        systemctl is-active "${service_name}" | grep -q "^active$" && green "running" || yellow "not running"
+        if systemctl is-active "${service_name}" 2>/dev/null | grep -q "^active$"; then
+            green "running"
+            return 0
+        else
+            yellow "not running"
+            return 1
+        fi
     fi
-    return $?
 }
 
 # 检查sing-box状态
@@ -1201,36 +1212,29 @@ EOF
 
 # 适配alpine 守护进程
 alpine_openrc_services() {
-    # OpenRC：使用 supervise-daemon，避免 pidfile 残留导致「已启动但未运行」
+    # 使用与原版兼容的 OpenRC 写法（Alpine 通用，不依赖 supervise-daemon）
     cat > /etc/init.d/sing-box << 'EOF'
 #!/sbin/openrc-run
-name="sing-box"
 description="sing-box service"
 command="/etc/sing-box/sing-box"
 command_args="run -C /etc/sing-box/conf"
-command_user="root"
-directory="/etc/sing-box"
-pidfile="/run/sing-box.pid"
 command_background=true
-# 崩溃后自动拉起
-supervisor=supervise-daemon
-respawn_delay=3
-output_log="/etc/sing-box/sb-stdout.log"
-error_log="/etc/sing-box/sb-stderr.log"
+pidfile="/var/run/sing-box.pid"
 
 depend() {
     need net
-    after firewall
 }
 
 start_pre() {
-    # 清理陈旧 pidfile，避免误判为已启动
-    if [ -f "$pidfile" ] && ! pgrep -f "/etc/sing-box/sing-box run" >/dev/null 2>&1; then
-        rm -f "$pidfile"
+    # 清理陈旧 pid，避免「already started」但进程已死
+    if [ -f "$pidfile" ]; then
+        oldpid=$(cat "$pidfile" 2>/dev/null)
+        if [ -n "$oldpid" ] && ! kill -0 "$oldpid" 2>/dev/null; then
+            rm -f "$pidfile"
+        fi
     fi
-    # 启动前快速校验配置
-    if ! /etc/sing-box/sing-box check -C /etc/sing-box/conf >/dev/null 2>&1; then
-        eerror "sing-box 配置校验失败，请检查 /etc/sing-box/conf"
+    if [ ! -x /etc/sing-box/sing-box ]; then
+        eerror "找不到 /etc/sing-box/sing-box"
         return 1
     fi
 }
@@ -1238,7 +1242,10 @@ EOF
 
     rewrite_argo_service
     chmod +x /etc/init.d/sing-box
-    rc-update add sing-box default > /dev/null 2>&1
+    # 确保 argo init 可执行
+    [ -f /etc/init.d/argo ] && chmod +x /etc/init.d/argo
+    rc-update add sing-box default >/dev/null 2>&1 || true
+    rc-update add argo default >/dev/null 2>&1 || true
 }
 
 # 生成节点链接并写入 url.txt / sub.txt（不再打印 HTTP 订阅地址）
@@ -1988,8 +1995,7 @@ change_hosts() {
 
 # 非交互静默安装（-i 参数；仍走官方优先下载与 IPv4 逻辑）
 auto_install() {
-    check_singbox &>/dev/null
-    if [ $? -eq 0 ]; then
+    if [ -x "${work_dir}/sing-box" ]; then
         yellow "sing-box 已经安装，跳过安装流程。"
         exit 0
     fi
@@ -3651,9 +3657,9 @@ case "$1" in
             need_pause=true
             case "${choice}" in
                 1)
-                    check_singbox &>/dev/null; singbox_check=$?
-                    if [ ${singbox_check} -eq 0 ]; then
-                        yellow "sing-box 已经安装！\n"
+                    # 以二进制是否存在判断是否已安装（不依赖运行状态）
+                    if [ -x "${work_dir}/sing-box" ]; then
+                        yellow "sing-box 已经安装！如需重装请先卸载。\n"
                     else
                         manage_packages install nginx jq tar openssl lsof coreutils
                         install_singbox
