@@ -1960,6 +1960,40 @@ setup_telegram() {
     setup_telegram
 }
 
+# 确保系统有 crontab（Alpine 默认可能没有，需装 dcron）
+ensure_crontab() {
+    if command_exists crontab; then
+        return 0
+    fi
+    yellow "未找到 crontab，尝试安装 cron 组件..."
+    if command_exists apk; then
+        # Alpine: dcron 提供 crontab；busybox 的 crond 不一定带 crontab 命令
+        apk add --no-cache dcron 2>/dev/null || apk add --no-cache cronie 2>/dev/null || true
+        if command_exists rc-service; then
+            rc-update add dcron default 2>/dev/null || rc-update add crond default 2>/dev/null || true
+            rc-service dcron start 2>/dev/null || rc-service crond start 2>/dev/null || true
+        fi
+    elif command_exists apt; then
+        DEBIAN_FRONTEND=noninteractive apt install -y cron 2>/dev/null || true
+        systemctl enable cron 2>/dev/null || systemctl enable crond 2>/dev/null || true
+        systemctl start cron 2>/dev/null || systemctl start crond 2>/dev/null || true
+    elif command_exists dnf; then
+        dnf install -y cronie 2>/dev/null || true
+        systemctl enable crond 2>/dev/null || true
+        systemctl start crond 2>/dev/null || true
+    elif command_exists yum; then
+        yum install -y cronie 2>/dev/null || true
+        systemctl enable crond 2>/dev/null || true
+        systemctl start crond 2>/dev/null || true
+    fi
+    if command_exists crontab; then
+        green "crontab 已就绪"
+        return 0
+    fi
+    red "无法安装 crontab（Alpine 可手动: apk add dcron && rc-service dcron start）"
+    return 1
+}
+
 # 离线监控脚本（供 cron 调用）
 install_tg_monitor() {
     load_tg_config
@@ -1969,6 +2003,10 @@ install_tg_monitor() {
     fi
     TG_ENABLED="1"
     save_tg_config
+
+    if ! ensure_crontab; then
+        return 1
+    fi
 
     reading "请输入检测间隔(分钟，回车默认2，最小1): " mon_min
     [ -z "$mon_min" ] && mon_min=2
@@ -2042,15 +2080,30 @@ SEOF
 MONEOF
     chmod +x "${work_dir}/tg_monitor.sh"
 
-    # 写入 crontab
+    # 写入 crontab（失败则明确报错，不假装成功）
     local cron_line="*/${mon_min} * * * * ${work_dir}/tg_monitor.sh >/dev/null 2>&1"
-    (crontab -l 2>/dev/null | grep -v "tg_monitor.sh"; echo "$cron_line") | crontab -
-    green "离线监控已安装（每 ${mon_min} 分钟检测 sing-box / argo / nginx）"
-    yellow "状态变化时会推送离线/恢复通知到 Telegram"
+    if (crontab -l 2>/dev/null | grep -v "tg_monitor.sh"; echo "$cron_line") | crontab - 2>/dev/null; then
+        green "离线监控已安装（每 ${mon_min} 分钟检测 sing-box / argo / nginx）"
+        yellow "状态变化时会推送离线/恢复通知到 Telegram"
+        # 确认 cron 守护进程在跑
+        if command_exists rc-service; then
+            rc-service dcron status 2>/dev/null | grep -q started || \
+            rc-service crond status 2>/dev/null | grep -q started || \
+            yellow "提示: 请确认 dcron/crond 服务已启动（rc-service dcron start）"
+        elif command_exists systemctl; then
+            systemctl is-active --quiet cron || systemctl is-active --quiet crond || \
+            yellow "提示: 请确认 cron/crond 服务已启动"
+        fi
+    else
+        red "写入 crontab 失败，离线监控未生效"
+        return 1
+    fi
 }
 
 uninstall_tg_monitor() {
-    crontab -l 2>/dev/null | grep -v "tg_monitor.sh" | crontab - 2>/dev/null || true
+    if command_exists crontab; then
+        crontab -l 2>/dev/null | grep -v "tg_monitor.sh" | crontab - 2>/dev/null || true
+    fi
     rm -f "${work_dir}/tg_monitor.sh" "${work_dir}/tg_monitor.state"
     green "离线监控已卸载"
 }
