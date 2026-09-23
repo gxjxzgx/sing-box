@@ -23,9 +23,12 @@
 #   7. 固定隧道：域名留空直接回退临时隧道，不再询问令牌；令牌留空同样回退
 #   8. 令牌输入支持自动剥离前缀：sudo cloudflared service install / cloudflared.exe ... 等，仅保留 eyJ 开头有效 Token
 #   9. 保持 Argo→Nginx→三WS 架构；统一 Argo 配置辅助函数，清理重复代码
+#  10. 移除 qrencode（已无订阅二维码需求，额外协议也不再输出终端二维码）
+#  11. 清理废弃 HTTP 订阅菜单；cloudflared 增加可执行校验；Token 配置安全转义
+#  12. 移除主菜单「Nginx管理」（Nginx 仍由安装/Argo 自动配置，状态仅展示）
 #
 # 基于: eooce/sing-box  修改日期: 2026.9.22
-# 版本: v2.1 (Alpine 官方 musl 优先)
+# 版本: v2.4
 # =========================
 
 export LANG=en_US.UTF-8
@@ -555,30 +558,7 @@ install_singbox() {
         exit 1
     fi
 
-    # ---------- 下载 qrencode（优先系统包，失败回退镜像） ----------
-    purple "正在准备 qrencode..."
-    if command_exists qrencode; then
-        cp "$(command -v qrencode)" "${work_dir}/qrencode" 2>/dev/null || true
-        green "使用系统已安装的 qrencode"
-    else
-        if manage_packages install qrencode 2>/dev/null; then
-            if command_exists qrencode; then
-                cp "$(command -v qrencode)" "${work_dir}/qrencode" 2>/dev/null || true
-                green "已通过包管理器安装 qrencode"
-            fi
-        fi
-    fi
-    if [ ! -x "${work_dir}/qrencode" ]; then
-        yellow "系统安装失败，回退到镜像源下载 qrencode..."
-        if curl -sL --connect-timeout 15 --max-time 60 -o "${work_dir}/qrencode" "https://${ARCH}.eooce.com/qrencode"; then
-            chmod +x "${work_dir}/qrencode"
-            green "qrencode 镜像下载成功"
-        else
-            yellow "qrencode 下载失败，二维码功能将不可用（不影响核心功能）"
-        fi
-    fi
-
-    # ---------- 下载 cloudflared（优先官方，失败回退镜像） ----------
+    # ---------- 下载 cloudflared（优先官方，失败或不可执行则回退镜像） ----------
     case "${ARCH}" in
         amd64)  CF_ARCH="amd64" ;;
         386)    CF_ARCH="386" ;;
@@ -586,24 +566,48 @@ install_singbox() {
         armv7)  CF_ARCH="arm" ;;
         *)      CF_ARCH="amd64" ;;
     esac
+    _argo_bin_ok() {
+        [ -f "${work_dir}/argo" ] || return 1
+        chmod +x "${work_dir}/argo" 2>/dev/null || true
+        "${work_dir}/argo" version >/dev/null 2>&1
+    }
     purple "正在下载最新版 cloudflared (官方)..."
-    if ! curl -sL --connect-timeout 15 --max-time 120 \
+    argo_got=0
+    if curl -sL --connect-timeout 15 --max-time 120 \
         -o "${work_dir}/argo" \
         "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${CF_ARCH}"; then
+        if _argo_bin_ok; then
+            argo_got=1
+        else
+            yellow "官方 cloudflared 无法在本系统执行，回退到镜像源..."
+            rm -f "${work_dir}/argo"
+        fi
+    else
         yellow "官方下载失败，回退到镜像源..."
-        curl -sLo "${work_dir}/argo" "https://${ARCH}.eooce.com/bot"
+    fi
+    if [ "$argo_got" -eq 0 ]; then
+        if curl -sL --connect-timeout 15 --max-time 120 -o "${work_dir}/argo" "https://${ARCH}.eooce.com/bot"; then
+            if _argo_bin_ok; then
+                argo_got=1
+            else
+                yellow "镜像 cloudflared 也无法执行（Argo 隧道可能不可用）"
+                rm -f "${work_dir}/argo"
+            fi
+        else
+            yellow "cloudflared 镜像下载失败（Argo 隧道可能不可用）"
+        fi
     fi
 
     chown root:root ${work_dir} 2>/dev/null || true
-    chmod +x "${work_dir}/${server_name}" "${work_dir}/argo" 2>/dev/null || true
-    [ -f "${work_dir}/qrencode" ] && chmod +x "${work_dir}/qrencode" 2>/dev/null || true
+    chmod +x "${work_dir}/${server_name}" 2>/dev/null || true
+    [ -f "${work_dir}/argo" ] && chmod +x "${work_dir}/argo" 2>/dev/null || true
 
     # 显示版本信息
     if [ -x "${work_dir}/sing-box" ]; then
         sb_ver=$("${work_dir}/sing-box" version 2>/dev/null | head -1 || echo "unknown")
         green "sing-box 版本: ${purple}${sb_ver}${re}"
     fi
-    if [ -x "${work_dir}/argo" ]; then
+    if [ -x "${work_dir}/argo" ] && _argo_bin_ok; then
         argo_ver=$("${work_dir}/argo" version 2>/dev/null | head -1 || echo "unknown")
         green "cloudflared 版本: ${purple}${argo_ver}${re}"
     fi
@@ -851,7 +855,6 @@ install_singbox() {
     vmess_ws_port=$(($ARGO_PORT + 10))
     vless_ws_port=$(($ARGO_PORT + 11))
     trojan_ws_port=$(($ARGO_PORT + 12))
-    password=$(< /dev/urandom tr -dc 'A-Za-z0-9' | head -c 24)
     output=$(/etc/sing-box/sing-box generate reality-keypair 2>/dev/null)
     private_key=$(echo "${output}" | grep -i 'PrivateKey' | awk '{print $NF}' | tr -d '\r')
     public_key=$(echo "${output}" | grep -i 'PublicKey' | awk '{print $NF}' | tr -d '\r')
@@ -1117,15 +1120,15 @@ EOF
 # ---------- Argo 配置辅助（统一入口，避免多处重复写 conf / 服务单元）----------
 # 架构固定：cloudflared → Nginx(ARGO_PORT) → 三个本机 WS 端口
 
-# 保存固定隧道配置
+# 保存固定隧道配置（Token 用 printf %q 转义，避免含引号时 source 失败）
 save_argo_fixed_conf() {
     mkdir -p "${work_dir}"
-    cat > "${work_dir}/argo_fixed.conf" << ARGOEOF
-ARGO_USE_FIXED=1
-ARGO_DOMAIN="${ARGO_DOMAIN}"
-ARGO_TOKEN='${ARGO_TOKEN}'
-ARGO_PORT="${ARGO_PORT}"
-ARGOEOF
+    {
+        echo "ARGO_USE_FIXED=1"
+        printf 'ARGO_DOMAIN=%q\n' "${ARGO_DOMAIN}"
+        printf 'ARGO_TOKEN=%q\n' "${ARGO_TOKEN}"
+        printf 'ARGO_PORT=%q\n' "${ARGO_PORT}"
+    } > "${work_dir}/argo_fixed.conf"
     chmod 600 "${work_dir}/argo_fixed.conf"
 }
 
@@ -1361,7 +1364,6 @@ get_info() {
         [ -z "$tuic_port" ] && tuic_port=$(jq -r '.inbounds[] | select(.tag=="tuic") | .listen_port' "${conf_dir}/inbounds.json" 2>/dev/null)
         [ -z "$vless_ws_direct_port" ] && vless_ws_direct_port=$(jq -r '.inbounds[] | select(.tag=="vless-ws-direct") | .listen_port' "${conf_dir}/inbounds.json" 2>/dev/null)
     fi
-    # nginx_port 已废弃（无独立订阅端口）
 
     # 节点前缀处理
     if [ -z "$node_prefix" ]; then
@@ -2524,83 +2526,24 @@ IEOF
     esac
 }
 
-disable_open_sub() {
-    local singbox_installed=$?
-    check_singbox &>/dev/null; singbox_installed=$?
-    if [ $singbox_installed -eq 2 ]; then
-        yellow "sing-box 尚未安装！"; sleep 1; menu; return
-    fi
-
+# 本修改版已取消独立 HTTP 订阅端口；仅提示本地节点文件位置
+show_node_files() {
     clear; echo ""
-    green "=== 管理节点订阅 ===\n"
-    yellow "提示: 本修改版已去掉独立 HTTP 订阅端口，以下选项基本不可用。\n"
-    yellow "请直接查看/复制: /etc/sing-box/url.txt  或  /etc/sing-box/sub.txt\n"
-    skyblue "------------"
-    green "1. 关闭节点订阅"
-    skyblue "------------"
-    green "2. 开启节点订阅"
-    skyblue "------------"
-    green "3. 更换订阅端口"
-    skyblue "------------"
-    green "4. 重启订阅服务"
-    skyblue "------------"
-    purple "0. 返回主菜单"
-    skyblue "------------"
-    reading "请输入选择: " choice
-    case "${choice}" in
-        1)
-            if command -v nginx &>/dev/null; then
-                if command_exists rc-service 2>/dev/null; then
-                    rc-service nginx status | grep -q "started" && rc-service nginx stop || red "nginx not running"
-                else
-                    [ "$(systemctl is-active nginx)" = "active" ] && systemctl stop nginx || red "nginx not running"
-                fi
-            else
-                yellow "Nginx is not installed"
-            fi
-            green "\n已关闭节点订阅\n"
-            ;;
-        2)
-            server_ip=$(get_realip)
-            password=$(tr -dc A-Za-z < /dev/urandom | head -c 32)
-            sed -i "s|\(location = /\)[^ ]*|\1$password|" /etc/nginx/conf.d/sing-box.conf
-            sub_port=$(grep -E 'listen [0-9]+;' "/etc/nginx/conf.d/sing-box.conf" | awk '{print $2}' | sed 's/;//' | head -1)
-            start_nginx
-            local link
-            [ "$sub_port" -eq 80 ] 2>/dev/null && link="http://$server_ip/$password" || link="http://$server_ip:$sub_port/$password"
-            green "\n已开启节点订阅\n新的节点订阅链接：$link\n"
-            ;;
-        3)
-            reading "请输入新的订阅端口(1-65535,直接回车随机生成):" sub_port
-            [ -z "$sub_port" ] && sub_port=$(shuf -i 2000-65000 -n 1)
-            until [[ -z $(lsof -iTCP:"$sub_port" -sTCP:LISTEN -t) ]]; do
-                echo -e "${red}端口 $sub_port 已被占用${re}"
-                reading "请输入新的订阅端口(1-65535):" sub_port
-                [[ -z $sub_port ]] && sub_port=$(shuf -i 2000-65000 -n 1)
-            done
-            green "新的订阅端口为：${purple}${sub_port}${re}"
-            [ -f "/etc/nginx/conf.d/sing-box.conf" ] && \
-                cp "/etc/nginx/conf.d/sing-box.conf" "/etc/nginx/conf.d/sing-box.conf.bak.$(date +%Y%m%d)"
-            sed -i 's/listen [0-9]\+;/listen '$sub_port';/g' "/etc/nginx/conf.d/sing-box.conf"
-            sed -i 's/listen \[::\]:[0-9]\+;/listen [::]:'$sub_port';/g' "/etc/nginx/conf.d/sing-box.conf"
-            path=$(sed -n 's|.*location = /\([^ ]*\).*|\1|p' "/etc/nginx/conf.d/sing-box.conf")
-            server_ip=$(get_realip)
-            allow_port $sub_port/tcp > /dev/null 2>&1
-            if nginx -t > /dev/null 2>&1; then
-                nginx -s reload > /dev/null 2>&1 || restart_nginx
-                green "\n订阅端口更换成功\n新的订阅链接为：${purple}http://${server_ip}:${sub_port}/${path}${re}\n"
-            else
-                red "nginx配置测试失败，正在恢复..."
-                latest_backup=$(ls -t /etc/nginx/conf.d/sing-box.conf.bak.* 2>/dev/null | head -1)
-                [ -n "$latest_backup" ] && cp "$latest_backup" "/etc/nginx/conf.d/sing-box.conf"
-                return 1
-            fi
-            ;;
-        4) restart_nginx ;;
-        0) menu ;;
-        *) red "无效的选项！" ;;
-    esac
-    read -n 1 -s -r -p $'\n\033[1;91m按任意键返回...\033[0m\n'
+    green "=== 节点文件说明 ===\n"
+    yellow "本版本已去掉独立 HTTP 订阅端口与订阅链接输出。\n"
+    green "明文节点列表: ${purple}${work_dir}/url.txt${re}"
+    green "base64 订阅体: ${purple}${work_dir}/sub.txt${re}"
+    echo ""
+    if [ -f "${work_dir}/url.txt" ]; then
+        yellow "当前节点预览:\n"
+        while IFS= read -r line; do
+            [ -z "$line" ] && continue
+            echo -e "${purple}${line}${re}"
+        done < "${work_dir}/url.txt"
+        echo ""
+    else
+        red "尚未生成节点文件，请先安装 sing-box。\n"
+    fi
 }
 
 # singbox 管理（优化版：循环 + 状态刷新）
@@ -2626,37 +2569,6 @@ manage_singbox() {
             1) start_singbox ;;
             2) stop_singbox ;;
             3) restart_singbox ;;
-            0) return ;;
-            *) red "无效的选项，请重新输入"; sleep 1; continue ;;
-        esac
-        echo ""
-        read -n 1 -s -r -p $'\033[1;91m按任意键继续...\033[0m'
-    done
-}
-
-# Nginx 管理（与 sing-box 管理风格统一）
-manage_nginx() {
-    while true; do
-        local nginx_status
-        nginx_status=$(check_nginx 2>/dev/null)
-        clear
-        echo ""
-        green "=== Nginx 管理 ===\n"
-        green "当前状态: ${nginx_status}\n"
-        green "1. 启动 Nginx 服务"
-        skyblue "-------------------"
-        green "2. 停止 Nginx 服务"
-        skyblue "-------------------"
-        green "3. 重启 Nginx 服务"
-        skyblue "-------------------"
-        purple "0. 返回主菜单"
-        skyblue "------------"
-        reading "\n请输入选择: " choice
-        echo ""
-        case "${choice}" in
-            1) start_nginx ;;
-            2) manage_service "nginx" "stop" ;;
-            3) restart_nginx ;;
             0) return ;;
             *) red "无效的选项，请重新输入"; sleep 1; continue ;;
         esac
@@ -2851,20 +2763,11 @@ change_argo_domain() {
     send_tg_nodes 2>/dev/null || true
 }
 
-# 查看当前节点信息（仅打印节点链接，无订阅地址）
+# 查看当前节点信息（仅打印节点链接）
 check_nodes() {
     if [ ! -f "${work_dir}/url.txt" ]; then
         red "节点信息文件不存在，请先安装 sing-box"; return 1
     fi
-
-    server_ip=$(get_realip)
-    local lujing sub_port base64_url
-
-    if [ -f "/etc/nginx/conf.d/sing-box.conf" ]; then
-        lujing=$(sed -n 's|.*location = /\([^ ]*\).*|\1|p' "/etc/nginx/conf.d/sing-box.conf")
-        sub_port=$(sed -n 's/^\s*listen \([0-9]\+\);/\1/p' "/etc/nginx/conf.d/sing-box.conf" | head -1)
-    fi
-    base64_url="http://${server_ip}:${sub_port}/${lujing}"
 
     clear; echo ""
     green "=== 当前节点信息 ===\n"
@@ -2875,7 +2778,8 @@ check_nodes() {
     done < "${work_dir}/url.txt"
 
     yellow "\n温馨提醒: 若 hysteria2/tuic 不通，请将客户端「跳过证书验证」设为 true 或更换内核\n"
-    yellow "节点文件: ${work_dir}/url.txt\n"
+    yellow "节点文件: ${work_dir}/url.txt"
+    yellow "本地 base64: ${work_dir}/sub.txt\n"
 }
 
 change_cfip() {
@@ -3422,7 +3326,6 @@ add_socks5_inbound() {
     green "端口: ${purple}${sk_port}${re}"
     green "用户名: ${purple}${sk_user}${re}  ${green}密码:${re} ${purple}${sk_pass}${re}"
     green "节点链接: ${purple}${url_line}${re}\n"
-    [ -x "${work_dir}/qrencode" ] && "${work_dir}/qrencode" "$url_line"
 }
 
 remove_socks5_inbound() {
@@ -3482,7 +3385,6 @@ add_anytls() {
     green "密码(UUID): ${purple}${current_uuid}${re}"
     green "端口: ${purple}${at_port}${re}"
     green "节点链接:\n${purple}${url_line}${re}\n"
-    [ -x "${work_dir}/qrencode" ] && "${work_dir}/qrencode" "$url_line"
 }
 
 remove_anytls() {
@@ -3550,7 +3452,6 @@ add_ss2022() {
     green "密钥(base64): ${purple}${ss_key}${re}"
     green "端口: ${purple}${ss_port}${re}"
     green "节点链接:\n${purple}${url_line}${re}\n"
-    [ -x "${work_dir}/qrencode" ] && "${work_dir}/qrencode" "$url_line"
 }
 
 remove_ss2022() {
@@ -3659,18 +3560,17 @@ menu() {
     echo "==============="
     green "3. sing-box管理"
     green "4. Argo隧道管理"
-    green "5. Nginx管理"
     echo "==============="
-    green "6. 查看节点信息"
-    green "7. 修改节点配置"
-    green "8. 管理节点订阅(已弱化)"
-    green "9. WARP分流管理"
+    green "5. 查看节点信息"
+    green "6. 修改节点配置"
+    green "7. 查看节点文件说明"
+    green "8. WARP分流管理"
     echo "==============="
-    green "10. 增加/删除协议"
+    green "9. 增加/删除协议"
     echo "==============="
-    green "11. Telegram通知设置"
+    green "10. Telegram通知设置"
     echo "==============="
-    purple "12. ssh综合工具箱"
+    purple "11. ssh综合工具箱"
     echo "==============="
     red "0. 退出脚本"
     echo "==========="
@@ -3720,7 +3620,7 @@ case "$1" in
         # 无参数：进入交互式主菜单
         while true; do
             menu
-            reading "请输入选择(0-12): " choice
+            reading "请输入选择(0-11): " choice
             echo ""
             need_pause=true
             case "${choice}" in
@@ -3755,21 +3655,20 @@ case "$1" in
                 2)  uninstall_singbox;  need_pause=false ;;
                 3)  manage_singbox;     need_pause=false ;;
                 4)  manage_argo;        need_pause=true ;;
-                5)  manage_nginx;       need_pause=false ;;
-                6)  check_nodes;        need_pause=true ;;
-                7)  change_config;      need_pause=true ;;
-                8)  disable_open_sub;   need_pause=true ;;
-                9)  warp_manage;        need_pause=false ;;
-                10) manage_protocols;   need_pause=false ;;
-                11) setup_telegram;     need_pause=false ;;
-                12)
+                5)  check_nodes;        need_pause=true ;;
+                6)  change_config;      need_pause=true ;;
+                7)  show_node_files;    need_pause=true ;;
+                8)  warp_manage;        need_pause=false ;;
+                9)  manage_protocols;   need_pause=false ;;
+                10) setup_telegram;     need_pause=false ;;
+                11)
                     clear
                     bash <(curl -Ls ssh_tool.eooce.com)
                     need_pause=false
                     ;;
                 0)  exit 0 ;;
                 *)
-                    red "无效的选项，请输入 0-12"
+                    red "无效的选项，请输入 0-11"
                     need_pause=true
                     ;;
             esac
