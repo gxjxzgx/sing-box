@@ -1,0 +1,1916 @@
+#!/bin/bash
+
+# =========================
+# sing-box Argo 隧道专用安装脚本（精简版）
+# 仅保留: vmess-ws / vless-ws / trojan-ws (经 Cloudflare Argo 隧道)
+# 已移除: vless-reality | hysteria2 | tuic | vless-ws直连 | 额外协议
+#
+# 架构: Cloudflare → Nginx(ARGO_PORT) → 本机三协议 WS
+# 端口: ARGO_PORT(入口)  内部WS=+10~+12 (仅本机)
+#
+# 基于: eooce/sing-box  精简日期: 2026.9.24
+# =========================
+
+export LANG=en_US.UTF-8
+re="\033[0m"
+red="\033[1;91m"
+green="\e[1;32m"
+yellow="\e[1;33m"
+purple="\e[1;35m"
+skyblue="\e[1;36m"
+red() { echo -e "\e[1;91m$1\033[0m"; }
+green() { echo -e "\e[1;32m$1\033[0m"; }
+yellow() { echo -e "\e[1;33m$1\033[0m"; }
+purple() { echo -e "\e[1;35m$1\033[0m"; }
+skyblue() { echo -e "\e[1;36m$1\033[0m"; }
+reading() { read -p "$(red "$1")" "$2"; }
+
+server_name="sing-box"
+work_dir="/etc/sing-box"
+conf_dir="${work_dir}/conf"
+client_dir="${work_dir}/url.txt"
+export CFIP=${CFIP:-'cdns.doon.eu.org'}
+export ARGO_PORT=${ARGO_PORT:-'8001'}
+export CFPORT=${CFPORT:-'443'}
+
+[[ $EUID -ne 0 ]] && red "请在root用户下运行脚本，可输入 sudo -i 回车切换到root用户" && exit 1
+
+command_exists() {
+    command -v "$1" >/dev/null 2>&1
+}
+
+# 自动清理 Argo 隧道令牌：去除常见前缀，仅保留有效 Token（通常以 eyJ 开头）
+clean_argo_token() {
+    local raw="$1"
+    [ -z "$raw" ] && { echo ""; return; }
+    if echo "$raw" | grep -q 'TunnelSecret'; then
+        printf '%s' "$raw"
+        return
+    fi
+    local token
+    token=$(printf '%s' "$raw" | grep -oE 'eyJ[A-Za-z0-9+/=._-]+' | head -1)
+    if [ -n "$token" ]; then
+        if [ "$token" != "$raw" ]; then
+            yellow "已自动去除命令前缀，仅保留有效令牌 (eyJ...)" >&2
+        fi
+        printf '%s' "$token"
+        return
+    fi
+    token=$(printf '%s' "$raw" | sed -E \
+        -e 's/^[[:space:]]*//' \
+        -e 's/[[:space:]]*$//' \
+        -e 's/.*(cloudflared(\.exe)?[[:space:]]+service[[:space:]]+install[[:space:]]+)//' \
+        -e 's/.*(cloudflared(\.exe)?[[:space:]]+tunnel[[:space:]]+run[[:space:]]+--token[[:space:]]+)//' \
+        -e 's/^sudo[[:space:]]+//' \
+        -e 's/^[[:space:]]*//' \
+        -e 's/[[:space:]]*$//')
+    printf '%s' "$token"
+}
+
+port_in_use() {
+    local port="$1"
+    [ -z "$port" ] && return 1
+    [ "${SKIP_PORT_CHECK:-0}" = "1" ] && return 1
+    if ! [[ "$port" =~ ^[0-9]+$ ]] || [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
+        return 1
+    fi
+    local py=""
+    command_exists python3 && py=python3
+    [ -z "$py" ] && command_exists python && py=python
+    if [ -n "$py" ]; then
+        if $py -c "
+import socket, sys
+p = int(sys.argv[1])
+try:
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind(('0.0.0.0', p))
+    s.close()
+    sys.exit(1)
+except Exception:
+    sys.exit(0)
+" "$port" 2>/dev/null; then
+            return 0
+        else
+            return 1
+        fi
+    fi
+    local hex
+    hex=$(printf '%04X' "$port" 2>/dev/null) || hex=""
+    if [ -n "$hex" ]; then
+        if awk -v h="$hex" '
+            NR > 1 {
+                n = split($2, a, ":")
+                if (n >= 2 && toupper(a[n]) == h) exit 0
+            }
+            END { exit 1 }
+        ' /proc/net/tcp /proc/net/tcp6 /proc/net/udp /proc/net/udp6 2>/dev/null; then
+            return 0
+        fi
+        if [ -r /proc/net/tcp ]; then
+            return 1
+        fi
+    fi
+    if command_exists ss; then
+        if ss -tuln 2>/dev/null | grep -E 'LISTEN|UNCONN' | grep -qE "[:.]${port}([^0-9]|$)"; then
+            return 0
+        fi
+    fi
+    return 1
+}
+
+check_service() {
+    local service_name=$1
+    local service_file=$2
+    [[ ! -f "${service_file}" ]] && { red "not installed"; return 2; }
+    if command_exists apk; then
+        if rc-service "${service_name}" status 2>/dev/null | grep -q "started"; then
+            green "running"; return 0
+        else
+            yellow "not running"; return 1
+        fi
+    else
+        if systemctl is-active "${service_name}" 2>/dev/null | grep -q "^active$"; then
+            green "running"; return 0
+        else
+            yellow "not running"; return 1
+        fi
+    fi
+}
+
+check_singbox() { check_service "sing-box" "${work_dir}/${server_name}"; }
+check_argo() { check_service "argo" "${work_dir}/argo"; }
+check_nginx() {
+    command_exists nginx || { red "not installed"; return 2; }
+    check_service "nginx" "$(command -v nginx)"
+}
+
+manage_packages() {
+    if [ $# -lt 2 ]; then
+        red "Unspecified package name or action"
+        return 1
+    fi
+    action=$1
+    shift
+    if [ "$action" == "install" ] && [ ! -d "$work_dir" ]; then
+        yellow "正在更新系统软件包...\n"
+        if command_exists apt; then
+            DEBIAN_FRONTEND=noninteractive apt update -y && DEBIAN_FRONTEND=noninteractive apt upgrade -y
+        elif command_exists dnf; then
+            dnf update -y
+        elif command_exists yum; then
+            yum update -y
+        elif command_exists apk; then
+            apk update && apk upgrade
+        else
+            yellow "Unknown system!\n"
+        fi
+        green "finished updated system\n"
+    fi
+    for package in "$@"; do
+        if [ "$action" == "install" ]; then
+            if command_exists "$package"; then
+                green "${package} already installed"
+                continue
+            fi
+            yellow "正在安装 ${package}..."
+            if command_exists apt; then
+                DEBIAN_FRONTEND=noninteractive apt install -y "$package"
+            elif command_exists dnf; then
+                dnf install -y "$package"
+            elif command_exists yum; then
+                yum install -y "$package"
+            elif command_exists apk; then
+                apk add "$package"
+            else
+                red "Unknown system!"; return 1
+            fi
+        elif [ "$action" == "uninstall" ]; then
+            if ! command_exists "$package"; then
+                yellow "${package} is not installed"; continue
+            fi
+            yellow "正在卸载 ${package}..."
+            if command_exists apt; then
+                apt remove -y "$package" && apt autoremove -y
+            elif command_exists dnf; then
+                dnf remove -y "$package" && dnf autoremove -y
+            elif command_exists yum; then
+                yum remove -y "$package" && yum autoremove -y
+            elif command_exists apk; then
+                apk del "$package"
+            else
+                red "Unknown system!"; return 1
+            fi
+        else
+            red "Unknown action: $action"; return 1
+        fi
+    done
+    return 0
+}
+
+get_isp() {
+    local fallback="${1:-node}"
+    local result
+    result=$(curl -sm 3 -H "User-Agent: Mozilla/5.0" "https://api.ip.sb/geoip" 2>/dev/null | tr -d '\n' | \
+        awk -F\" '{c="";i="";for(x=1;x<=NF;x++){if($x=="country_code")c=$(x+2);if($x=="isp")i=$(x+2)};if(c&&i)print c"-"i}' | \
+        sed 's/ /_/g')
+    if [ -z "$result" ]; then
+        result=$(curl -sm 3 -H "User-Agent: Mozilla/5.0" "https://ipapi.co/json" 2>/dev/null | tr -d '\n' | \
+            awk -F\" '{c="";o="";for(x=1;x<=NF;x++){if($x=="country_code")c=$(x+2);if($x=="org")o=$(x+2)};if(c&&o)print c"-"o}' | \
+            sed 's/ /_/g')
+    fi
+    echo "${result:-$fallback}"
+}
+
+refresh_sub() {
+    local src="${1:-$client_dir}"
+    [ -f "$src" ] || return 1
+    if base64 -w0 "$src" > "${work_dir}/sub.txt" 2>/dev/null; then
+        :
+    else
+        base64 "$src" | tr -d '\n\r' > "${work_dir}/sub.txt"
+    fi
+    chmod 644 "${work_dir}/sub.txt" 2>/dev/null || true
+}
+
+allow_port() {
+    has_ufw=0; has_firewalld=0; has_iptables=0; has_ip6tables=0
+    command_exists ufw && has_ufw=1
+    command_exists firewall-cmd && systemctl is-active firewalld >/dev/null 2>&1 && has_firewalld=1
+    command_exists iptables && has_iptables=1
+    command_exists ip6tables && has_ip6tables=1
+    [ "$has_ufw" -eq 1 ] && ufw --force default allow outgoing >/dev/null 2>&1
+    [ "$has_firewalld" -eq 1 ] && firewall-cmd --permanent --zone=public --set-target=ACCEPT >/dev/null 2>&1
+    [ "$has_iptables" -eq 1 ] && {
+        iptables -C INPUT -i lo -j ACCEPT 2>/dev/null || iptables -I INPUT 3 -i lo -j ACCEPT
+        iptables -C INPUT -p icmp -j ACCEPT 2>/dev/null || iptables -I INPUT 4 -p icmp -j ACCEPT
+        iptables -P FORWARD DROP 2>/dev/null || true
+        iptables -P OUTPUT ACCEPT 2>/dev/null || true
+    }
+    [ "$has_ip6tables" -eq 1 ] && {
+        ip6tables -C INPUT -i lo -j ACCEPT 2>/dev/null || ip6tables -I INPUT 3 -i lo -j ACCEPT
+        ip6tables -C INPUT -p icmp -j ACCEPT 2>/dev/null || ip6tables -I INPUT 4 -p icmp -j ACCEPT
+        ip6tables -P FORWARD DROP 2>/dev/null || true
+        ip6tables -P OUTPUT ACCEPT 2>/dev/null || true
+    }
+    for rule in "$@"; do
+        port=${rule%/*}
+        proto=${rule#*/}
+        [ "$has_ufw" -eq 1 ] && ufw allow in ${port}/${proto} >/dev/null 2>&1
+        [ "$has_firewalld" -eq 1 ] && firewall-cmd --permanent --add-port=${port}/${proto} >/dev/null 2>&1
+        [ "$has_iptables" -eq 1 ] && (iptables -C INPUT -p ${proto} --dport ${port} -j ACCEPT 2>/dev/null || iptables -I INPUT 4 -p ${proto} --dport ${port} -j ACCEPT)
+        [ "$has_ip6tables" -eq 1 ] && (ip6tables -C INPUT -p ${proto} --dport ${port} -j ACCEPT 2>/dev/null || ip6tables -I INPUT 4 -p ${proto} --dport ${port} -j ACCEPT)
+    done
+    [ "$has_firewalld" -eq 1 ] && firewall-cmd --reload >/dev/null 2>&1
+    if command_exists rc-service 2>/dev/null; then
+        [ "$has_iptables" -eq 1 ] && iptables-save > /etc/iptables/rules.v4 2>/dev/null
+        [ "$has_ip6tables" -eq 1 ] && ip6tables-save > /etc/iptables/rules.v6 2>/dev/null
+    else
+        if ! command_exists netfilter-persistent; then
+            manage_packages install iptables-persistent || yellow "请手动安装netfilter-persistent或保存iptables规则"
+            netfilter-persistent save >/dev/null 2>&1
+        elif command_exists service; then
+            service iptables save 2>/dev/null
+            service ip6tables save 2>/dev/null
+        fi
+    fi
+}
+
+# ---------- 下载 sing-box / cloudflared ----------
+install_singbox() {
+    clear
+    purple "正在安装sing-box中，请稍后..."
+    ARCH_RAW=$(uname -m)
+    case "${ARCH_RAW}" in
+        'x86_64' | 'amd64')  ARCH='amd64' ;;
+        'x86' | 'i686' | 'i386') ARCH='386' ;;
+        'aarch64' | 'arm64') ARCH='arm64' ;;
+        'armv7l')  ARCH='armv7' ;;
+        's390x')   ARCH='s390x' ;;
+        *) red "不支持的架构: ${ARCH_RAW}"; exit 1 ;;
+    esac
+
+    [ ! -d "${work_dir}" ] && mkdir -p "${work_dir}" && chmod 777 "${work_dir}" && mkdir -p "${conf_dir}"
+
+    _singbox_bin_ok() {
+        [ -f "${work_dir}/sing-box" ] || return 1
+        chmod +x "${work_dir}/sing-box" 2>/dev/null || true
+        "${work_dir}/sing-box" version >/dev/null 2>&1
+    }
+
+    _sb_get_latest_version() {
+        local ver
+        ver=$(curl -sL --connect-timeout 10 --max-time 30 \
+            "https://api.github.com/repos/SagerNet/sing-box/releases/latest" 2>/dev/null \
+            | grep -o '"tag_name":[[:space:]]*"[^"]*"' | head -1 | cut -d'"' -f4 | sed 's/^v//')
+        if [ -z "$ver" ]; then
+            ver=$(curl -sL --connect-timeout 10 --max-time 30 \
+                "https://github.com/SagerNet/sing-box/releases/latest" 2>/dev/null \
+                | grep -oE 'tag/v[0-9]+\.[0-9]+\.[0-9]+' | head -1 | sed 's|tag/v||')
+        fi
+        printf '%s' "$ver"
+    }
+
+    download_singbox_official() {
+        local variant="${1:-}"
+        local tmpdir version tarball url bin suffix_label
+        tmpdir=$(mktemp -d)
+        version="${SB_LATEST_VERSION:-}"
+        if [ -z "$version" ]; then
+            version=$(_sb_get_latest_version)
+            SB_LATEST_VERSION="$version"
+        fi
+        [ -z "$version" ] && { rm -rf "$tmpdir"; return 1; }
+        if [ -n "$variant" ]; then
+            tarball="sing-box-${version}-linux-${ARCH}-${variant}.tar.gz"
+            suffix_label=" (${variant})"
+        else
+            tarball="sing-box-${version}-linux-${ARCH}.tar.gz"
+            suffix_label=""
+        fi
+        url="https://github.com/SagerNet/sing-box/releases/download/v${version}/${tarball}"
+        purple "  官方版本: ${version}  架构: ${ARCH}${suffix_label}"
+        if curl -sL --connect-timeout 15 --max-time 120 -o "${tmpdir}/${tarball}" "$url"; then
+            if tar -tzf "${tmpdir}/${tarball}" >/dev/null 2>&1; then
+                tar -xzf "${tmpdir}/${tarball}" -C "$tmpdir" 2>/dev/null
+                bin=$(find "$tmpdir" -type f -name "sing-box" 2>/dev/null | head -1)
+                if [ -n "$bin" ] && [ -f "$bin" ]; then
+                    cp -f "$bin" "${work_dir}/sing-box"
+                    chmod +x "${work_dir}/sing-box"
+                    rm -rf "$tmpdir"
+                    if _singbox_bin_ok; then return 0; fi
+                    yellow "官方二进制${suffix_label}无法在本系统执行"
+                    rm -f "${work_dir}/sing-box"
+                    return 1
+                fi
+            fi
+        fi
+        rm -rf "$tmpdir"
+        return 1
+    }
+
+    download_singbox_mirror() {
+        yellow "尝试镜像源: https://${ARCH}.eooce.com/sb"
+        if curl -sL --connect-timeout 15 --max-time 120 -o "${work_dir}/sing-box" "https://${ARCH}.eooce.com/sb"; then
+            chmod +x "${work_dir}/sing-box"
+            if _singbox_bin_ok; then return 0; fi
+            yellow "镜像二进制无法执行"
+            rm -f "${work_dir}/sing-box"
+        fi
+        return 1
+    }
+
+    sb_got=0
+    SB_LATEST_VERSION=""
+    if command_exists apk 2>/dev/null; then
+        purple "检测到 Alpine/musl，优先尝试官方 musl 构建..."
+        if download_singbox_official "musl"; then sb_got=1
+        elif download_singbox_official; then sb_got=1
+        elif download_singbox_mirror; then sb_got=1
+        fi
+    else
+        if download_singbox_official; then sb_got=1
+        elif download_singbox_mirror; then sb_got=1
+        fi
+    fi
+
+    if [ "$sb_got" -eq 1 ] && _singbox_bin_ok; then
+        sb_ver=$("${work_dir}/sing-box" version 2>/dev/null | head -1)
+        green "sing-box 下载成功: ${purple}${sb_ver}${re}"
+    else
+        red "sing-box 下载失败或无法在本系统执行"
+        exit 1
+    fi
+
+    # cloudflared
+    case "${ARCH}" in
+        amd64)  CF_ARCH="amd64" ;;
+        386)    CF_ARCH="386" ;;
+        arm64)  CF_ARCH="arm64" ;;
+        armv7)  CF_ARCH="arm" ;;
+        *)      CF_ARCH="amd64" ;;
+    esac
+    _argo_bin_ok() {
+        [ -f "${work_dir}/argo" ] || return 1
+        chmod +x "${work_dir}/argo" 2>/dev/null || true
+        "${work_dir}/argo" version >/dev/null 2>&1
+    }
+    purple "正在下载最新版 cloudflared (官方)..."
+    argo_got=0
+    if curl -sL --connect-timeout 15 --max-time 120 \
+        -o "${work_dir}/argo" \
+        "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${CF_ARCH}"; then
+        if _argo_bin_ok; then argo_got=1
+        else
+            yellow "官方 cloudflared 无法在本系统执行，回退到镜像源..."
+            rm -f "${work_dir}/argo"
+        fi
+    else
+        yellow "官方下载失败，回退到镜像源..."
+    fi
+    if [ "$argo_got" -eq 0 ]; then
+        if curl -sL --connect-timeout 15 --max-time 120 -o "${work_dir}/argo" "https://${ARCH}.eooce.com/bot"; then
+            if _argo_bin_ok; then argo_got=1
+            else
+                yellow "镜像 cloudflared 也无法执行（Argo 隧道可能不可用）"
+                rm -f "${work_dir}/argo"
+            fi
+        else
+            yellow "cloudflared 镜像下载失败（Argo 隧道可能不可用）"
+        fi
+    fi
+
+    chown root:root ${work_dir} 2>/dev/null || true
+    chmod +x "${work_dir}/${server_name}" 2>/dev/null || true
+    [ -f "${work_dir}/argo" ] && chmod +x "${work_dir}/argo" 2>/dev/null || true
+
+    if [ -x "${work_dir}/sing-box" ]; then
+        sb_ver=$("${work_dir}/sing-box" version 2>/dev/null | head -1 || echo "unknown")
+        green "sing-box 版本: ${purple}${sb_ver}${re}"
+    fi
+    if [ -x "${work_dir}/argo" ] && _argo_bin_ok; then
+        argo_ver=$("${work_dir}/argo" version 2>/dev/null | head -1 || echo "unknown")
+        green "cloudflared 版本: ${purple}${argo_ver}${re}"
+    fi
+
+    # ---------- 输入：前缀 / UUID ----------
+    if [ -z "$node_prefix" ]; then
+        if [ -t 0 ]; then
+            reading "请输入节点前缀名称 (回车默认使用 ISP 信息): " node_prefix
+        fi
+    fi
+    export node_prefix
+
+    if [ -z "$uuid" ]; then
+        if [ -t 0 ]; then
+            reading "请输入 UUID (回车随机生成): " uuid
+        fi
+    fi
+    if [ -z "$uuid" ]; then
+        uuid=$(cat /proc/sys/kernel/random/uuid)
+        green "已随机生成 UUID: ${purple}${uuid}${re}"
+    else
+        if ! echo "$uuid" | grep -Eq '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'; then
+            yellow "UUID 格式不正确，已重新随机生成"
+            uuid=$(cat /proc/sys/kernel/random/uuid)
+            green "新 UUID: ${purple}${uuid}${re}"
+        else
+            green "使用 UUID: ${purple}${uuid}${re}"
+        fi
+    fi
+
+    # ---------- 仅 Argo 端口 ----------
+    while true; do
+        base="${ARGO_PORT:-8001}"
+        conflict_list=""
+        conflict_detail=""
+        for offset_name in "0:Argo入口" "10:VMess内部" "11:VLESS内部" "12:Trojan内部"; do
+            off="${offset_name%%:*}"
+            name="${offset_name#*:}"
+            p=$((base + off))
+            if port_in_use "$p"; then
+                conflict_list="${conflict_list} ${p}"
+                conflict_detail="${conflict_detail}\n  - ${p} (${name}) 已被占用"
+            fi
+        done
+        if [ -z "$conflict_list" ]; then
+            ARGO_PORT="$base"
+            export ARGO_PORT
+            break
+        fi
+        red "Argo 相关端口冲突 (当前 ARGO 起始=${base}):"
+        echo -e "${red}${conflict_detail}${re}"
+        yellow "将占用: Argo=${base}  内部WS=${base}+10~+12"
+        if [ -t 0 ]; then
+            reading "请输入新的 Argo 起始端口 (回车自动随机空闲端口): " input_argo
+            if [ -n "$input_argo" ]; then
+                if ! [[ "$input_argo" =~ ^[0-9]+$ ]] || [ "$input_argo" -lt 1 ] || [ "$input_argo" -gt 65522 ]; then
+                    red "端口无效，请输入 1-65522"
+                    continue
+                fi
+                ARGO_PORT="$input_argo"
+            else
+                found=""
+                for _ in $(seq 1 80); do
+                    cand=$(shuf -i 2000-64000 -n 1)
+                    ok=1
+                    for off in 0 10 11 12; do
+                        p=$((cand + off))
+                        port_in_use "$p" && { ok=0; break; }
+                    done
+                    if [ "$ok" -eq 1 ]; then
+                        found=$cand
+                        break
+                    fi
+                done
+                if [ -n "$found" ]; then
+                    ARGO_PORT="$found"
+                    green "已自动分配 Argo 起始端口: ${purple}${ARGO_PORT}${re}"
+                else
+                    red "自动分配失败，请手动输入"
+                    continue
+                fi
+            fi
+            export ARGO_PORT
+        else
+            found=""
+            for _ in $(seq 1 80); do
+                cand=$(shuf -i 2000-64000 -n 1)
+                ok=1
+                for off in 0 10 11 12; do
+                    p=$((cand + off))
+                    port_in_use "$p" && { ok=0; break; }
+                done
+                [ "$ok" -eq 1 ] && { found=$cand; break; }
+            done
+            if [ -n "$found" ]; then
+                ARGO_PORT="$found"
+                export ARGO_PORT
+                green "已自动分配 Argo 起始端口: ${purple}${ARGO_PORT}${re}"
+                break
+            else
+                red "无法分配可用的 Argo 端口，请手动指定"
+                exit 1
+            fi
+        fi
+    done
+    green "Argo 端口: ${purple}${ARGO_PORT}${re}"
+
+    # ---------- 固定隧道 / 临时隧道 ----------
+    export ARGO_DOMAIN="${ARGO_DOMAIN:-}"
+    export ARGO_TOKEN="${ARGO_TOKEN:-}"
+    [ -n "$ARGO_TOKEN" ] && ARGO_TOKEN=$(clean_argo_token "$ARGO_TOKEN")
+    export ARGO_USE_FIXED="${ARGO_USE_FIXED:-0}"
+
+    if [ -t 0 ]; then
+        echo ""
+        purple "=== Argo 隧道配置 ==="
+        yellow "直接配置固定隧道。域名留空 → 立即使用临时隧道；令牌留空 → 回退临时隧道"
+        echo ""
+        if [ -n "$ARGO_DOMAIN" ] && [ -n "$ARGO_TOKEN" ]; then
+            green "检测到环境变量已设置固定隧道域名与令牌，将直接使用"
+            ARGO_USE_FIXED=1
+        else
+            if [ -z "$ARGO_DOMAIN" ]; then
+                reading "请输入固定隧道域名 (例如: argo.example.com，直接回车则使用临时隧道): " ARGO_DOMAIN
+            fi
+            if [ -z "$ARGO_DOMAIN" ]; then
+                yellow "域名为空，已自动回退为临时隧道 (trycloudflare.com)"
+                clear_argo_fixed_conf
+            else
+                if [ -z "$ARGO_TOKEN" ]; then
+                    yellow "令牌获取：Cloudflare Zero Trust → Networks → Tunnels → 复制 Token；或使用 JSON 凭证"
+                    yellow "可直接粘贴完整命令，脚本会自动去除前缀仅保留 eyJ 开头的有效令牌"
+                    reading "请输入隧道令牌 (Token) 或 JSON 凭证 (直接回车则使用临时隧道): " ARGO_TOKEN
+                    ARGO_TOKEN=$(clean_argo_token "$ARGO_TOKEN")
+                fi
+                if [ -z "$ARGO_TOKEN" ]; then
+                    yellow "令牌为空，已自动回退为临时隧道 (trycloudflare.com)"
+                    clear_argo_fixed_conf
+                else
+                    ARGO_USE_FIXED=1
+                fi
+            fi
+        fi
+        if [ "$ARGO_USE_FIXED" = "1" ] && [ -n "$ARGO_DOMAIN" ] && [ -n "$ARGO_TOKEN" ]; then
+            if ! echo "$ARGO_DOMAIN" | grep -Eq '^[a-zA-Z0-9]([a-zA-Z0-9.-]*[a-zA-Z0-9])?(\.[a-zA-Z]{2,})+$'; then
+                yellow "域名格式可能不正确，仍将尝试使用: ${ARGO_DOMAIN}"
+            fi
+            green "隧道域名: ${purple}${ARGO_DOMAIN}${re}"
+            if echo "$ARGO_TOKEN" | grep -q 'TunnelSecret'; then
+                green "检测到 JSON 凭证格式"
+            elif echo "$ARGO_TOKEN" | grep -Eq '^[A-Za-z0-9=]{100,}$'; then
+                green "检测到 Token 格式"
+            else
+                yellow "令牌格式未明确识别，将按输入内容配置"
+            fi
+            save_argo_fixed_conf
+            green "已记录固定隧道配置（流量: Cloudflare → Nginx:${ARGO_PORT} → 三协议）"
+        else
+            clear_argo_fixed_conf
+        fi
+        export ARGO_USE_FIXED ARGO_DOMAIN ARGO_TOKEN
+    else
+        if [ -n "$ARGO_DOMAIN" ] && [ -n "$ARGO_TOKEN" ]; then
+            ARGO_USE_FIXED=1
+            save_argo_fixed_conf
+            green "非交互模式：已启用固定隧道 ${purple}${ARGO_DOMAIN}${re}"
+        else
+            clear_argo_fixed_conf
+            green "非交互模式：使用临时隧道"
+        fi
+        export ARGO_USE_FIXED
+    fi
+
+    vmess_ws_port=$(($ARGO_PORT + 10))
+    vless_ws_port=$(($ARGO_PORT + 11))
+    trojan_ws_port=$(($ARGO_PORT + 12))
+
+    allow_port ${ARGO_PORT}/tcp > /dev/null 2>&1
+
+    dns_strategy=$(ping -c 1 -W 3 8.8.8.8 >/dev/null 2>&1 && echo "prefer_ipv4" || \
+        (ping -c 1 -W 3 2001:4860:4860::8888 >/dev/null 2>&1 && echo "prefer_ipv6" || echo "prefer_ipv4"))
+
+    cat > "${conf_dir}/log.json" << EOF
+{
+  "log": {
+    "disabled": false,
+    "level": "error",
+    "output": "$work_dir/sb.log",
+    "timestamp": true
+  }
+}
+EOF
+
+    cat > ${conf_dir}/ntp.json << EOF
+{
+    "ntp": {
+        "enabled": true,
+        "server": "time.apple.com",
+        "server_port": 123,
+        "interval": "60m"
+    }
+}
+EOF
+
+    cat > "${conf_dir}/dns.json" << EOF
+{
+  "dns": {
+    "servers": [
+      {
+        "tag": "local",
+        "type": "local"
+      }
+    ],
+    "strategy": "$dns_strategy"
+  }
+}
+EOF
+
+    # 仅三个隧道协议入站（本机监听，由 Nginx 转发）
+    cat > "${conf_dir}/inbounds.json" << EOF
+{
+  "inbounds": [
+    {
+      "type": "vmess",
+      "tag": "vmess-ws",
+      "listen": "127.0.0.1",
+      "listen_port": $vmess_ws_port,
+      "users": [
+        {
+          "uuid": "$uuid"
+        }
+      ],
+      "transport": {
+        "type": "ws",
+        "path": "/vmess-argo",
+        "early_data_header_name": "Sec-WebSocket-Protocol"
+      }
+    },
+    {
+      "type": "vless",
+      "tag": "vless-ws",
+      "listen": "127.0.0.1",
+      "listen_port": $vless_ws_port,
+      "users": [
+        {
+          "uuid": "$uuid"
+        }
+      ],
+      "transport": {
+        "type": "ws",
+        "path": "/vless-argo",
+        "early_data_header_name": "Sec-WebSocket-Protocol"
+      }
+    },
+    {
+      "type": "trojan",
+      "tag": "trojan-ws",
+      "listen": "127.0.0.1",
+      "listen_port": $trojan_ws_port,
+      "users": [
+        {
+          "password": "$uuid"
+        }
+      ],
+      "transport": {
+        "type": "ws",
+        "path": "/trojan-argo",
+        "early_data_header_name": "Sec-WebSocket-Protocol"
+      }
+    }
+  ]
+}
+EOF
+
+    cat > "${conf_dir}/outbounds.json" << EOF
+{
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "direct"
+    }
+  ]
+}
+EOF
+
+    cat > "${conf_dir}/route.json" << EOF
+{
+  "route": {
+    "rules": [],
+    "final": "direct"
+  }
+}
+EOF
+}
+
+# ---------- Argo 配置辅助 ----------
+save_argo_fixed_conf() {
+    mkdir -p "${work_dir}"
+    {
+        echo "ARGO_USE_FIXED=1"
+        printf 'ARGO_DOMAIN=%q\n' "${ARGO_DOMAIN}"
+        printf 'ARGO_TOKEN=%q\n' "${ARGO_TOKEN}"
+        printf 'ARGO_PORT=%q\n' "${ARGO_PORT}"
+    } > "${work_dir}/argo_fixed.conf"
+    chmod 600 "${work_dir}/argo_fixed.conf"
+}
+
+clear_argo_fixed_conf() {
+    ARGO_USE_FIXED=0
+    ARGO_DOMAIN=""
+    ARGO_TOKEN=""
+    export ARGO_USE_FIXED ARGO_DOMAIN ARGO_TOKEN
+    rm -f "${work_dir}/argo_fixed.conf" "${work_dir}/tunnel.json" "${work_dir}/tunnel.yml" 2>/dev/null || true
+}
+
+load_argo_fixed_conf() {
+    if [ -f "${work_dir}/argo_fixed.conf" ]; then
+        # shellcheck source=/dev/null
+        source "${work_dir}/argo_fixed.conf" 2>/dev/null || true
+    fi
+    ARGO_USE_FIXED="${ARGO_USE_FIXED:-0}"
+    ARGO_PORT="${ARGO_PORT:-8001}"
+}
+
+_prepare_argo_exec() {
+    load_argo_fixed_conf
+    if [ "$ARGO_USE_FIXED" = "1" ] && [ -n "${ARGO_TOKEN:-}" ]; then
+        if echo "$ARGO_TOKEN" | grep -q 'TunnelSecret'; then
+            echo "$ARGO_TOKEN" > "${work_dir}/tunnel.json"
+            local tunnel_id
+            tunnel_id=$(echo "$ARGO_TOKEN" | grep -o '"TunnelID":"[^"]*"' | head -1 | cut -d'"' -f4)
+            [ -z "$tunnel_id" ] && tunnel_id=$(cut -d\" -f12 <<< "$ARGO_TOKEN" 2>/dev/null || true)
+            if [ -z "$tunnel_id" ]; then
+                yellow "无法从 JSON 中解析 TunnelID，已回退为临时隧道"
+                clear_argo_fixed_conf
+                _ARGO_EXEC_CMD="/etc/sing-box/argo tunnel --url http://localhost:${ARGO_PORT} --no-autoupdate --edge-ip-version auto --protocol http2"
+            else
+                cat > "${work_dir}/tunnel.yml" << YMLEOF
+tunnel: ${tunnel_id}
+credentials-file: ${work_dir}/tunnel.json
+protocol: http2
+
+ingress:
+  - hostname: ${ARGO_DOMAIN}
+    service: http://localhost:${ARGO_PORT}
+    originRequest:
+      noTLSVerify: true
+  - service: http_status:404
+YMLEOF
+                _ARGO_EXEC_CMD="/etc/sing-box/argo tunnel --edge-ip-version auto --config /etc/sing-box/tunnel.yml run"
+                green "Argo 服务将使用固定隧道 (JSON) → ${ARGO_DOMAIN} → Nginx:${ARGO_PORT}"
+            fi
+        else
+            local safe_token
+            safe_token=$(printf '%s' "$ARGO_TOKEN" | sed "s/'/'\\\\''/g")
+            _ARGO_EXEC_CMD="/etc/sing-box/argo tunnel --edge-ip-version auto --no-autoupdate --protocol http2 run --token '${safe_token}'"
+            green "Argo 服务将使用固定隧道 (Token) → ${ARGO_DOMAIN:-未指定域名} → Nginx:${ARGO_PORT}"
+        fi
+    else
+        if [ "$ARGO_USE_FIXED" = "1" ]; then
+            yellow "固定隧道配置不完整，已回退为临时隧道"
+            clear_argo_fixed_conf
+        fi
+        _ARGO_EXEC_CMD="/etc/sing-box/argo tunnel --url http://localhost:${ARGO_PORT} --no-autoupdate --edge-ip-version auto --protocol http2"
+        green "Argo 服务将使用临时隧道 → Nginx:${ARGO_PORT}"
+    fi
+}
+
+rewrite_argo_service() {
+    _prepare_argo_exec
+    cat > "${work_dir}/argo-start.sh" << 'STARTEOF'
+#!/bin/sh
+exec >> /etc/sing-box/argo.log 2>&1
+STARTEOF
+    printf '%s\n' "exec ${_ARGO_EXEC_CMD}" >> "${work_dir}/argo-start.sh"
+    chmod +x "${work_dir}/argo-start.sh"
+
+    if command_exists rc-service 2>/dev/null; then
+        cat > /etc/init.d/argo << 'EOF'
+#!/sbin/openrc-run
+description="Cloudflare Tunnel"
+command="/etc/sing-box/argo-start.sh"
+command_background=true
+pidfile="/var/run/argo.pid"
+EOF
+        chmod +x /etc/init.d/argo
+        rc-update add argo default >/dev/null 2>&1 || true
+    else
+        cat > /etc/systemd/system/argo.service << 'EOF'
+[Unit]
+Description=Cloudflare Tunnel
+After=network.target
+
+[Service]
+Type=simple
+NoNewPrivileges=yes
+TimeoutStartSec=0
+ExecStart=/etc/sing-box/argo-start.sh
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target
+EOF
+        systemctl daemon-reload
+        systemctl enable argo >/dev/null 2>&1 || true
+    fi
+}
+
+main_systemd_services() {
+    cat > /etc/systemd/system/sing-box.service << EOF
+[Unit]
+Description=sing-box service
+Documentation=https://sing-box.sagernet.org
+After=network.target nss-lookup.target
+
+[Service]
+User=root
+WorkingDirectory=/etc/sing-box
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
+ExecStart=/etc/sing-box/sing-box run -C /etc/sing-box/conf
+ExecReload=/bin/kill -HUP \$MAINPID
+Restart=on-failure
+RestartSec=10
+LimitNOFILE=infinity
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    rewrite_argo_service
+    if [ -f /etc/centos-release ]; then
+        yum install -y chrony
+        systemctl start chronyd
+        systemctl enable chronyd
+        chronyc -a makestep
+        yum update -y ca-certificates
+        bash -c 'echo "0 0" > /proc/sys/net/ipv4/ping_group_range'
+    fi
+    systemctl daemon-reload
+    systemctl enable sing-box
+    systemctl start sing-box
+    systemctl enable argo
+    systemctl start argo
+}
+
+alpine_openrc_services() {
+    cat > /etc/init.d/sing-box << 'EOF'
+#!/sbin/openrc-run
+description="sing-box service"
+command="/etc/sing-box/sing-box"
+command_args="run -C /etc/sing-box/conf"
+command_background=true
+pidfile="/var/run/sing-box.pid"
+
+depend() {
+    need net
+}
+
+start_pre() {
+    if [ -f "$pidfile" ]; then
+        oldpid=$(cat "$pidfile" 2>/dev/null)
+        if [ -n "$oldpid" ] && ! kill -0 "$oldpid" 2>/dev/null; then
+            rm -f "$pidfile"
+        fi
+    fi
+    if [ ! -x /etc/sing-box/sing-box ]; then
+        eerror "找不到 /etc/sing-box/sing-box"
+        return 1
+    fi
+}
+EOF
+    rewrite_argo_service
+    chmod +x /etc/init.d/sing-box
+    [ -f /etc/init.d/argo ] && chmod +x /etc/init.d/argo
+    rc-update add sing-box default >/dev/null 2>&1 || true
+    rc-update add argo default >/dev/null 2>&1 || true
+}
+
+# 生成仅隧道节点链接
+get_info() {
+    yellow "\n正在获取 Argo 域名...\n"
+    clear
+    isp=$(get_isp "node")
+
+    argodomain=""
+    load_argo_fixed_conf
+    if [ "${ARGO_USE_FIXED:-0}" = "1" ] && [ -n "${ARGO_DOMAIN:-}" ]; then
+        argodomain="$ARGO_DOMAIN"
+        green "使用固定隧道域名: ${purple}${argodomain}${re}"
+    fi
+
+    if [ -z "$argodomain" ]; then
+        if [ -f "${work_dir}/argo.log" ]; then
+            for i in {1..5}; do
+                purple "第 $i 次尝试获取ArgoDomain中..."
+                argodomain=$(sed -n 's|.*https://\([^/]*trycloudflare\.com\).*|\1|p' "${work_dir}/argo.log")
+                [ -n "$argodomain" ] && break
+                sleep 2
+            done
+        else
+            restart_argo
+            sleep 6
+            argodomain=$(sed -n 's|.*https://\([^/]*trycloudflare\.com\).*|\1|p' "${work_dir}/argo.log")
+        fi
+    fi
+
+    if [ -z "$argodomain" ]; then
+        yellow "未能获取 Argo 域名，节点中的隧道链接可能无效，请稍后在「Argo隧道管理」中重新获取或配置固定隧道"
+        argodomain="未获取到域名"
+    fi
+
+    green "\nArgoDomain：${purple}$argodomain${re}\n"
+
+    if [ -z "$node_prefix" ]; then
+        prefix="$isp"
+    else
+        prefix="${node_prefix}-${isp}"
+    fi
+
+    # 从配置读取 UUID
+    if [ -z "$uuid" ]; then
+        uuid=$(jq -r '.inbounds[] | select(.tag=="vmess-ws") | .users[0].uuid // empty' "${conf_dir}/inbounds.json" 2>/dev/null | head -1)
+    fi
+
+    VMESS="{ \"v\": \"2\", \"ps\": \"${prefix}-argo-vmess\", \"add\": \"${CFIP}\", \"port\": \"${CFPORT}\", \"id\": \"${uuid}\", \"aid\": \"0\", \"scy\": \"auto\", \"net\": \"ws\", \"type\": \"none\", \"host\": \"${argodomain}\", \"path\": \"/vmess-argo?ed=2560\", \"tls\": \"tls\", \"sni\": \"${argodomain}\", \"alpn\": \"\", \"fp\": \"firefox\", \"allowInsecure\": \"false\"}"
+
+    cat > ${work_dir}/url.txt << EOF
+vmess://$(echo "$VMESS" | base64 -w0 2>/dev/null || echo "$VMESS" | base64 | tr -d '\n')
+
+vless://${uuid}@${CFIP}:${CFPORT}?encryption=none&security=tls&sni=${argodomain}&fp=firefox&type=ws&host=${argodomain}&path=%2Fvless-argo%3Fed%3D2560#${prefix}-argo-vless
+
+trojan://${uuid}@${CFIP}:${CFPORT}?security=tls&sni=${argodomain}&fp=firefox&type=ws&host=${argodomain}&path=%2Ftrojan-argo%3Fed%3D2560#${prefix}-argo-trojan
+EOF
+
+    echo ""
+    while IFS= read -r line; do echo -e "${purple}$line"; done < ${work_dir}/url.txt
+    refresh_sub
+    yellow "\n节点已写入: ${work_dir}/url.txt  本地 base64: ${work_dir}/sub.txt\n"
+    send_tg_nodes 2>/dev/null || true
+}
+
+add_nginx_conf() {
+    if ! command_exists nginx; then
+        red "nginx 未安装，无法配置 Argo 隧道路径分流"
+        return 1
+    else
+        manage_service "nginx" "stop" > /dev/null 2>&1
+        pkill nginx > /dev/null 2>&1
+    fi
+
+    mkdir -p /etc/nginx/conf.d
+    local vmess_ws_port=$((ARGO_PORT + 10))
+    local vless_ws_port=$((ARGO_PORT + 11))
+    local trojan_ws_port=$((ARGO_PORT + 12))
+
+    rm -f /etc/nginx/conf.d/sing-box.conf
+
+    cat > /etc/nginx/conf.d/argo-ws.conf << EOF
+server {
+    listen ${ARGO_PORT};
+    listen [::]:${ARGO_PORT};
+    server_name _;
+
+    location /vmess-argo {
+        proxy_pass http://127.0.0.1:${vmess_ws_port};
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_read_timeout 300s;
+        proxy_send_timeout 300s;
+    }
+
+    location /vless-argo {
+        proxy_pass http://127.0.0.1:${vless_ws_port};
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_read_timeout 300s;
+        proxy_send_timeout 300s;
+    }
+
+    location /trojan-argo {
+        proxy_pass http://127.0.0.1:${trojan_ws_port};
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_read_timeout 300s;
+        proxy_send_timeout 300s;
+    }
+
+    location / { return 404; }
+}
+EOF
+
+    if [ -f "/etc/nginx/nginx.conf" ]; then
+        cp /etc/nginx/nginx.conf /etc/nginx/nginx.conf.bak.sb > /dev/null 2>&1
+        sed -i -e '15{/include \/etc\/nginx\/modules\/\*\.conf/d;}' \
+               -e '18{/include \/etc\/nginx\/conf\.d\/\*\.conf/d;}' /etc/nginx/nginx.conf > /dev/null 2>&1
+        if ! grep -q "include.*conf.d" /etc/nginx/nginx.conf; then
+            http_end_line=$(grep -n "^}" /etc/nginx/nginx.conf | tail -1 | cut -d: -f1)
+            [ -n "$http_end_line" ] && sed -i "${http_end_line}i \    include /etc/nginx/conf.d/*.conf;" /etc/nginx/nginx.conf > /dev/null 2>&1
+        fi
+    else
+        cat > /etc/nginx/nginx.conf << 'EOF'
+user nginx;
+worker_processes auto;
+error_log /var/log/nginx/error.log;
+pid /run/nginx.pid;
+
+events { worker_connections 1024; }
+
+http {
+    include       /etc/nginx/mime.types;
+    default_type  application/octet-stream;
+    sendfile        on;
+    keepalive_timeout  65;
+    include /etc/nginx/conf.d/*.conf;
+}
+EOF
+    fi
+
+    if nginx -t > /dev/null 2>&1; then
+        nginx -s reload > /dev/null 2>&1 || start_nginx > /dev/null 2>&1
+        green "nginx 配置已加载"
+    else
+        yellow "nginx配置检测失败，尝试重启..."
+        restart_nginx > /dev/null 2>&1
+        if [ $? -ne 0 ]; then
+            [[ -f "/etc/nginx/nginx.conf.bak.sb" ]] && cp "/etc/nginx/nginx.conf.bak.sb" /etc/nginx/nginx.conf > /dev/null 2>&1
+            restart_nginx > /dev/null 2>&1
+        fi
+    fi
+}
+
+get_current_uuid() {
+    local inbounds_file="${conf_dir}/inbounds.json"
+    if [ -f "$inbounds_file" ]; then
+        jq -r '.inbounds[] | select(.type == "vmess" or .type == "vless") | .users[0].uuid // empty' "$inbounds_file" 2>/dev/null | head -1
+    fi
+}
+
+manage_service() {
+    local service_name="$1"
+    local action="$2"
+    if [ -z "$service_name" ] || [ -z "$action" ]; then
+        red "缺少服务名或操作参数\n"; return 1
+    fi
+    local service_file=""
+    case "$service_name" in
+        "sing-box") service_file="${work_dir}/${server_name}" ;;
+        "argo")     service_file="${work_dir}/argo" ;;
+        "nginx")    service_file="$(command -v nginx 2>/dev/null)" ;;
+        *)          service_file="" ;;
+    esac
+    local status
+    status=$(check_service "$service_name" "$service_file" 2>/dev/null)
+
+    case "$action" in
+        "start")
+            if [[ "$status" == *"running"* ]]; then yellow "${service_name} 已在运行中\n"; return 0; fi
+            if [[ "$status" == *"not installed"* ]]; then yellow "${service_name} 尚未安装！\n"; return 1; fi
+            yellow "正在启动 ${service_name} 服务...\n"
+            if command_exists rc-service; then
+                rc-service "$service_name" start
+            elif command_exists systemctl; then
+                systemctl reset-failed "$service_name" 2>/dev/null
+                systemctl daemon-reload
+                systemctl start "$service_name"
+            fi
+            sleep 1
+            if pgrep -f "${service_file}" >/dev/null 2>&1 || [[ "$(check_service "$service_name" "$service_file" 2>/dev/null)" == *"running"* ]]; then
+                green "${service_name} 服务已成功启动\n"
+            else
+                red "${service_name} 服务启动失败\n"
+            fi
+            ;;
+        "stop")
+            if [[ "$status" == *"not installed"* ]]; then yellow "${service_name} 尚未安装！\n"; return 2; fi
+            if [[ "$status" == *"not running"* ]]; then yellow "${service_name} 当前未运行\n"; return 1; fi
+            yellow "正在停止 ${service_name} 服务...\n"
+            if command_exists rc-service; then
+                rc-service "$service_name" stop
+            elif command_exists systemctl; then
+                systemctl stop "$service_name"
+            fi
+            sleep 1
+            local process_pattern=""
+            case "$service_name" in
+                "sing-box") process_pattern="${work_dir}/sing-box" ;;
+                "argo")     process_pattern="${work_dir}/argo" ;;
+                "nginx")    process_pattern="nginx: master process" ;;
+            esac
+            if [ -n "$process_pattern" ] && pgrep -f "$process_pattern" >/dev/null 2>&1; then
+                yellow "检测到残留进程，正在强制终止...\n"
+                pkill -15 -f "$process_pattern" 2>/dev/null
+                sleep 1
+                pkill -9 -f "$process_pattern" 2>/dev/null
+                sleep 0.5
+            fi
+            if [ -n "$process_pattern" ] && pgrep -f "$process_pattern" >/dev/null 2>&1; then
+                red "${service_name} 停止失败，仍有进程残留，请手动检查\n"
+            else
+                green "${service_name} 服务已彻底停止\n"
+            fi
+            ;;
+        "restart")
+            if [[ "$status" == *"not installed"* ]]; then yellow "${service_name} 尚未安装！\n"; return 1; fi
+            yellow "正在重启 ${service_name} 服务...\n"
+            manage_service "$service_name" "stop" >/dev/null 2>&1
+            sleep 1
+            if command_exists rc-service; then
+                rc-service "$service_name" start
+            elif command_exists systemctl; then
+                systemctl daemon-reload
+                systemctl start "$service_name"
+            fi
+            sleep 1
+            if pgrep -f "${service_file}" >/dev/null 2>&1 || [[ "$(check_service "$service_name" "$service_file" 2>/dev/null)" == *"running"* ]]; then
+                green "${service_name} 服务已成功重启\n"
+            else
+                red "${service_name} 服务重启失败\n"
+            fi
+            ;;
+        *) red "无效的操作: $action\n"; return 1 ;;
+    esac
+}
+
+start_singbox()  { manage_service "sing-box" "start"; }
+stop_singbox()   { manage_service "sing-box" "stop"; }
+restart_singbox(){ manage_service "sing-box" "restart"; }
+start_argo()     { manage_service "argo" "start"; }
+stop_argo()      { manage_service "argo" "stop"; }
+restart_argo()   { manage_service "argo" "restart"; }
+start_nginx()    { manage_service "nginx" "start"; }
+restart_nginx()  { manage_service "nginx" "restart"; }
+
+uninstall_singbox() {
+    reading "确定要卸载 sing-box 吗? (y/n): " choice
+    case "${choice}" in
+        y|Y)
+            yellow "正在卸载 sing-box"
+            if command_exists rc-service; then
+                rc-service sing-box stop; rc-service argo stop
+                rm -f /etc/init.d/sing-box /etc/init.d/argo
+                rc-update del sing-box default; rc-update del argo default
+            else
+                systemctl stop "${server_name}"; systemctl stop argo
+                systemctl disable "${server_name}"; systemctl disable argo
+                systemctl daemon-reload || true
+            fi
+            rm -rf "${work_dir}" || true
+            rm -f /etc/systemd/system/sing-box.service /etc/systemd/system/argo.service
+            rm -f /etc/nginx/conf.d/sing-box.conf /etc/nginx/conf.d/argo-ws.conf
+            reading "\n是否卸载 Nginx？${green}(卸载请输入 ${yellow}y${re} ${green}回车将跳过卸载Nginx) (y/n): ${re}" choice
+            case "${choice}" in
+                y|Y) manage_packages uninstall nginx ;;
+                *)   yellow "取消卸载Nginx\n\n" ;;
+            esac
+            green "\nsing-box 卸载成功\n\n" && exit 0
+            ;;
+        *) purple "已取消卸载操作\n\n" ;;
+    esac
+}
+
+create_shortcut() {
+    local local_script="${work_dir}/sing-box.sh"
+    if [ -n "${BASH_SOURCE[0]:-}" ] && [ -r "${BASH_SOURCE[0]}" ]; then
+        cp -f "${BASH_SOURCE[0]}" "$local_script" 2>/dev/null || cat "${BASH_SOURCE[0]}" > "$local_script" 2>/dev/null || true
+    fi
+    if [ ! -s "$local_script" ]; then
+        yellow "未找到可保存的本地脚本，sb 将回退到远程版本"
+    else
+        chmod 755 "$local_script"
+    fi
+    cat > "$work_dir/sb.sh" << 'EOF'
+#!/usr/bin/env bash
+LOCAL_SCRIPT="/etc/sing-box/sing-box.sh"
+if [ -f "$LOCAL_SCRIPT" ] && [ -s "$LOCAL_SCRIPT" ]; then
+    exec bash "$LOCAL_SCRIPT" "$@"
+else
+    echo "本地脚本不存在，请重新安装"
+    exit 1
+fi
+EOF
+    chmod +x "$work_dir/sb.sh"
+    ln -sf "$work_dir/sb.sh" /usr/bin/sb
+    [ -s /usr/bin/sb ] && green "\n快捷指令 sb 创建成功\n" || red "\n快捷指令创建失败\n"
+}
+
+# =========================
+# Telegram 通知（精简保留）
+# =========================
+tg_conf_file="${work_dir}/tg.conf"
+
+load_tg_config() {
+    TG_BOT_TOKEN=""; TG_CHAT_ID=""; TG_ENABLED=""
+    if [ -f "$tg_conf_file" ]; then
+        # shellcheck source=/dev/null
+        source "$tg_conf_file" 2>/dev/null || true
+    fi
+    [ -z "$TG_BOT_TOKEN" ] && [ -n "${BOT_TOKEN:-}" ] && TG_BOT_TOKEN="$BOT_TOKEN"
+    [ -z "$TG_CHAT_ID" ] && [ -n "${CHAT_ID:-}" ] && TG_CHAT_ID="$CHAT_ID"
+    if [ -z "$TG_ENABLED" ]; then
+        if [ -n "$TG_BOT_TOKEN" ] && [ -n "$TG_CHAT_ID" ]; then TG_ENABLED="1"; else TG_ENABLED="0"; fi
+    fi
+}
+
+save_tg_config() {
+    mkdir -p "$(dirname "$tg_conf_file")"
+    cat > "$tg_conf_file" << TGEOF
+TG_BOT_TOKEN="${TG_BOT_TOKEN}"
+TG_CHAT_ID="${TG_CHAT_ID}"
+TG_ENABLED="${TG_ENABLED}"
+TGEOF
+    chmod 600 "$tg_conf_file"
+}
+
+tg_html_escape() {
+    printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'
+}
+
+send_tg_msg() {
+    local msg="$1"
+    local mode="${2:-}"
+    load_tg_config
+    if [ "$TG_ENABLED" != "1" ] || [ -z "$TG_BOT_TOKEN" ] || [ -z "$TG_CHAT_ID" ]; then return 1; fi
+    if [ ${#msg} -gt 4000 ]; then msg="${msg:0:4000}...(已截断)"; fi
+    if [ "$mode" = "html" ]; then
+        curl -sS -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${TG_CHAT_ID}" \
+            --data-urlencode "text=${msg}" \
+            --data-urlencode "parse_mode=HTML" \
+            --data-urlencode "disable_web_page_preview=true" >/dev/null 2>&1
+    else
+        curl -sS -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${TG_CHAT_ID}" \
+            --data-urlencode "text=${msg}" \
+            --data-urlencode "disable_web_page_preview=true" >/dev/null 2>&1
+    fi
+}
+
+get_plain_status() {
+    local service_name="$1"
+    local service_file="$2"
+    if [ "$service_name" = "nginx" ]; then
+        command_exists nginx || { echo "not installed"; return 2; }
+    else
+        [ -z "$service_file" ] || [ ! -f "$service_file" ] && { echo "not installed"; return 2; }
+    fi
+    if command_exists apk; then
+        rc-service "${service_name}" status 2>/dev/null | grep -q "started" && echo "running" || echo "not running"
+    else
+        systemctl is-active "${service_name}" 2>/dev/null | grep -q "^active$" && echo "running" || echo "not running"
+    fi
+}
+
+send_tg_nodes() {
+    load_tg_config
+    if [ "$TG_ENABLED" != "1" ] || [ -z "$TG_BOT_TOKEN" ] || [ -z "$TG_CHAT_ID" ]; then return 1; fi
+    if [ ! -f "$client_dir" ]; then return 1; fi
+    local hostname_info node_text node_escaped
+    hostname_info=$(hostname 2>/dev/null || echo "server")
+    node_text=$(cat "$client_dir" 2>/dev/null)
+    node_escaped=$(tg_html_escape "$node_text")
+    local sb_status argo_status nginx_status
+    sb_status=$(get_plain_status "sing-box" "${work_dir}/${server_name}")
+    argo_status=$(get_plain_status "argo" "${work_dir}/argo")
+    nginx_status=$(get_plain_status "nginx" "$(command -v nginx 2>/dev/null)")
+    local msg
+    msg="📡 <b>sing-box Argo 节点通知</b>
+主机: $(tg_html_escape "$hostname_info")
+时间: $(date '+%Y-%m-%d %H:%M:%S')
+
+—— 服务状态 ——
+sing-box: ${sb_status}
+Argo: ${argo_status}
+Nginx: ${nginx_status}
+
+—— 节点列表 ——
+<pre>${node_escaped}</pre>"
+    send_tg_msg "$msg" "html" && green "节点信息已推送到 Telegram" || yellow "Telegram 推送失败"
+}
+
+setup_telegram() {
+    load_tg_config
+    clear
+    echo ""
+    green "=== Telegram 通知设置 ===\n"
+    if [ "$TG_ENABLED" = "1" ] && [ -n "$TG_BOT_TOKEN" ]; then
+        green "当前状态: ${green}已启用${re}"
+        yellow "Bot Token: ${TG_BOT_TOKEN:0:10}********"
+        yellow "Chat ID: ${TG_CHAT_ID}"
+    else
+        yellow "当前状态: 未启用"
+    fi
+    echo ""
+    green "1. 配置/修改 Bot Token 与 Chat ID"
+    green "2. 发送测试消息"
+    green "3. 推送当前节点信息"
+    green "4. 开启通知"
+    red   "5. 关闭通知"
+    purple "0. 返回主菜单"
+    skyblue "------------"
+    reading "请输入选择: " tg_choice
+    case "$tg_choice" in
+        1)
+            reading "请输入 Telegram Bot Token: " input_token
+            reading "请输入 Telegram Chat ID: " input_chat
+            [ -z "$input_token" ] && input_token="${BOT_TOKEN:-}"
+            [ -z "$input_chat" ] && input_chat="${CHAT_ID:-}"
+            if [ -n "$input_token" ] && [ -n "$input_chat" ]; then
+                TG_BOT_TOKEN="$input_token"
+                TG_CHAT_ID="$input_chat"
+                TG_ENABLED="1"
+                save_tg_config
+                green "已保存并启用 Telegram 通知"
+                send_tg_msg "✅ sing-box Telegram 通知已配置成功
+主机: $(hostname)
+时间: $(date '+%Y-%m-%d %H:%M:%S')"
+            else
+                red "Token 或 Chat ID 不能为空"
+            fi
+            ;;
+        2)
+            load_tg_config
+            if send_tg_msg "🔔 sing-box 测试消息
+主机: $(hostname)
+时间: $(date '+%Y-%m-%d %H:%M:%S')"; then
+                green "测试消息已发送"
+            else
+                red "发送失败，请先完成配置"
+            fi
+            ;;
+        3) send_tg_nodes ;;
+        4)
+            load_tg_config
+            if [ -z "$TG_BOT_TOKEN" ] || [ -z "$TG_CHAT_ID" ]; then
+                red "请先配置 Bot Token 与 Chat ID"
+            else
+                TG_ENABLED="1"; save_tg_config; green "已开启 Telegram 通知"
+            fi
+            ;;
+        5) TG_ENABLED="0"; save_tg_config; yellow "已关闭 Telegram 通知" ;;
+        0) return ;;
+        *) red "无效选项" ;;
+    esac
+    read -n 1 -s -r -p $'\n\033[1;91m按任意键返回...\033[0m'
+    setup_telegram
+}
+
+change_hosts() {
+    sh -c 'echo "0 0" > /proc/sys/net/ipv4/ping_group_range'
+    sed -i '1s/.*/127.0.0.1   localhost/' /etc/hosts
+    sed -i '2s/.*/::1         localhost/' /etc/hosts
+}
+
+auto_install() {
+    if [ -x "${work_dir}/sing-box" ]; then
+        yellow "sing-box 已经安装，跳过安装流程。"
+        exit 0
+    fi
+    green "开始无交互式安装 sing-box (仅 Argo 隧道)..."
+    manage_packages install nginx jq tar openssl lsof coreutils
+    install_singbox
+    if command_exists systemctl; then
+        main_systemd_services
+    elif command_exists rc-update; then
+        alpine_openrc_services
+        change_hosts
+        rc-service sing-box restart
+        rc-service argo restart
+    else
+        red "不支持的 init 系统，安装中止。"
+        exit 1
+    fi
+    sleep 5
+    get_info
+    add_nginx_conf
+    create_shortcut
+    if command_exists nginx; then
+        restart_nginx
+        green "Nginx 已重启完成"
+    fi
+    green "\nsing-box (Argo 隧道) 安装完成\n"
+}
+
+auto_uninstall() {
+    green "开始无交互式卸载..."
+    if command_exists rc-service; then
+        rc-service sing-box stop  > /dev/null 2>&1
+        rc-service argo stop      > /dev/null 2>&1
+        rc-update del sing-box default > /dev/null 2>&1
+        rc-update del argo default     > /dev/null 2>&1
+        rm -f /etc/init.d/sing-box /etc/init.d/argo
+    elif command_exists systemctl; then
+        systemctl stop    sing-box > /dev/null 2>&1
+        systemctl stop    argo     > /dev/null 2>&1
+        systemctl disable sing-box > /dev/null 2>&1
+        systemctl disable argo     > /dev/null 2>&1
+        systemctl daemon-reload    > /dev/null 2>&1
+        rm -f /etc/systemd/system/sing-box.service /etc/systemd/system/argo.service
+    fi
+    rm -rf "${work_dir}"
+    rm -f /usr/bin/sb
+    if command_exists nginx; then
+        if command_exists rc-service; then
+            rc-service nginx stop   > /dev/null 2>&1
+            rc-update del nginx default > /dev/null 2>&1
+        elif command_exists systemctl; then
+            systemctl stop    nginx > /dev/null 2>&1
+            systemctl disable nginx > /dev/null 2>&1
+        fi
+        rm -f /etc/nginx/conf.d/sing-box.conf /etc/nginx/conf.d/argo-ws.conf
+        manage_packages uninstall nginx
+        [ -f /etc/nginx/nginx.conf.bak.sb ] && mv /etc/nginx/nginx.conf.bak.sb /etc/nginx/nginx.conf > /dev/null 2>&1
+    fi
+    green "\nsing-box 及 nginx 已完全卸载!\n"
+}
+
+# 修改配置（精简：UUID / 优选域名 / 前缀 / Argo端口）
+change_config() {
+    local singbox_status=$(check_singbox 2>/dev/null)
+    local singbox_installed=$?
+    if [ $singbox_installed -eq 2 ]; then
+        yellow "sing-box 尚未安装！"; sleep 1; menu; return
+    fi
+    clear; echo ""
+    green "=== 修改节点配置 ===\n"
+    green "sing-box当前状态: $singbox_status\n"
+    green "1. 修改 UUID"
+    skyblue "------------"
+    green "2. 修改 vmess-argo 优选域名"
+    skyblue "------------"
+    green "3. 修改节点前缀名称"
+    skyblue "------------"
+    green "4. 修改 Argo 对外端口"
+    skyblue "------------"
+    purple "0. 返回主菜单"
+    skyblue "------------"
+    reading "请输入选择: " choice
+    case "${choice}" in
+        1)
+            reading "\n请输入新的UUID(直接回车随机生成UUID): " new_uuid
+            [ -z "$new_uuid" ] && new_uuid=$(cat /proc/sys/kernel/random/uuid)
+            jq --arg uuid "$new_uuid" \
+               '(.inbounds[] | select(.users != null) | .users[] | select(.uuid != null).uuid) = $uuid |
+                (.inbounds[] | select(.users != null) | .users[] | select(.password != null).password) = $uuid' \
+               "${conf_dir}/inbounds.json" > "${conf_dir}/inbounds.json.tmp" && mv "${conf_dir}/inbounds.json.tmp" "${conf_dir}/inbounds.json"
+            restart_singbox
+            # 重新生成节点
+            uuid="$new_uuid"
+            get_info
+            green "\nUUID已修改为：${purple}${new_uuid}${re}\n"
+            ;;
+        2) change_cfip ;;
+        3)
+            reading "\n请输入新的节点前缀名称 (回车清空前缀，仅使用 ISP): " new_prefix
+            export node_prefix="$new_prefix"
+            get_info
+            green "\n节点前缀已更新\n"
+            ;;
+        4)
+            reading "\n请输入Argo对外端口 (当前Nginx入口, 回车随机): " new_port
+            [ -z "$new_port" ] && new_port=$(shuf -i 2000-65000 -n 1)
+            if ! [[ "$new_port" =~ ^[0-9]+$ ]] || [ "$new_port" -lt 1 ] || [ "$new_port" -gt 65535 ]; then
+                red "端口无效"; return 1
+            fi
+            allow_port $new_port/tcp > /dev/null 2>&1
+            if [ -f /etc/nginx/conf.d/argo-ws.conf ]; then
+                sed -i "s/listen [0-9]\+;/listen ${new_port};/g" /etc/nginx/conf.d/argo-ws.conf
+                sed -i "s/listen \[::\]:[0-9]\+;/listen [::]:${new_port};/g" /etc/nginx/conf.d/argo-ws.conf
+                nginx -t >/dev/null 2>&1 && nginx -s reload >/dev/null 2>&1 || restart_nginx >/dev/null 2>&1
+            fi
+            export ARGO_PORT=$new_port
+            if [ -f "${work_dir}/argo_fixed.conf" ]; then
+                sed -i "s/^ARGO_PORT=.*/ARGO_PORT=\"${new_port}\"/" "${work_dir}/argo_fixed.conf"
+            fi
+            rewrite_argo_service
+            restart_argo
+            sleep 2
+            if [ -f "${work_dir}/argo-start.sh" ] && grep -q -- '--url http://localhost' "${work_dir}/argo-start.sh" 2>/dev/null; then
+                get_quick_tunnel && change_argo_domain
+            fi
+            green "\nArgo对外端口已修改为：${purple}${new_port}${re}\n"
+            ;;
+        0) menu ;;
+        *) red "无效的选项！\n" ;;
+    esac
+}
+
+show_node_files() {
+    clear; echo ""
+    green "=== 节点文件说明 ===\n"
+    yellow "本版本仅输出 Argo 隧道节点（vmess / vless / trojan）。\n"
+    green "明文节点列表: ${purple}${work_dir}/url.txt${re}"
+    green "base64 订阅体: ${purple}${work_dir}/sub.txt${re}"
+    echo ""
+    if [ -f "${work_dir}/url.txt" ]; then
+        yellow "当前节点预览:\n"
+        while IFS= read -r line; do
+            [ -z "$line" ] && continue
+            echo -e "${purple}${line}${re}"
+        done < "${work_dir}/url.txt"
+        echo ""
+    else
+        red "尚未生成节点文件，请先安装 sing-box。\n"
+    fi
+}
+
+manage_singbox() {
+    while true; do
+        local singbox_status
+        singbox_status=$(check_singbox 2>/dev/null)
+        clear
+        echo ""
+        green "=== sing-box 管理 ===\n"
+        green "当前状态: ${singbox_status}\n"
+        green "1. 启动 sing-box 服务"
+        skyblue "-------------------"
+        green "2. 停止 sing-box 服务"
+        skyblue "-------------------"
+        green "3. 重启 sing-box 服务"
+        skyblue "-------------------"
+        purple "0. 返回主菜单"
+        skyblue "------------"
+        reading "\n请输入选择: " choice
+        echo ""
+        case "${choice}" in
+            1) start_singbox ;;
+            2) stop_singbox ;;
+            3) restart_singbox ;;
+            0) return ;;
+            *) red "无效的选项"; sleep 1; continue ;;
+        esac
+        echo ""
+        read -n 1 -s -r -p $'\033[1;91m按任意键继续...\033[0m'
+    done
+}
+
+manage_argo() {
+    local argo_status=$(check_argo 2>/dev/null)
+    clear; echo ""
+    green "=== Argo 隧道管理 ===\n"
+    green "Argo当前状态: $argo_status\n"
+    green "1. 启动Argo服务"
+    skyblue "------------"
+    green "2. 停止Argo服务"
+    skyblue "------------"
+    green "3. 重启Argo服务"
+    skyblue "------------"
+    green "4. 添加Argo固定隧道"
+    skyblue "----------------"
+    green "5. 切换回Argo临时隧道"
+    skyblue "------------------"
+    green "6. 重新获取Argo临时域名"
+    skyblue "-------------------"
+    purple "0. 返回主菜单"
+    skyblue "-----------"
+    reading "\n请输入选择: " choice
+    case "${choice}" in
+        1) start_argo ;;
+        2) stop_argo ;;
+        3)
+            clear
+            if [ -f "${work_dir}/argo-start.sh" ] && grep -q -- '--url http://localhost' "${work_dir}/argo-start.sh" 2>/dev/null; then
+                get_quick_tunnel && change_argo_domain
+            elif [ ! -f "${work_dir}/argo_fixed.conf" ]; then
+                get_quick_tunnel && change_argo_domain
+            else
+                green "\n当前使用固定隧道,无需获取临时域名"; sleep 2; menu
+            fi
+            ;;
+        4)
+            clear
+            yellow "\n固定隧道（JSON 或 Token）。Token 请在 Cloudflare 配置一致的 Public Hostname"
+            yellow "架构: Cloudflare → Nginx(入口) → VMess/VLESS/Trojan 三个 WS 端口\n"
+            load_argo_fixed_conf
+            local current_argo_port="${ARGO_PORT:-8001}"
+            reading "请输入 Argo 入口端口 (当前: ${current_argo_port}，回车保持): " input_port
+            if [ -n "$input_port" ]; then
+                if [[ "$input_port" =~ ^[0-9]+$ ]] && [ "$input_port" -ge 1 ] && [ "$input_port" -le 65535 ]; then
+                    ARGO_PORT="$input_port"
+                    export ARGO_PORT
+                    if [ -f /etc/nginx/conf.d/argo-ws.conf ]; then
+                        sed -i "s/listen [0-9]\+;/listen ${ARGO_PORT};/g" /etc/nginx/conf.d/argo-ws.conf
+                        sed -i "s/listen \[::\]:[0-9]\+;/listen [::]:${ARGO_PORT};/g" /etc/nginx/conf.d/argo-ws.conf
+                        nginx -t >/dev/null 2>&1 && nginx -s reload >/dev/null 2>&1 || restart_nginx >/dev/null 2>&1
+                    fi
+                    allow_port ${ARGO_PORT}/tcp >/dev/null 2>&1
+                    green "Argo 入口端口已更新为: ${purple}${ARGO_PORT}${re}"
+                else
+                    red "端口无效，保持 ${current_argo_port}"
+                    ARGO_PORT="$current_argo_port"
+                fi
+            else
+                ARGO_PORT="$current_argo_port"
+            fi
+            export ARGO_PORT
+            reading "请输入固定隧道域名 (回车取消): " argo_domain
+            [ -z "$argo_domain" ] && { yellow "已取消"; return; }
+            yellow "可粘贴完整命令，将自动去除前缀仅保留 eyJ 令牌"
+            reading "请输入隧道令牌/JSON (回车取消): " argo_auth
+            argo_auth=$(clean_argo_token "$argo_auth")
+            [ -z "$argo_auth" ] && { yellow "已取消"; return; }
+            ARGO_DOMAIN="$argo_domain"
+            ARGO_TOKEN="$argo_auth"
+            ARGO_USE_FIXED=1
+            ArgoDomain="$argo_domain"
+            export ARGO_DOMAIN ARGO_TOKEN ARGO_USE_FIXED
+            save_argo_fixed_conf
+            rewrite_argo_service
+            restart_argo
+            sleep 1
+            change_argo_domain
+            ;;
+        5)
+            clear
+            clear_argo_fixed_conf
+            rewrite_argo_service
+            restart_argo
+            get_quick_tunnel
+            change_argo_domain
+            ;;
+        6)
+            if [ -f "${work_dir}/argo-start.sh" ] && grep -q -- '--url http://localhost' "${work_dir}/argo-start.sh" 2>/dev/null; then
+                get_quick_tunnel && change_argo_domain
+            elif [ ! -f "${work_dir}/argo_fixed.conf" ]; then
+                get_quick_tunnel && change_argo_domain
+            else
+                yellow "当前使用固定隧道，无法获取临时隧道"; sleep 2; menu
+            fi
+            ;;
+        0) menu ;;
+        *) red "无效的选项！" ;;
+    esac
+}
+
+get_quick_tunnel() {
+    restart_argo
+    yellow "获取临时argo域名中，请稍等...\n"
+    sleep 3
+    if [ -f /etc/sing-box/argo.log ]; then
+        for i in {1..5}; do
+            purple "第 $i 次尝试获取ArgoDomain中..."
+            get_argodomain=$(sed -n 's|.*https://\([^/]*trycloudflare\.com\).*|\1|p' "/etc/sing-box/argo.log")
+            [ -n "$get_argodomain" ] && break
+            sleep 2
+        done
+    else
+        restart_argo; sleep 6
+        get_argodomain=$(sed -n 's|.*https://\([^/]*trycloudflare\.com\).*|\1|p' "/etc/sing-box/argo.log")
+    fi
+    green "ArgoDomain：${purple}$get_argodomain${re}\n"
+    ArgoDomain=$get_argodomain
+}
+
+change_argo_domain() {
+    if [ -z "$ArgoDomain" ]; then
+        red "ArgoDomain 为空，无法更新节点"
+        return 1
+    fi
+    if [ ! -f "$client_dir" ]; then
+        red "节点文件不存在: $client_dir"
+        return 1
+    fi
+    content=$(cat "$client_dir")
+    # 更新 vmess
+    vmess_url=$(grep -o 'vmess://[^[:space:]]*' "$client_dir" | head -1)
+    if [ -n "$vmess_url" ]; then
+        encoded_vmess="${vmess_url#vmess://}"
+        decoded_vmess=$(echo "$encoded_vmess" | base64 --decode 2>/dev/null)
+        if [ -n "$decoded_vmess" ]; then
+            updated_vmess=$(echo "$decoded_vmess" | jq --arg d "$ArgoDomain" '.host = $d | .sni = $d' 2>/dev/null)
+            if [ -n "$updated_vmess" ]; then
+                encoded_updated=$(echo "$updated_vmess" | base64 -w0 2>/dev/null || echo "$updated_vmess" | base64 | tr -d '\n')
+                new_vmess_url="vmess://${encoded_updated}"
+                content=$(echo "$content" | sed "s|$vmess_url|$new_vmess_url|")
+                green "vmess 节点已更新"
+            fi
+        fi
+    fi
+    # 更新 vless-ws / trojan-ws
+    if echo "$content" | grep -qE 'path=%2Fvless-argo|path=/vless-argo'; then
+        content=$(echo "$content" | sed -E "s#(vless://[^[:space:]#]*[?&]sni=)[^&[:space:]#]+#\1${ArgoDomain}#g")
+        content=$(echo "$content" | sed -E "s#(vless://[^[:space:]#]*[?&]host=)[^&[:space:]#]+#\1${ArgoDomain}#g")
+        green "vless-ws 隧道节点已更新"
+    fi
+    if echo "$content" | grep -qE 'path=%2Ftrojan-argo|path=/trojan-argo'; then
+        content=$(echo "$content" | sed -E "s#(trojan://[^[:space:]#]*[?&]sni=)[^&[:space:]#]+#\1${ArgoDomain}#g")
+        content=$(echo "$content" | sed -E "s#(trojan://[^[:space:]#]*[?&]host=)[^&[:space:]#]+#\1${ArgoDomain}#g")
+        green "trojan-ws 隧道节点已更新"
+    fi
+    echo "$content" > "$client_dir"
+    refresh_sub
+    echo ""
+    green "=== 更新后的节点信息 ===\n"
+    while IFS= read -r line; do
+        [ -z "$line" ] && continue
+        echo -e "${purple}${line}${re}"
+    done < "$client_dir"
+    echo ""
+    send_tg_nodes 2>/dev/null || true
+}
+
+check_nodes() {
+    if [ ! -f "${work_dir}/url.txt" ]; then
+        red "节点信息文件不存在，请先安装 sing-box"; return 1
+    fi
+    clear; echo ""
+    green "=== 当前节点信息（仅 Argo 隧道） ===\n"
+    while IFS= read -r line; do
+        [ -z "$line" ] && continue
+        echo -e "${purple}${line}${re}\n"
+    done < "${work_dir}/url.txt"
+    yellow "节点文件: ${work_dir}/url.txt"
+    yellow "本地 base64: ${work_dir}/sub.txt\n"
+}
+
+change_cfip() {
+    clear
+    yellow "修改vmess-argo优选域名\n"
+    green "1: cf.090227.xyz  2: cf.877774.xyz  3: cf.877771.xyz  4: cdns.doon.eu.org  5: cf.zhetengsha.eu.org  6: time.is\n"
+    reading "请输入你的优选域名或优选IP\n(请输入1至6选项,可输入域名:端口 或 IP:端口,直接回车默认使用1): " cfip_input
+    case "$cfip_input" in
+        ""|"1") cfip="cf.090227.xyz";          cfport="443" ;;
+        "2")    cfip="cf.877774.xyz";           cfport="443" ;;
+        "3")    cfip="cf.877771.xyz";           cfport="443" ;;
+        "4")    cfip="cdns.doon.eu.org";        cfport="443" ;;
+        "5")    cfip="cf.zhetengsha.eu.org";    cfport="443" ;;
+        "6")    cfip="time.is";                 cfport="443" ;;
+        *)
+            if [[ "$cfip_input" =~ : ]]; then
+                cfip=$(echo "$cfip_input" | cut -d':' -f1)
+                cfport=$(echo "$cfip_input" | cut -d':' -f2)
+            else
+                cfip="$cfip_input"; cfport="443"
+            fi
+            ;;
+    esac
+    content=$(cat "$client_dir")
+    vmess_url=$(grep -o 'vmess://[^ ]*' "$client_dir")
+    encoded_part="${vmess_url#vmess://}"
+    decoded_json=$(echo "$encoded_part" | base64 --decode 2>/dev/null)
+    updated_json=$(echo "$decoded_json" | jq --arg cfip "$cfip" --argjson cfport "$cfport" '.add = $cfip | .port = $cfport')
+    new_encoded_part=$(echo "$updated_json" | base64 -w0 2>/dev/null || echo "$updated_json" | base64 | tr -d '\n')
+    new_vmess_url="vmess://$new_encoded_part"
+    new_content=$(echo "$content" | sed "s|$vmess_url|$new_vmess_url|")
+    # 同步更新 vless/trojan 的 CFIP
+    new_content=$(echo "$new_content" | sed -E "s#(vless://[^@]+@)[^:]+(:${cfport})#\1${cfip}\2#g")
+    new_content=$(echo "$new_content" | sed -E "s#(trojan://[^@]+@)[^:]+(:${cfport})#\1${cfip}\2#g")
+    echo "$new_content" > "$client_dir"
+    refresh_sub
+    green "\nvmess/vless/trojan 优选域名已更新为：${purple}${cfip}:${cfport}${re}\n"
+    while IFS= read -r line; do purple "$line"; done < "$client_dir"
+}
+
+menu() {
+    singbox_status=$(check_singbox 2>/dev/null)
+    nginx_status=$(check_nginx 2>/dev/null)
+    argo_status=$(check_argo 2>/dev/null)
+    clear; echo ""
+    purple "=== sing-box Argo 隧道专用脚本（精简版） ===\n"
+    purple "---Argo 状态: ${argo_status}"
+    purple "--Nginx 状态: ${nginx_status}"
+    purple "singbox 状态: ${singbox_status}\n"
+    yellow "仅保留: vmess-ws / vless-ws / trojan-ws (Argo 隧道)\n"
+    green "1. 安装sing-box"
+    red   "2. 卸载sing-box"
+    echo "==============="
+    green "3. sing-box管理"
+    green "4. Argo隧道管理"
+    echo "==============="
+    green "5. 查看节点信息"
+    green "6. 修改节点配置"
+    green "7. 查看节点文件说明"
+    echo "==============="
+    green "8. Telegram通知设置"
+    echo "==============="
+    red "0. 退出脚本"
+    echo "==========="
+}
+
+trap 'red "\n强制退出"; exit' INT
+
+case "$1" in
+    -i | --install)
+        auto_install
+        exit 0
+        ;;
+    -u | --uninstall)
+        auto_uninstall
+        exit 0
+        ;;
+    -c | --check)
+        check_nodes
+        exit 0
+        ;;
+    -r | --restart)
+        get_quick_tunnel
+        change_argo_domain
+        exit 0
+        ;;
+    -h | --help)
+        echo ""
+        green "用法: [sb或脚本] [参数], 示例: sb -c"
+        echo ""
+        green "  -i, --install     无交互安装 sing-box (仅 Argo 隧道)"
+        green "  -c, --check       查看节点信息（url.txt）"
+        green "  -r, --restart     重新获取 Argo 临时隧道并更新节点"
+        green "  -u, --uninstall   无交互卸载"
+        green "  -h, --help        显示此帮助信息"
+        echo ""
+        green "  不带参数          进入交互式主菜单"
+        echo ""
+        yellow "精简版: 仅 Argo 隧道节点 (vmess/vless/trojan-ws)"
+        yellow "支持环境变量: ARGO_PORT / ARGO_DOMAIN / ARGO_TOKEN / CFIP / CFPORT / uuid / node_prefix / BOT_TOKEN / CHAT_ID"
+        echo ""
+        exit 0
+        ;;
+    "")
+        while true; do
+            menu
+            reading "请输入选择(0-8): " choice
+            echo ""
+            need_pause=true
+            case "${choice}" in
+                1)
+                    if [ -x "${work_dir}/sing-box" ]; then
+                        yellow "sing-box 已经安装！如需重装请先卸载。\n"
+                    else
+                        manage_packages install nginx jq tar openssl lsof coreutils
+                        install_singbox
+                        if command_exists systemctl; then
+                            main_systemd_services
+                        elif command_exists rc-update; then
+                            alpine_openrc_services
+                            change_hosts
+                            rc-service sing-box restart
+                            rc-service argo restart
+                        else
+                            echo "Unsupported init system"; exit 1
+                        fi
+                        sleep 5
+                        get_info
+                        add_nginx_conf
+                        create_shortcut
+                        if command_exists nginx; then
+                            restart_nginx
+                            green "Nginx 已重启完成"
+                        fi
+                    fi
+                    ;;
+                2)  uninstall_singbox;  need_pause=false ;;
+                3)  manage_singbox;     need_pause=false ;;
+                4)  manage_argo;        need_pause=true ;;
+                5)  check_nodes;        need_pause=true ;;
+                6)  change_config;      need_pause=true ;;
+                7)  show_node_files;    need_pause=true ;;
+                8)  setup_telegram;     need_pause=false ;;
+                0)  exit 0 ;;
+                *)
+                    red "无效的选项，请输入 0-8"
+                    need_pause=true
+                    ;;
+            esac
+            [ "$need_pause" = true ] && read -n 1 -s -r -p $'\033[1;91m按任意键返回...\033[0m'
+        done
+        ;;
+    *)
+        red "未知参数: $1"
+        echo ""
+        green "用法: sb [-i|-u|-c|-r|-h]"
+        exit 1
+        ;;
+esac
