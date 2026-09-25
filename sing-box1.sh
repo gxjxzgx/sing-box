@@ -1027,8 +1027,7 @@ EOF
       ],
       "transport": {
         "type": "ws",
-        "path": "/vless",
-        "early_data_header_name": "Sec-WebSocket-Protocol"
+        "path": "/vless-ws"
       }
     },
     {
@@ -1382,7 +1381,7 @@ hysteria2://${uuid}@${server_ip}:${hy2_port}/?sni=www.bing.com&insecure=1&pinSHA
 
 tuic://${uuid}:${uuid}@${server_ip}:${tuic_port}?sni=www.bing.com&congestion_control=bbr&udp_relay_mode=native&alpn=h3&allow_insecure=1#${prefix}-tuic
 
-vless://${uuid}@${server_ip}:${vless_ws_direct_port}?encryption=none&security=none&type=ws&host=${server_ip}&path=%2Fvless#${prefix}-vless-ws
+vless://${uuid}@${server_ip}:${vless_ws_direct_port}?encryption=none&security=none&type=ws&host=${server_ip}&path=%2Fvless-ws#${prefix}-vless-ws
 
 vmess://$(echo "$VMESS" | base64 -w0)
 
