@@ -2,7 +2,7 @@
 
 # =========================
 # 老王sing-box多协议安装脚本（个人修改版）
-# 协议: vless-reality | hysteria2 | tuic | vless-ws(直连)
+# 协议: vless-reality | hysteria2 | tuic | vless-ws(直连, 无TLS)
 #       vmess-ws / vless-ws / trojan-ws (Argo 隧道)
 # 可额外添加: anytls / socks5 / ss2022
 #
@@ -1025,11 +1025,6 @@ EOF
           "uuid": "$uuid"
         }
       ],
-      "tls": {
-        "enabled": true,
-        "certificate_path": "$work_dir/cert.pem",
-        "key_path": "$work_dir/private.key"
-      },
       "transport": {
         "type": "ws",
         "path": "/vless",
@@ -1387,7 +1382,7 @@ hysteria2://${uuid}@${server_ip}:${hy2_port}/?sni=www.bing.com&insecure=1&pinSHA
 
 tuic://${uuid}:${uuid}@${server_ip}:${tuic_port}?sni=www.bing.com&congestion_control=bbr&udp_relay_mode=native&alpn=h3&allow_insecure=1#${prefix}-tuic
 
-vless://${uuid}@${server_ip}:${vless_ws_direct_port}?encryption=none&security=tls&sni=www.bing.com&fp=firefox&type=ws&host=${server_ip}&path=%2Fvless&allowInsecure=1#${prefix}-vless-ws
+vless://${uuid}@${server_ip}:${vless_ws_direct_port}?encryption=none&security=none&type=ws&host=${server_ip}&path=%2Fvless#${prefix}-vless-ws
 
 vmess://$(echo "$VMESS" | base64 -w0)
 
@@ -2403,11 +2398,12 @@ change_config() {
                 "5") new_sni="www.nazhumi.com" ;;
             esac
             jq --arg sni "$new_sni" \
-               '(.inbounds[] | select(.type == "vless") | .tls.server_name) = $sni |
-                (.inbounds[] | select(.type == "vless") | .tls.reality.handshake.server) = $sni' \
+               '(.inbounds[] | select(.tag == "vless-reality") | .tls.server_name) = $sni |
+                (.inbounds[] | select(.tag == "vless-reality") | .tls.reality.handshake.server) = $sni' \
                "${conf_dir}/inbounds.json" > "${conf_dir}/inbounds.json.tmp" && mv "${conf_dir}/inbounds.json.tmp" "${conf_dir}/inbounds.json"
             restart_singbox
-            sed -i "s/\(vless:\/\/[^\?]*\?\([^\&]*\&\)*sni=\)[^&]*/\1$new_sni/" $client_dir
+            # 仅更新 Reality 节点的 sni，避免误改无 TLS 的 vless-ws 直连
+            sed -i -E "/flow=xtls-rprx-vision/s/(sni=)[^&]*/\1${new_sni}/" $client_dir
             refresh_sub
             while IFS= read -r line; do yellow "$line"; done < ${work_dir}/url.txt
             green "\nReality sni已修改为：${purple}${new_sni}${re}\n"
