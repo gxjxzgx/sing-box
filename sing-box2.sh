@@ -28,7 +28,7 @@
 #  12. 移除主菜单「Nginx管理」（Nginx 仍由安装/Argo 自动配置，状态仅展示）
 #
 # 基于: eooce/sing-box  修改日期: 2026.9.22
-# 版本: v2.4.4 (修复损坏的 mime.types 截断/缺括号；强制重写)
+# 版本: v2.4.5 (nginx 始终写入自包含主配置+mime.types，不再修补系统残缺文件)
 # =========================
 
 export LANG=en_US.UTF-8
@@ -1517,38 +1517,87 @@ add_nginx_conf() {
     if ! command_exists nginx; then
         red "nginx 未安装，无法配置 Argo 隧道路径分流"
         return 1
-    else
-        manage_service "nginx" "stop" > /dev/null 2>&1
-        pkill -x nginx > /dev/null 2>&1 || pkill nginx > /dev/null 2>&1
     fi
 
-    # 先补全运行时依赖（mime.types / 用户 / 目录），再写站点配置
-    _ensure_nginx_ready
+    # 停止旧进程，避免占用端口
+    manage_service "nginx" "stop" > /dev/null 2>&1
+    pkill -x nginx > /dev/null 2>&1 || pkill nginx > /dev/null 2>&1
+    sleep 0.5
 
-    mkdir -p /etc/nginx/conf.d /var/log/nginx /run
-    # 避免 Debian/Ubuntu 默认站点与 Argo 入口端口冲突
+    mkdir -p /etc/nginx/conf.d /var/log/nginx /run /var/lib/nginx /var/cache/nginx
+
+    # 禁用可能冲突的默认站点
     if [ -L /etc/nginx/sites-enabled/default ]; then
         rm -f /etc/nginx/sites-enabled/default
-        yellow "已禁用 sites-enabled/default，避免端口冲突"
+        yellow "已禁用 sites-enabled/default"
     fi
-    [[ -f "/etc/nginx/conf.d/sing-box.conf" ]] && cp /etc/nginx/conf.d/sing-box.conf /etc/nginx/conf.d/sing-box.conf.bak.sb
+    rm -f /etc/nginx/conf.d/sing-box.conf
 
-    # 内部端口（与 install_singbox 保持一致）
     local vmess_ws_port=$((ARGO_PORT + 10))
     local vless_ws_port=$((ARGO_PORT + 11))
     local trojan_ws_port=$((ARGO_PORT + 12))
+    local nginx_user
+    nginx_user=$(_resolve_nginx_user)
 
-    # 已去掉独立订阅端口；删除旧订阅配置（若存在）
-    rm -f /etc/nginx/conf.d/sing-box.conf
+    # ---------- 1. 始终覆盖写入已知可用的 mime.types（不信任系统残留文件）----------
+    # 历史问题：系统 mime.types 可能缺失、截断、缺 }，导致 nginx -t 失败
+    if [ -f /etc/nginx/mime.types ]; then
+        cp -f /etc/nginx/mime.types "/etc/nginx/mime.types.bak.sb.$(date +%s)" 2>/dev/null || true
+    fi
+    cat > /etc/nginx/mime.types << 'MIMEOF'
+types {
+    text/html                             html htm shtml;
+    text/css                              css;
+    text/xml                              xml;
+    image/gif                             gif;
+    image/jpeg                            jpeg jpg;
+    application/javascript                js;
+    application/json                      json;
+    application/octet-stream              bin exe dmg;
+    application/pdf                       pdf;
+    application/xhtml+xml                 xhtml;
+    application/xml                       xsl;
+    application/zip                       zip;
+    image/png                             png;
+    image/svg+xml                         svg svgz;
+    image/webp                            webp;
+    image/x-icon                          ico;
+    text/plain                            txt;
+    text/event-stream                     event-stream;
+}
+MIMEOF
 
-    # Argo 统一入口：同一端口按路径分流到三个协议（临时隧道/固定隧道均可）
+    # ---------- 2. 始终覆盖写入完整可用的主配置（不依赖系统残缺 include）----------
+    if [ -f /etc/nginx/nginx.conf ]; then
+        cp -f /etc/nginx/nginx.conf /etc/nginx/nginx.conf.bak.sb 2>/dev/null || true
+    fi
+    cat > /etc/nginx/nginx.conf << EOF
+user ${nginx_user};
+worker_processes auto;
+error_log /var/log/nginx/error.log warn;
+pid /run/nginx.pid;
+
+events {
+    worker_connections 1024;
+}
+
+http {
+    include       /etc/nginx/mime.types;
+    default_type  application/octet-stream;
+    sendfile        on;
+    keepalive_timeout  65;
+    # 仅加载 conf.d，避免 sites-enabled 等冲突
+    include /etc/nginx/conf.d/*.conf;
+}
+EOF
+
+    # ---------- 3. Argo 路径分流 ----------
     cat > /etc/nginx/conf.d/argo-ws.conf << EOF
 server {
     listen ${ARGO_PORT};
     listen [::]:${ARGO_PORT};
     server_name _;
 
-    # VMess-WS
     location /vmess-argo {
         proxy_pass http://127.0.0.1:${vmess_ws_port};
         proxy_http_version 1.1;
@@ -1561,7 +1610,6 @@ server {
         proxy_send_timeout 300s;
     }
 
-    # VLESS-WS
     location /vless-argo {
         proxy_pass http://127.0.0.1:${vless_ws_port};
         proxy_http_version 1.1;
@@ -1574,7 +1622,6 @@ server {
         proxy_send_timeout 300s;
     }
 
-    # Trojan-WS
     location /trojan-argo {
         proxy_pass http://127.0.0.1:${trojan_ws_port};
         proxy_http_version 1.1;
@@ -1591,126 +1638,114 @@ server {
 }
 EOF
 
-    # 确保主配置包含 conf.d，禁止按行号硬编码 sed（易破坏不同发行版 nginx.conf）
-    if [ -f "/etc/nginx/nginx.conf" ]; then
-        cp /etc/nginx/nginx.conf /etc/nginx/nginx.conf.bak.sb > /dev/null 2>&1
-        if ! grep -qE 'include[[:space:]]+/etc/nginx/conf\.d/\*\.conf' /etc/nginx/nginx.conf; then
-            # 在 http { 块内追加 include（匹配最后一个以 } 结束前的 http 作用域）
-            if grep -qE '^[[:space:]]*http[[:space:]]*\{' /etc/nginx/nginx.conf; then
-                # 在第一个 "http {" 之后插入 include 行（若尚未存在）
-                awk '
-                    BEGIN { done=0 }
-                    /^[[:space:]]*http[[:space:]]*\{/ && !done {
-                        print
-                        print "    include /etc/nginx/conf.d/*.conf;"
-                        done=1
-                        next
-                    }
-                    { print }
-                ' /etc/nginx/nginx.conf > /etc/nginx/nginx.conf.tmp.sb \
-                    && mv /etc/nginx/nginx.conf.tmp.sb /etc/nginx/nginx.conf
-            else
-                yellow "未在 nginx.conf 中找到 http {} 块，将写入最小可用主配置"
-                _write_minimal_nginx_conf
-            fi
-        fi
-    else
-        _write_minimal_nginx_conf
-    fi
-
-    # 补全 mime.types / 用户 / 目录（精简系统常见缺失）
-    _ensure_nginx_ready
-
-    local nginx_test_out
+    # ---------- 4. 检测并启动 ----------
+    local nginx_test_out nginx_test_rc
     nginx_test_out=$(nginx -t 2>&1)
-    local nginx_test_rc=$?
-    if [ $nginx_test_rc -eq 0 ]; then
-        nginx -s reload > /dev/null 2>&1 || start_nginx
-        if command_exists systemctl && systemctl is-active --quiet nginx 2>/dev/null; then
-            green "nginx 配置检测通过，服务已加载"
-        elif pgrep -x nginx >/dev/null 2>&1; then
-            green "nginx 配置检测通过，进程已运行"
-        else
-            yellow "nginx 配置检测通过，但服务未处于 active 状态，正在启动..."
-            start_nginx
-        fi
-    else
-        yellow "nginx 配置检测失败，详细信息如下："
+    nginx_test_rc=$?
+
+    if [ $nginx_test_rc -ne 0 ]; then
+        yellow "nginx -t 首次失败，尝试重装/修复 nginx 包依赖后重试..."
         echo "$nginx_test_out" | while IFS= read -r line; do red "  $line"; done
-        yellow "尝试恢复主配置并重启..."
-        if [ -f "/etc/nginx/nginx.conf.bak.sb" ]; then
-            cp /etc/nginx/nginx.conf.bak.sb /etc/nginx/nginx.conf > /dev/null 2>&1
-            # 恢复后仍保留 argo-ws.conf；再次确保 include
-            if ! grep -qE 'include[[:space:]]+/etc/nginx/conf\.d/\*\.conf' /etc/nginx/nginx.conf; then
-                if grep -qE '^[[:space:]]*http[[:space:]]*\{' /etc/nginx/nginx.conf; then
-                    awk '
-                        BEGIN { done=0 }
-                        /^[[:space:]]*http[[:space:]]*\{/ && !done {
-                            print
-                            print "    include /etc/nginx/conf.d/*.conf;"
-                            done=1
-                            next
-                        }
-                        { print }
-                    ' /etc/nginx/nginx.conf > /etc/nginx/nginx.conf.tmp.sb \
-                        && mv /etc/nginx/nginx.conf.tmp.sb /etc/nginx/nginx.conf
-                fi
-            fi
+        # 尝试用包管理器补全 nginx 公共文件（不卸载配置）
+        if command_exists apt; then
+            DEBIAN_FRONTEND=noninteractive apt-get install -y --reinstall nginx-common nginx 2>/dev/null || \
+            DEBIAN_FRONTEND=noninteractive apt-get install -y nginx 2>/dev/null || true
+        elif command_exists dnf; then
+            dnf reinstall -y nginx 2>/dev/null || dnf install -y nginx 2>/dev/null || true
+        elif command_exists yum; then
+            yum reinstall -y nginx 2>/dev/null || yum install -y nginx 2>/dev/null || true
+        elif command_exists apk; then
+            apk add --no-cache nginx 2>/dev/null || true
         fi
-        _ensure_nginx_ready
+        # 包重装可能覆盖我们的配置，再次写入
+        cat > /etc/nginx/mime.types << 'MIMEOF'
+types {
+    text/html                             html htm shtml;
+    text/css                              css;
+    text/xml                              xml;
+    image/gif                             gif;
+    image/jpeg                            jpeg jpg;
+    application/javascript                js;
+    application/json                      json;
+    application/octet-stream              bin exe dmg;
+    application/pdf                       pdf;
+    image/png                             png;
+    image/svg+xml                         svg svgz;
+    image/webp                            webp;
+    image/x-icon                          ico;
+    text/plain                            txt;
+}
+MIMEOF
+        cat > /etc/nginx/nginx.conf << EOF
+user ${nginx_user};
+worker_processes auto;
+error_log /var/log/nginx/error.log warn;
+pid /run/nginx.pid;
+events { worker_connections 1024; }
+http {
+    include       /etc/nginx/mime.types;
+    default_type  application/octet-stream;
+    sendfile        on;
+    keepalive_timeout  65;
+    include /etc/nginx/conf.d/*.conf;
+}
+EOF
+        # 确保 argo-ws.conf 仍在
+        [ -f /etc/nginx/conf.d/argo-ws.conf ] || true
         nginx_test_out=$(nginx -t 2>&1)
         nginx_test_rc=$?
-        if [ $nginx_test_rc -eq 0 ]; then
-            restart_nginx
-            if command_exists systemctl && systemctl is-active --quiet nginx 2>/dev/null; then
-                green "已恢复配置并成功重启 nginx"
-            elif pgrep -x nginx >/dev/null 2>&1; then
-                green "已恢复配置，nginx 进程已运行"
-            else
-                red "配置已通过检测，但 nginx 仍未成功启动，请执行: journalctl -xeu nginx.service"
-                return 1
-            fi
-        else
-            # mime.types 仍坏时强制覆盖再试一次
-            if echo "$nginx_test_out" | grep -qi 'mime.types'; then
-                yellow "强制重写损坏的 mime.types 并重试..."
-                _write_safe_mime_types
-                _ensure_nginx_ready
-                nginx_test_out=$(nginx -t 2>&1)
-                nginx_test_rc=$?
-                if [ $nginx_test_rc -eq 0 ]; then
-                    restart_nginx
-                    if command_exists systemctl && systemctl is-active --quiet nginx 2>/dev/null; then
-                        green "强制修复 mime.types 后 nginx 已正常"
-                        return 0
-                    fi
-                fi
-            fi
-            red "恢复后 nginx 配置仍检测失败："
-            echo "$nginx_test_out" | while IFS= read -r line; do red "  $line"; done
-            red "请检查: ls -l /etc/nginx/mime.types ; head -5 /etc/nginx/mime.types ; tail -5 /etc/nginx/mime.types"
-            red "请检查端口 ${ARGO_PORT} 是否被占用: ss -tlnp | grep :${ARGO_PORT}"
-            return 1
+    fi
+
+    if [ $nginx_test_rc -ne 0 ]; then
+        red "nginx 配置检测仍失败："
+        echo "$nginx_test_out" | while IFS= read -r line; do red "  $line"; done
+        red "请手动执行并反馈完整输出: nginx -t ; ls -la /etc/nginx/ ; head -20 /etc/nginx/nginx.conf"
+        return 1
+    fi
+
+    green "nginx -t 检测通过"
+
+    # 启动：优先 systemctl，失败则直接 nginx 二进制拉起
+    if command_exists systemctl; then
+        systemctl reset-failed nginx 2>/dev/null || true
+        systemctl daemon-reload 2>/dev/null || true
+        systemctl enable nginx 2>/dev/null || true
+        systemctl start nginx 2>/tmp/sb-nginx-start.err
+        sleep 1
+        if systemctl is-active --quiet nginx 2>/dev/null; then
+            green "nginx 服务已启动 (systemctl)"
+            return 0
+        fi
+        [ -s /tmp/sb-nginx-start.err ] && cat /tmp/sb-nginx-start.err | while IFS= read -r l; do red "$l"; done
+    fi
+
+    # 回退：直接用 nginx 主进程启动（不依赖 unit）
+    if nginx 2>/tmp/sb-nginx-bin.err; then
+        sleep 0.5
+        if pgrep -x nginx >/dev/null 2>&1; then
+            green "nginx 已通过二进制直接启动"
+            return 0
         fi
     fi
-    return 0
+    [ -s /tmp/sb-nginx-bin.err ] && cat /tmp/sb-nginx-bin.err | while IFS= read -r l; do red "$l"; done
+
+    red "nginx 启动失败。请执行: nginx -t ; journalctl -xeu nginx.service | tail -30"
+    return 1
 }
 
-# 写入最小可用 nginx 主配置（无发行版差异）
 _resolve_nginx_user() {
-    # 按优先级选择系统中真实存在的用户，避免 getpwnam("nginx") failed
     local u
-    for u in nginx www-data www nobody nobody nobody; do
+    for u in nginx www-data www nobody; do
         if id "$u" >/dev/null 2>&1; then
-            echo "$u"
+            printf '%s' "$u"
             return 0
         fi
     done
-    echo "root"
+    printf '%s' "root"
 }
 
+# 兼容旧调用名（其它位置可能仍引用）
 _write_safe_mime_types() {
-    # 写入语法完整、可被 nginx -t 接受的 mime.types（覆盖损坏文件）
     cat > /etc/nginx/mime.types << 'MIMEOF'
 types {
     text/html                             html htm shtml;
@@ -1722,143 +1757,21 @@ types {
     application/json                      json;
     application/octet-stream              bin exe dmg;
     application/pdf                       pdf;
-    application/xhtml+xml                 xhtml;
-    application/xml                       xsl;
-    application/zip                       zip;
-    application/x-rar-compressed          rar;
-    audio/mpeg                            mp3;
-    video/mp4                             mp4;
     image/png                             png;
     image/svg+xml                         svg svgz;
     image/webp                            webp;
     image/x-icon                          ico;
     text/plain                            txt;
-    text/event-stream                     event-stream;
 }
 MIMEOF
 }
-
-_mime_types_looks_valid() {
-    local f="/etc/nginx/mime.types"
-    [ -f "$f" ] && [ -s "$f" ] || return 1
-    # 必须含 types { 与配对的结束 }
-    grep -qE 'types[[:space:]]*\{' "$f" || return 1
-    # 粗略检查：最后一个非空行应为 }
-    local last
-    last=$(grep -vE '^[[:space:]]*$|^[[:space:]]*#' "$f" | tail -1)
-    echo "$last" | grep -qE '\}' || return 1
-    # 行数异常偏大且疑似截断时视为无效（曾出现 2428 行 EOF）
-    local lines
-    lines=$(wc -l < "$f" 2>/dev/null || echo 0)
-    if [ "$lines" -gt 500 ]; then
-        # 大文件也要求括号平衡
-        local open close
-        open=$(grep -o '{' "$f" | wc -l)
-        close=$(grep -o '}' "$f" | wc -l)
-        [ "$open" -eq "$close" ] || return 1
-    fi
-    return 0
-}
-
-_ensure_nginx_mime_types() {
-    # 缺失、空文件、语法损坏（截断/缺 }）时一律重写
-    mkdir -p /etc/nginx /var/log/nginx /run /var/lib/nginx /var/cache/nginx
-
-    if _mime_types_looks_valid; then
-        return 0
-    fi
-
-    # 备份损坏文件便于排查
-    if [ -f /etc/nginx/mime.types ]; then
-        cp -f /etc/nginx/mime.types "/etc/nginx/mime.types.broken.$(date +%s)" 2>/dev/null || true
-        yellow "检测到 /etc/nginx/mime.types 缺失或语法损坏，正在修复..."
-    fi
-
-    # 优先使用其它完整副本
-    local src
-    for src in /usr/share/nginx/mime.types /usr/share/nginx/conf/mime.types /usr/local/nginx/conf/mime.types; do
-        if [ -f "$src" ] && [ -s "$src" ]; then
-            # 简单校验源文件
-            if grep -qE 'types[[:space:]]*\{' "$src" && grep -qE '\}' "$src"; then
-                cp -f "$src" /etc/nginx/mime.types
-                if _mime_types_looks_valid; then
-                    green "已从 ${src} 恢复 mime.types"
-                    return 0
-                fi
-            fi
-        fi
-    done
-
-    # 写入安全精简版（覆盖损坏内容）
-    _write_safe_mime_types
-    if _mime_types_looks_valid; then
-        green "已写入安全的 /etc/nginx/mime.types"
-    else
-        red "写入 mime.types 后仍校验失败，请检查磁盘与权限"
-        return 1
-    fi
-}
-
+_ensure_nginx_mime_types() { _write_safe_mime_types; }
 _ensure_nginx_ready() {
-    # 统一在 nginx -t / 启动前调用：用户、mime.types、目录
-    mkdir -p /etc/nginx/conf.d /var/log/nginx /run /var/lib/nginx /var/cache/nginx
-    _ensure_nginx_mime_types
-    if [ -f /etc/nginx/nginx.conf ]; then
-        _fix_nginx_user_directive /etc/nginx/nginx.conf
-    fi
-    # 若主配置仍引用不存在的文件，尽量消除致命 include
-    if [ -f /etc/nginx/nginx.conf ]; then
-        # modules 目录不存在时注释掉 modules include，避免次要失败
-        if grep -qE 'include[[:space:]]+/etc/nginx/modules-enabled' /etc/nginx/nginx.conf \
-            && [ ! -d /etc/nginx/modules-enabled ]; then
-            sed -i -E 's|^([[:space:]]*include[[:space:]]+/etc/nginx/modules-enabled/.*)|# \1|' /etc/nginx/nginx.conf
-        fi
-    fi
+    mkdir -p /etc/nginx/conf.d /var/log/nginx /run
+    _write_safe_mime_types
 }
-
-_fix_nginx_user_directive() {
-    # 修正 nginx.conf 中的 user 行；无 user 行则在文件首行附近插入
-    local conf="${1:-/etc/nginx/nginx.conf}"
-    [ -f "$conf" ] || return 1
-    local nginx_user
-    nginx_user=$(_resolve_nginx_user)
-    if grep -qE '^[[:space:]]*user[[:space:]]+' "$conf"; then
-        sed -i -E "s/^[[:space:]]*user[[:space:]]+[^;]+;/user ${nginx_user};/" "$conf"
-    else
-        sed -i "1i user ${nginx_user};" "$conf"
-    fi
-    mkdir -p /var/log/nginx /run
-    if ! id "$nginx_user" >/dev/null 2>&1; then
-        if command_exists useradd; then
-            useradd -r -s /sbin/nologin "$nginx_user" 2>/dev/null || true
-        elif command_exists adduser; then
-            adduser -D -H -s /sbin/nologin "$nginx_user" 2>/dev/null || true
-        fi
-    fi
-}
-
-_write_minimal_nginx_conf() {
-    local nginx_user
-    nginx_user=$(_resolve_nginx_user)
-    _ensure_nginx_mime_types
-    mkdir -p /var/log/nginx /run /etc/nginx/conf.d
-    cat > /etc/nginx/nginx.conf << EOF
-user ${nginx_user};
-worker_processes auto;
-error_log /var/log/nginx/error.log;
-pid /run/nginx.pid;
-
-events { worker_connections 1024; }
-
-http {
-    include       /etc/nginx/mime.types;
-    default_type  application/octet-stream;
-    sendfile        on;
-    keepalive_timeout  65;
-    include /etc/nginx/conf.d/*.conf;
-}
-EOF
-}
+_fix_nginx_user_directive() { :; }
+_write_minimal_nginx_conf() { :; }
 
 # 从已安装配置中获取UUID
 get_current_uuid() {
@@ -2081,15 +1994,21 @@ uninstall_singbox() {
 # 创建快捷指令（优先运行本机已保存的脚本，避免 sb 拉到远程旧版）
 create_shortcut() {
     local local_script="${work_dir}/sing-box.sh"
-    # 将当前正在执行的脚本保存到本地（文件路径或 /dev/fd 均可尝试读取）
-    if [ -n "${BASH_SOURCE[0]:-}" ] && [ -r "${BASH_SOURCE[0]}" ]; then
-        cp -f "${BASH_SOURCE[0]}" "$local_script" 2>/dev/null || cat "${BASH_SOURCE[0]}" > "$local_script" 2>/dev/null || true
+    # 将当前正在执行的脚本保存到本地，避免 sb 回退到未修复的远程版
+    local src=""
+    if [ -n "${BASH_SOURCE[0]:-}" ] && [ -r "${BASH_SOURCE[0]}" ] && [ -f "${BASH_SOURCE[0]}" ]; then
+        src="${BASH_SOURCE[0]}"
+    elif [ -n "${0:-}" ] && [ -r "$0" ] && [ -f "$0" ]; then
+        src="$0"
     fi
-    # 若仍无本地副本且存在历史 sb 指向的内容，保持不动
+    if [ -n "$src" ]; then
+        cp -f "$src" "$local_script" 2>/dev/null || cat "$src" > "$local_script" 2>/dev/null || true
+    fi
     if [ ! -s "$local_script" ]; then
-        yellow "未找到可保存的本地脚本，sb 将回退到远程版本（建议用本地文件方式安装以固定版本）"
+        yellow "未找到可保存的本地脚本，sb 将回退到远程版本（请用: bash /path/to/sing-box-v2.4.5.sh 安装以固定版本）"
     else
         chmod 755 "$local_script"
+        green "已保存本地脚本副本: ${local_script}"
     fi
 
     cat > "$work_dir/sb.sh" << 'EOF'
