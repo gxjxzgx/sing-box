@@ -28,7 +28,7 @@
 #  12. 移除主菜单「Nginx管理」（Nginx 仍由安装/Argo 自动配置，状态仅展示）
 #
 # 基于: eooce/sing-box  修改日期: 2026.9.22
-# 版本: v2.4.1 (nginx 配置修复：取消行号 sed、暴露 nginx -t 错误、准确判断重启结果)
+# 版本: v2.4.2 (修复 getpwnam nginx 用户；空端口 y 随机/n 跳过直连)
 # =========================
 
 export LANG=en_US.UTF-8
@@ -641,12 +641,34 @@ install_singbox() {
     fi
 
     # ---------- 直连协议端口（vless_port ~ +3）----------
+    # SKIP_DIRECT=1 时不安装 Reality / HY2 / TUIC / VLESS-WS 直连
+    export SKIP_DIRECT="${SKIP_DIRECT:-0}"
     while true; do
         if [ -z "$vless_port" ] && [ -t 0 ]; then
-            reading "请输入直连起始端口 (回车随机；将占用 +0~+3 共4个端口): " input_vless_port
-            [ -n "$input_vless_port" ] && vless_port=$input_vless_port
+            reading "请输入直连起始端口 (回车进入下一步选择；将占用 +0~+3 共4个端口): " input_vless_port
+            if [ -z "$input_vless_port" ]; then
+                reading "起始端口为空。是否使用随机端口安装直连协议? (y=随机端口 / n=跳过直连仅装 Argo) [y/n]: " yn_direct
+                case "${yn_direct}" in
+                    n|N)
+                        SKIP_DIRECT=1
+                        export SKIP_DIRECT
+                        yellow "已选择：跳过直连协议，仅安装 Argo 隧道节点"
+                        break
+                        ;;
+                    *)
+                        vless_port=$(shuf -i 1000-65000 -n 1)
+                        green "已随机直连起始端口: ${purple}${vless_port}${re}"
+                        ;;
+                esac
+            else
+                vless_port=$input_vless_port
+            fi
+        fi
+        if [ "$SKIP_DIRECT" = "1" ]; then
+            break
         fi
         if [ -z "$vless_port" ]; then
+            # 非交互或已确认随机
             vless_port=$(shuf -i 1000-65000 -n 1)
         fi
         if ! [[ "$vless_port" =~ ^[0-9]+$ ]] || [ "$vless_port" -lt 1 ] || [ "$vless_port" -gt 65532 ]; then
@@ -664,8 +686,13 @@ install_singbox() {
             red "以下直连端口已被占用:${conflict_list}"
             yellow "说明: 起始端口 ${vless_port} 会同时占用 Reality/HY2/TUIC/WS = ${vless_port}~$((vless_port+3))"
             if [ -t 0 ]; then
-                reading "请重新输入起始端口 (回车随机): " input_vless_port
-                if [ -n "$input_vless_port" ]; then
+                reading "请重新输入起始端口 (回车随机；输入 n 跳过直连): " input_vless_port
+                if [ "$input_vless_port" = "n" ] || [ "$input_vless_port" = "N" ]; then
+                    SKIP_DIRECT=1
+                    export SKIP_DIRECT
+                    yellow "已选择：跳过直连协议，仅安装 Argo 隧道节点"
+                    break
+                elif [ -n "$input_vless_port" ]; then
                     vless_port=$input_vless_port
                 else
                     vless_port=$(shuf -i 1000-65000 -n 1)
@@ -678,7 +705,15 @@ install_singbox() {
         fi
         break
     done
-    green "直连端口: Reality=${purple}${vless_port}${re}  HY2=$((vless_port+1))  TUIC=$((vless_port+2))  WS直连=$((vless_port+3))"
+    if [ "$SKIP_DIRECT" = "1" ]; then
+        vless_port=""
+        hy2_port=""
+        tuic_port=""
+        vless_ws_direct_port=""
+        green "直连协议: 已跳过（不占用公网端口）"
+    else
+        green "直连端口: Reality=${purple}${vless_port}${re}  HY2=$((vless_port+1))  TUIC=$((vless_port+2))  WS直连=$((vless_port+3))"
+    fi
 
     # ---------- Argo 端口（ARGO_PORT 及 +10~+12，无独立订阅端口）----------
     # 被占用时明确提示哪个端口，并交互式输入新的 ARGO 起始端口
@@ -771,7 +806,11 @@ install_singbox() {
         fi
     done
     green "Argo 端口: ${purple}${ARGO_PORT}${re}"
-    green "将使用端口: Reality=${vless_port}  HY2=$((vless_port+1))  TUIC=$((vless_port+2))  WS直连=$((vless_port+3))  Argo=${ARGO_PORT}"
+    if [ "${SKIP_DIRECT:-0}" = "1" ]; then
+        green "将使用端口: 仅 Argo=${ARGO_PORT}（已跳过直连）"
+    else
+        green "将使用端口: Reality=${vless_port}  HY2=$((vless_port+1))  TUIC=$((vless_port+2))  WS直连=$((vless_port+3))  Argo=${ARGO_PORT}"
+    fi
 
     # ---------- 交互式输入：隧道类型 / 固定隧道域名 / 隧道令牌 ----------
     # 支持环境变量预设：ARGO_DOMAIN / ARGO_TOKEN / ARGO_USE_FIXED=1
@@ -847,32 +886,37 @@ install_singbox() {
         export ARGO_USE_FIXED
     fi
 
-    # 公网协议端口：Reality / Hysteria2 / TUIC / VLESS-WS直连
-    hy2_port=$(($vless_port + 1))
-    tuic_port=$(($vless_port + 2))
-    vless_ws_direct_port=$(($vless_port + 3))
-    # Argo 内部端口（仅本机访问，由 Nginx 统一对外监听 ARGO_PORT；已去掉独立订阅端口）
+    # Argo 内部端口（仅本机访问，由 Nginx 统一对外监听 ARGO_PORT）
     vmess_ws_port=$(($ARGO_PORT + 10))
     vless_ws_port=$(($ARGO_PORT + 11))
     trojan_ws_port=$(($ARGO_PORT + 12))
-    output=$(/etc/sing-box/sing-box generate reality-keypair 2>/dev/null)
-    private_key=$(echo "${output}" | grep -i 'PrivateKey' | awk '{print $NF}' | tr -d '\r')
-    public_key=$(echo "${output}" | grep -i 'PublicKey' | awk '{print $NF}' | tr -d '\r')
-    if [ -z "$private_key" ] || [ -z "$public_key" ]; then
-        # 兼容不同版本输出格式，再试一次
-        output=$(/etc/sing-box/sing-box generate reality-keypair 2>&1)
-        private_key=$(echo "${output}" | sed -n 's/.*PrivateKey:[[:space:]]*//p' | head -1 | tr -d '\r')
-        public_key=$(echo "${output}" | sed -n 's/.*PublicKey:[[:space:]]*//p' | head -1 | tr -d '\r')
-    fi
-    if [ -z "$private_key" ] || [ -z "$public_key" ]; then
-        red "Reality 密钥生成失败，请检查 sing-box 二进制是否正常"
-        red "输出: ${output}"
-        exit 1
-    fi
-    green "Reality 密钥已生成"
 
-    # 仅开放对外端口；Argo 内部 WS 端口只监听 127.0.0.1，无需公网放行
-    allow_port $vless_port/tcp $hy2_port/udp $tuic_port/udp $vless_ws_direct_port/tcp ${ARGO_PORT}/tcp > /dev/null 2>&1
+    private_key=""
+    public_key=""
+    if [ "${SKIP_DIRECT:-0}" != "1" ]; then
+        # 公网协议端口：Reality / Hysteria2 / TUIC / VLESS-WS直连
+        hy2_port=$(($vless_port + 1))
+        tuic_port=$(($vless_port + 2))
+        vless_ws_direct_port=$(($vless_port + 3))
+        output=$(/etc/sing-box/sing-box generate reality-keypair 2>/dev/null)
+        private_key=$(echo "${output}" | grep -i 'PrivateKey' | awk '{print $NF}' | tr -d '\r')
+        public_key=$(echo "${output}" | grep -i 'PublicKey' | awk '{print $NF}' | tr -d '\r')
+        if [ -z "$private_key" ] || [ -z "$public_key" ]; then
+            output=$(/etc/sing-box/sing-box generate reality-keypair 2>&1)
+            private_key=$(echo "${output}" | sed -n 's/.*PrivateKey:[[:space:]]*//p' | head -1 | tr -d '\r')
+            public_key=$(echo "${output}" | sed -n 's/.*PublicKey:[[:space:]]*//p' | head -1 | tr -d '\r')
+        fi
+        if [ -z "$private_key" ] || [ -z "$public_key" ]; then
+            red "Reality 密钥生成失败，请检查 sing-box 二进制是否正常"
+            red "输出: ${output}"
+            exit 1
+        fi
+        green "Reality 密钥已生成"
+        allow_port $vless_port/tcp $hy2_port/udp $tuic_port/udp $vless_ws_direct_port/tcp ${ARGO_PORT}/tcp > /dev/null 2>&1
+    else
+        allow_port ${ARGO_PORT}/tcp > /dev/null 2>&1
+        green "已跳过 Reality 密钥与直连端口放行"
+    fi
 
     openssl ecparam -genkey -name prime256v1 -out "${work_dir}/private.key"
     openssl req -new -x509 -days 3650 -key "${work_dir}/private.key" -out "${work_dir}/cert.pem" -subj "/CN=bing.com"
@@ -918,7 +962,64 @@ EOF
 }
 EOF
 
-    cat > "${conf_dir}/inbounds.json" << EOF
+    # 生成 inbounds：Argo 三协议始终安装；直连四协议受 SKIP_DIRECT 控制
+    if [ "${SKIP_DIRECT:-0}" = "1" ]; then
+        cat > "${conf_dir}/inbounds.json" << EOF
+{
+  "inbounds": [
+    {
+      "type": "vmess",
+      "tag": "vmess-ws",
+      "listen": "127.0.0.1",
+      "listen_port": $vmess_ws_port,
+      "users": [
+        {
+          "uuid": "$uuid"
+        }
+      ],
+      "transport": {
+        "type": "ws",
+        "path": "/vmess-argo",
+        "early_data_header_name": "Sec-WebSocket-Protocol"
+      }
+    },
+    {
+      "type": "vless",
+      "tag": "vless-ws",
+      "listen": "127.0.0.1",
+      "listen_port": $vless_ws_port,
+      "users": [
+        {
+          "uuid": "$uuid"
+        }
+      ],
+      "transport": {
+        "type": "ws",
+        "path": "/vless-argo",
+        "early_data_header_name": "Sec-WebSocket-Protocol"
+      }
+    },
+    {
+      "type": "trojan",
+      "tag": "trojan-ws",
+      "listen": "127.0.0.1",
+      "listen_port": $trojan_ws_port,
+      "users": [
+        {
+          "password": "$uuid"
+        }
+      ],
+      "transport": {
+        "type": "ws",
+        "path": "/trojan-argo",
+        "early_data_header_name": "Sec-WebSocket-Protocol"
+      }
+    }
+  ]
+}
+EOF
+    else
+        cat > "${conf_dir}/inbounds.json" << EOF
 {
   "inbounds": [
     {
@@ -1052,6 +1153,7 @@ EOF
   ]
 }
 EOF
+    fi
 
     cat > "${conf_dir}/outbounds.json" << EOF
 {
@@ -1373,23 +1475,25 @@ get_info() {
         extra_lines=$(grep -vE '^(vless://|vmess://|hysteria2://|tuic://|trojan://)' "${client_dir}" || true)
     fi
 
-    # 隧道协议节点（临时隧道默认指向vmess端口；固定隧道可按路径分流到vless/trojan）
-    cat > ${work_dir}/url.txt << EOF
-vless://${uuid}@${server_ip}:${vless_port}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=www.iij.ad.jp&fp=firefox&pbk=${public_key}&type=tcp&headerType=none#${prefix}-vless-reality
-
-hysteria2://${uuid}@${server_ip}:${hy2_port}/?sni=www.bing.com&insecure=1&pinSHA256=${fingerprint}&alpn=h3&obfs=none#${prefix}-hysteria2
-
-tuic://${uuid}:${uuid}@${server_ip}:${tuic_port}?sni=www.bing.com&congestion_control=bbr&udp_relay_mode=native&alpn=h3&allow_insecure=1#${prefix}-tuic
-
-vless://${uuid}@${server_ip}:${vless_ws_direct_port}?encryption=none&security=none&type=ws&host=${server_ip}&path=%2Fvless-ws#${prefix}-vless-ws
-
-vmess://$(echo "$VMESS" | base64 -w0)
-
-vless://${uuid}@${CFIP}:${CFPORT}?encryption=none&security=tls&sni=${argodomain}&fp=firefox&type=ws&host=${argodomain}&path=%2Fvless-argo%3Fed%3D2560#${prefix}-argo-vless
-
-trojan://${uuid}@${CFIP}:${CFPORT}?security=tls&sni=${argodomain}&fp=firefox&type=ws&host=${argodomain}&path=%2Ftrojan-argo%3Fed%3D2560#${prefix}-argo-trojan
-
-EOF
+    # 写入节点链接：直连四协议可选；Argo 三协议始终写入
+    {
+        if [ "${SKIP_DIRECT:-0}" != "1" ] && [ -n "$vless_port" ] && [ -n "$public_key" ]; then
+            echo "vless://${uuid}@${server_ip}:${vless_port}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=www.iij.ad.jp&fp=firefox&pbk=${public_key}&type=tcp&headerType=none#${prefix}-vless-reality"
+            echo ""
+            echo "hysteria2://${uuid}@${server_ip}:${hy2_port}/?sni=www.bing.com&insecure=1&pinSHA256=${fingerprint}&alpn=h3&obfs=none#${prefix}-hysteria2"
+            echo ""
+            echo "tuic://${uuid}:${uuid}@${server_ip}:${tuic_port}?sni=www.bing.com&congestion_control=bbr&udp_relay_mode=native&alpn=h3&allow_insecure=1#${prefix}-tuic"
+            echo ""
+            echo "vless://${uuid}@${server_ip}:${vless_ws_direct_port}?encryption=none&security=none&type=ws&host=${server_ip}&path=%2Fvless-ws#${prefix}-vless-ws"
+            echo ""
+        fi
+        echo "vmess://$(echo "$VMESS" | base64 -w0)"
+        echo ""
+        echo "vless://${uuid}@${CFIP}:${CFPORT}?encryption=none&security=tls&sni=${argodomain}&fp=firefox&type=ws&host=${argodomain}&path=%2Fvless-argo%3Fed%3D2560#${prefix}-argo-vless"
+        echo ""
+        echo "trojan://${uuid}@${CFIP}:${CFPORT}?security=tls&sni=${argodomain}&fp=firefox&type=ws&host=${argodomain}&path=%2Ftrojan-argo%3Fed%3D2560#${prefix}-argo-trojan"
+        echo ""
+    } > "${work_dir}/url.txt"
 
     if [ -n "$extra_lines" ]; then
         echo "" >> "${work_dir}/url.txt"
@@ -1511,6 +1615,9 @@ EOF
         _write_minimal_nginx_conf
     fi
 
+    # 修复 user 指令（系统无 nginx 用户时 getpwnam 会失败）
+    _fix_nginx_user_directive /etc/nginx/nginx.conf
+
     local nginx_test_out
     nginx_test_out=$(nginx -t 2>&1)
     local nginx_test_rc=$?
@@ -1547,6 +1654,7 @@ EOF
                 fi
             fi
         fi
+        _fix_nginx_user_directive /etc/nginx/nginx.conf
         nginx_test_out=$(nginx -t 2>&1)
         nginx_test_rc=$?
         if [ $nginx_test_rc -eq 0 ]; then
@@ -1570,10 +1678,44 @@ EOF
 }
 
 # 写入最小可用 nginx 主配置（无发行版差异）
+_resolve_nginx_user() {
+    # 按优先级选择系统中真实存在的用户，避免 getpwnam("nginx") failed
+    local u
+    for u in nginx www-data www nobody nobody nobody; do
+        if id "$u" >/dev/null 2>&1; then
+            echo "$u"
+            return 0
+        fi
+    done
+    echo "root"
+}
+
+_fix_nginx_user_directive() {
+    # 修正 nginx.conf 中的 user 行；无 user 行则在文件首行附近插入
+    local conf="${1:-/etc/nginx/nginx.conf}"
+    [ -f "$conf" ] || return 1
+    local nginx_user
+    nginx_user=$(_resolve_nginx_user)
+    if grep -qE '^[[:space:]]*user[[:space:]]+' "$conf"; then
+        sed -i -E "s/^[[:space:]]*user[[:space:]]+[^;]+;/user ${nginx_user};/" "$conf"
+    else
+        sed -i "1i user ${nginx_user};" "$conf"
+    fi
+    # 确保运行时目录存在
+    mkdir -p /var/log/nginx /run
+    # 若用户不存在则创建（极少见，_resolve 已兜底 root）
+    if ! id "$nginx_user" >/dev/null 2>&1; then
+        if command_exists useradd; then
+            useradd -r -s /sbin/nologin "$nginx_user" 2>/dev/null || true
+        elif command_exists adduser; then
+            adduser -D -H -s /sbin/nologin "$nginx_user" 2>/dev/null || true
+        fi
+    fi
+}
+
 _write_minimal_nginx_conf() {
-    local nginx_user="nginx"
-    id nginx >/dev/null 2>&1 || nginx_user="www-data"
-    id "$nginx_user" >/dev/null 2>&1 || nginx_user="root"
+    local nginx_user
+    nginx_user=$(_resolve_nginx_user)
     mkdir -p /var/log/nginx /run
     cat > /etc/nginx/nginx.conf << EOF
 user ${nginx_user};
@@ -1727,8 +1869,18 @@ manage_service() {
             if command_exists rc-service; then
                 rc-service "$service_name" start
             elif command_exists systemctl; then
-                systemctl daemon-reload
-                systemctl start "$service_name"
+                systemctl daemon-reload >/dev/null 2>&1
+                if [ "$service_name" = "nginx" ]; then
+                    _fix_nginx_user_directive /etc/nginx/nginx.conf 2>/dev/null || true
+                fi
+                systemctl start "$service_name" 2>/tmp/sb-svc-start.err
+                local start_rc=$?
+                if [ $start_rc -ne 0 ] && [ -s /tmp/sb-svc-start.err ]; then
+                    # 将 systemd 错误以红色显示，避免误报成功
+                    while IFS= read -r _eline; do
+                        [ -n "$_eline" ] && red "$_eline"
+                    done < /tmp/sb-svc-start.err
+                fi
             fi
 
             sleep 1
