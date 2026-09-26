@@ -28,7 +28,7 @@
 #  12. 移除主菜单「Nginx管理」（Nginx 仍由安装/Argo 自动配置，状态仅展示）
 #
 # 基于: eooce/sing-box  修改日期: 2026.9.22
-# 版本: v2.5.6 (port_in_use 仅认 EADDRINUSE; 冲突显示占用进程; 重装先停旧 nginx)
+# 版本: v2.5.8 (port_in_use 恢复 UDP 检测; TCP 仍仅认 EADDRINUSE)
 # =========================
 
 export LANG=en_US.UTF-8
@@ -125,34 +125,35 @@ port_in_use() {
     command_exists python3 && py=python3
     [ -z "$py" ] && command_exists python && py=python
 
-    # 方法1：实际 bind。仅 EADDRINUSE 视为占用；其它异常不误判
+    # 方法1：TCP + UDP 实际 bind。仅 EADDRINUSE 视为占用
     if [ -n "$py" ]; then
         $py -c "
 import socket, sys, errno
 p = int(sys.argv[1])
 in_use = False
+eaddr = (getattr(errno, 'EADDRINUSE', 98), getattr(errno, 'WSAEADDRINUSE', 10048))
 for fam, addr in ((socket.AF_INET, '0.0.0.0'), (socket.AF_INET6, '::')):
-    try:
-        s = socket.socket(fam, socket.SOCK_STREAM)
+    for sock_type in (socket.SOCK_STREAM, socket.SOCK_DGRAM):
         try:
-            if fam == socket.AF_INET6:
-                s.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+            s = socket.socket(fam, sock_type)
+            try:
+                if fam == socket.AF_INET6:
+                    s.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+            except Exception:
+                pass
+            s.bind((addr, p))
+            s.close()
+        except OSError as e:
+            if e.errno in eaddr:
+                in_use = True
+                break
         except Exception:
             pass
-        # 不用 SO_REUSEADDR，避免把已监听端口误判为空闲
-        s.bind((addr, p))
-        s.close()
-    except OSError as e:
-        if e.errno in (getattr(errno, 'EADDRINUSE', 98), getattr(errno, 'WSAEADDRINUSE', 10048)):
-            in_use = True
-            break
-        # EAFNOSUPPORT / EPERM 等：跳过该族，不判占用
-    except Exception:
-        pass
+    if in_use:
+        break
 sys.exit(0 if in_use else 1)
 " "$port" 2>/dev/null
         local py_rc=$?
-        # exit 0 = 占用, exit 1 = 空闲, 其它 = python 异常则走后续方法
         if [ "$py_rc" -eq 0 ]; then
             return 0
         elif [ "$py_rc" -eq 1 ]; then
@@ -160,30 +161,39 @@ sys.exit(0 if in_use else 1)
         fi
     fi
 
-    # 方法2：/proc/net 只认 TCP LISTEN（state 0A），避免 UDP/TIME_WAIT 误报
+    # 方法2：/proc/net — TCP 仅 LISTEN(0A)；UDP 有记录即占用（无 LISTEN 状态位）
     local hex
     hex=$(printf '%04X' "$port" 2>/dev/null) || hex=""
     if [ -n "$hex" ] && [ -r /proc/net/tcp ]; then
         if awk -v h="$hex" '
             NR > 1 {
                 n = split($2, a, ":")
-                # $4 为连接状态，0A = LISTEN
                 if (n >= 2 && toupper(a[n]) == h && toupper($4) == "0A") exit 0
             }
             END { exit 1 }
         ' /proc/net/tcp /proc/net/tcp6 2>/dev/null; then
             return 0
         fi
+        if [ -r /proc/net/udp ] || [ -r /proc/net/udp6 ]; then
+            if awk -v h="$hex" '
+                NR > 1 {
+                    n = split($2, a, ":")
+                    if (n >= 2 && toupper(a[n]) == h) exit 0
+                }
+                END { exit 1 }
+            ' /proc/net/udp /proc/net/udp6 2>/dev/null; then
+                return 0
+            fi
+        fi
         return 1
     fi
 
-    # 方法3：ss 仅匹配 LISTEN
+    # 方法3：ss 查 TCP LISTEN + UDP
     if command_exists ss; then
-        if ss -tln 2>/dev/null | grep -qE "[:.]${port}[[:space:]]"; then
+        if ss -tln 2>/dev/null | grep LISTEN | grep -qE "[:.]${port}([^0-9]|$)"; then
             return 0
         fi
-        # 兼容部分 ss 输出格式 *:8001 或 0.0.0.0:8001
-        if ss -tln 2>/dev/null | grep LISTEN | grep -qE "[:.]${port}([^0-9]|$)"; then
+        if ss -uln 2>/dev/null | grep -qE "[:.]${port}([^0-9]|$)"; then
             return 0
         fi
     fi
@@ -191,14 +201,15 @@ sys.exit(0 if in_use else 1)
     return 1
 }
 
-# 打印占用某端口的进程（诊断用）
 port_holder_info() {
     local port="$1"
     [ -z "$port" ] && return 0
     if command_exists ss; then
         ss -lntp 2>/dev/null | grep -E ":${port}\\b" || true
+        ss -lnup 2>/dev/null | grep -E ":${port}\\b" || true
     elif command_exists lsof; then
         lsof -iTCP:"${port}" -sTCP:LISTEN 2>/dev/null || true
+        lsof -iUDP:"${port}" 2>/dev/null || true
     fi
 }
 
@@ -777,43 +788,56 @@ install_singbox() {
             fi
         fi
     fi
-    # 被占用时明确提示哪个端口，并交互式输入新的 ARGO 起始端口
+    # Argo 端口冲突检测：
+    # - 与直连重叠 / ss 能看到监听进程 → 真实冲突，需换端口
+    # - port_in_use 为真但 ss 无监听进程 → 视为误报，直接沿用当前端口，不打断安装
     while true; do
         base="${ARGO_PORT:-8001}"
-        conflict_list=""
-        conflict_detail=""
+        real_conflict_list=""
+        real_conflict_detail=""
+        false_positive_list=""
         for offset_name in "0:Argo入口" "10:VMess内部" "11:VLESS内部" "12:Trojan内部"; do
             off="${offset_name%%:*}"
             name="${offset_name#*:}"
             p=$((base + off))
-            # 与直连端口重叠也算冲突
-            if [ "$p" = "$vless_port" ] || [ "$p" = "$((vless_port+1))" ] || [ "$p" = "$((vless_port+2))" ] || [ "$p" = "$((vless_port+3))" ]; then
-                conflict_list="${conflict_list} ${p}"
-                conflict_detail="${conflict_detail}\n  - ${p} (${name}) 与直连端口重叠"
+            # 与直连端口重叠：真实冲突
+            if [ -n "${vless_port:-}" ] && {
+                [ "$p" = "$vless_port" ] || [ "$p" = "$((vless_port+1))" ] || [ "$p" = "$((vless_port+2))" ] || [ "$p" = "$((vless_port+3))" ]
+            }; then
+                real_conflict_list="${real_conflict_list} ${p}"
+                real_conflict_detail="${real_conflict_detail}\n  - ${p} (${name}) 与直连端口重叠"
                 continue
             fi
             if port_in_use "$p"; then
-                conflict_list="${conflict_list} ${p}"
-                conflict_detail="${conflict_detail}\n  - ${p} (${name}) 已被占用"
+                _holder=$(port_holder_info "$p" 2>/dev/null || true)
+                if [ -n "$_holder" ]; then
+                    real_conflict_list="${real_conflict_list} ${p}"
+                    real_conflict_detail="${real_conflict_detail}\n  - ${p} (${name}) 已被占用"
+                else
+                    # 检测器认为占用，但 ss 看不到 LISTEN → 误报，忽略
+                    false_positive_list="${false_positive_list} ${p}"
+                fi
             fi
         done
-        if [ -z "$conflict_list" ]; then
+        if [ -n "$false_positive_list" ] && [ -z "$real_conflict_list" ]; then
+            yellow "端口检测对${false_positive_list} 曾报占用，但系统无监听进程，已按空闲处理（沿用 ${base}，无需改端口）"
             ARGO_PORT="$base"
             export ARGO_PORT
             break
         fi
-        red "Argo 相关端口冲突 (当前 ARGO 起始=${base}):"
-        echo -e "${red}${conflict_detail}${re}"
-        yellow "占用详情（便于确认是否误报）:"
-        for _cp in $conflict_list; do
+        if [ -z "$real_conflict_list" ]; then
+            ARGO_PORT="$base"
+            export ARGO_PORT
+            break
+        fi
+        red "Argo 相关端口真实冲突 (当前 ARGO 起始=${base}):"
+        echo -e "${red}${real_conflict_detail}${re}"
+        yellow "占用详情:"
+        for _cp in $real_conflict_list; do
             yellow "  端口 ${_cp}:"
             port_holder_info "$_cp" | while IFS= read -r _line; do
                 [ -n "$_line" ] && echo -e "    ${purple}${_line}${re}"
             done
-            # 若无输出，说明检测认为占用但 ss 看不到（可能是旧逻辑误报；可回车换端口或设 SKIP_PORT_CHECK=1）
-            if [ -z "$(port_holder_info "$_cp" 2>/dev/null)" ]; then
-                yellow "    (ss 未看到监听进程；若确认空闲可回车自动换端口，或执行: SKIP_PORT_CHECK=1 sb)"
-            fi
         done
         yellow "将占用: Argo=${base}  内部WS=${base}+10~+12"
         if [ -t 0 ]; then
@@ -825,17 +849,22 @@ install_singbox() {
                 fi
                 ARGO_PORT="$input_argo"
             else
-                # 自动找一组空闲
                 found=""
                 for _ in $(seq 1 80); do
                     cand=$(shuf -i 2000-64000 -n 1)
                     ok=1
                     for off in 0 10 11 12; do
                         p=$((cand + off))
-                        if [ "$p" = "$vless_port" ] || [ "$p" = "$((vless_port+1))" ] || [ "$p" = "$((vless_port+2))" ] || [ "$p" = "$((vless_port+3))" ]; then
+                        if [ -n "${vless_port:-}" ] && {
+                            [ "$p" = "$vless_port" ] || [ "$p" = "$((vless_port+1))" ] || [ "$p" = "$((vless_port+2))" ] || [ "$p" = "$((vless_port+3))" ]
+                        }; then
                             ok=0; break
                         fi
-                        port_in_use "$p" && { ok=0; break; }
+                        # 自动分配时同样：仅 ss 能看到占用才算冲突
+                        if port_in_use "$p"; then
+                            _h=$(port_holder_info "$p" 2>/dev/null || true)
+                            [ -n "$_h" ] && { ok=0; break; }
+                        fi
                     done
                     if [ "$ok" -eq 1 ]; then
                         found=$cand
@@ -852,17 +881,21 @@ install_singbox() {
             fi
             export ARGO_PORT
         else
-            # 非交互：自动随机
             found=""
             for _ in $(seq 1 80); do
                 cand=$(shuf -i 2000-64000 -n 1)
                 ok=1
                 for off in 0 10 11 12; do
                     p=$((cand + off))
-                    if [ "$p" = "$vless_port" ] || [ "$p" = "$((vless_port+1))" ] || [ "$p" = "$((vless_port+2))" ] || [ "$p" = "$((vless_port+3))" ]; then
+                    if [ -n "${vless_port:-}" ] && {
+                        [ "$p" = "$vless_port" ] || [ "$p" = "$((vless_port+1))" ] || [ "$p" = "$((vless_port+2))" ] || [ "$p" = "$((vless_port+3))" ]
+                    }; then
                         ok=0; break
                     fi
-                    port_in_use "$p" && { ok=0; break; }
+                    if port_in_use "$p"; then
+                        _h=$(port_holder_info "$p" 2>/dev/null || true)
+                        [ -n "$_h" ] && { ok=0; break; }
+                    fi
                 done
                 [ "$ok" -eq 1 ] && { found=$cand; break; }
             done
@@ -872,8 +905,11 @@ install_singbox() {
                 green "已自动分配 Argo 起始端口: ${purple}${ARGO_PORT}${re}"
                 break
             else
-                red "无法分配可用的 Argo 端口，请手动指定"
-                exit 1
+                # 非交互且找不到：仍沿用默认，避免安装中断
+                yellow "无法确认空闲端口，沿用 ARGO_PORT=${base}"
+                ARGO_PORT="$base"
+                export ARGO_PORT
+                break
             fi
         fi
     done
