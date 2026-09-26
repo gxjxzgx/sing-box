@@ -28,7 +28,7 @@
 #  12. 移除主菜单「Nginx管理」（Nginx 仍由安装/Argo 自动配置，状态仅展示）
 #
 # 基于: eooce/sing-box  修改日期: 2026.9.22
-# 版本: v2.5.5 (Alpine nginx: 避免双实例抢端口; 真实启停判定; 不再假成功)
+# 版本: v2.5.6 (port_in_use 仅认 EADDRINUSE; 冲突显示占用进程; 重装先停旧 nginx)
 # =========================
 
 export LANG=en_US.UTF-8
@@ -125,53 +125,81 @@ port_in_use() {
     command_exists python3 && py=python3
     [ -z "$py" ] && command_exists python && py=python
 
-    # 方法1：实际 bind（最可靠；有 python 时优先）
+    # 方法1：实际 bind。仅 EADDRINUSE 视为占用；其它异常不误判
     if [ -n "$py" ]; then
-        if $py -c "
-import socket, sys
+        $py -c "
+import socket, sys, errno
 p = int(sys.argv[1])
-try:
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    s.bind(('0.0.0.0', p))
-    s.close()
-    sys.exit(1)
-except Exception:
-    sys.exit(0)
-" "$port" 2>/dev/null; then
+in_use = False
+for fam, addr in ((socket.AF_INET, '0.0.0.0'), (socket.AF_INET6, '::')):
+    try:
+        s = socket.socket(fam, socket.SOCK_STREAM)
+        try:
+            if fam == socket.AF_INET6:
+                s.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+        except Exception:
+            pass
+        # 不用 SO_REUSEADDR，避免把已监听端口误判为空闲
+        s.bind((addr, p))
+        s.close()
+    except OSError as e:
+        if e.errno in (getattr(errno, 'EADDRINUSE', 98), getattr(errno, 'WSAEADDRINUSE', 10048)):
+            in_use = True
+            break
+        # EAFNOSUPPORT / EPERM 等：跳过该族，不判占用
+    except Exception:
+        pass
+sys.exit(0 if in_use else 1)
+" "$port" 2>/dev/null
+        local py_rc=$?
+        # exit 0 = 占用, exit 1 = 空闲, 其它 = python 异常则走后续方法
+        if [ "$py_rc" -eq 0 ]; then
             return 0
-        else
+        elif [ "$py_rc" -eq 1 ]; then
             return 1
         fi
     fi
 
-    # 方法2：/proc/net 只比较 local_address 端口（第2列末段），不扫整行
+    # 方法2：/proc/net 只认 TCP LISTEN（state 0A），避免 UDP/TIME_WAIT 误报
     local hex
     hex=$(printf '%04X' "$port" 2>/dev/null) || hex=""
-    if [ -n "$hex" ]; then
+    if [ -n "$hex" ] && [ -r /proc/net/tcp ]; then
         if awk -v h="$hex" '
             NR > 1 {
                 n = split($2, a, ":")
-                if (n >= 2 && toupper(a[n]) == h) exit 0
+                # $4 为连接状态，0A = LISTEN
+                if (n >= 2 && toupper(a[n]) == h && toupper($4) == "0A") exit 0
             }
             END { exit 1 }
-        ' /proc/net/tcp /proc/net/tcp6 /proc/net/udp /proc/net/udp6 2>/dev/null; then
+        ' /proc/net/tcp /proc/net/tcp6 2>/dev/null; then
             return 0
         fi
-        # /proc 可读且未命中 → 视为空闲（避免再被 ss 误报）
-        if [ -r /proc/net/tcp ]; then
-            return 1
-        fi
+        return 1
     fi
 
-    # 方法3：ss 回退
+    # 方法3：ss 仅匹配 LISTEN
     if command_exists ss; then
-        if ss -tuln 2>/dev/null | grep -E 'LISTEN|UNCONN' | grep -qE "[:.]${port}([^0-9]|$)"; then
+        if ss -tln 2>/dev/null | grep -qE "[:.]${port}[[:space:]]"; then
+            return 0
+        fi
+        # 兼容部分 ss 输出格式 *:8001 或 0.0.0.0:8001
+        if ss -tln 2>/dev/null | grep LISTEN | grep -qE "[:.]${port}([^0-9]|$)"; then
             return 0
         fi
     fi
 
     return 1
+}
+
+# 打印占用某端口的进程（诊断用）
+port_holder_info() {
+    local port="$1"
+    [ -z "$port" ] && return 0
+    if command_exists ss; then
+        ss -lntp 2>/dev/null | grep -E ":${port}\\b" || true
+    elif command_exists lsof; then
+        lsof -iTCP:"${port}" -sTCP:LISTEN 2>/dev/null || true
+    fi
 }
 
 # 交互获取可用端口；参数: 提示语 默认空则随机
@@ -726,6 +754,29 @@ install_singbox() {
     fi
 
     # ---------- Argo 端口（ARGO_PORT 及 +10~+12，无独立订阅端口）----------
+    # 重装场景：若仅是本机旧 nginx 占着默认入口，先停掉以免误报 8001 被占用
+    if command_exists nginx && type _nginx_stop_all >/dev/null 2>&1; then
+        if port_in_use "${ARGO_PORT:-8001}" 2>/dev/null; then
+            local _hold
+            _hold=$(port_holder_info "${ARGO_PORT:-8001}" 2>/dev/null || true)
+            if echo "$_hold" | grep -qi nginx; then
+                yellow "检测到旧 nginx 占用 Argo 入口端口，安装前先停止..."
+                _nginx_stop_all >/dev/null 2>&1 || true
+            fi
+        fi
+    elif command_exists nginx; then
+        if port_in_use "${ARGO_PORT:-8001}" 2>/dev/null; then
+            local _hold
+            _hold=$(port_holder_info "${ARGO_PORT:-8001}" 2>/dev/null || true)
+            if echo "$_hold" | grep -qi nginx; then
+                yellow "检测到旧 nginx 占用 Argo 入口端口，安装前先停止..."
+                nginx -s stop >/dev/null 2>&1 || true
+                command_exists rc-service && rc-service nginx stop >/dev/null 2>&1 || true
+                pkill -x nginx >/dev/null 2>&1 || true
+                sleep 0.5
+            fi
+        fi
+    fi
     # 被占用时明确提示哪个端口，并交互式输入新的 ARGO 起始端口
     while true; do
         base="${ARGO_PORT:-8001}"
@@ -753,6 +804,17 @@ install_singbox() {
         fi
         red "Argo 相关端口冲突 (当前 ARGO 起始=${base}):"
         echo -e "${red}${conflict_detail}${re}"
+        yellow "占用详情（便于确认是否误报）:"
+        for _cp in $conflict_list; do
+            yellow "  端口 ${_cp}:"
+            port_holder_info "$_cp" | while IFS= read -r _line; do
+                [ -n "$_line" ] && echo -e "    ${purple}${_line}${re}"
+            done
+            # 若无输出，说明检测认为占用但 ss 看不到（可能是旧逻辑误报；可回车换端口或设 SKIP_PORT_CHECK=1）
+            if [ -z "$(port_holder_info "$_cp" 2>/dev/null)" ]; then
+                yellow "    (ss 未看到监听进程；若确认空闲可回车自动换端口，或执行: SKIP_PORT_CHECK=1 sb)"
+            fi
+        done
         yellow "将占用: Argo=${base}  内部WS=${base}+10~+12"
         if [ -t 0 ]; then
             reading "请输入新的 Argo 起始端口 (回车自动随机空闲端口): " input_argo
