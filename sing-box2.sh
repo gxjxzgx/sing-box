@@ -28,7 +28,7 @@
 #  12. 移除主菜单「Nginx管理」（Nginx 仍由安装/Argo 自动配置，状态仅展示）
 #
 # 基于: eooce/sing-box  修改日期: 2026.9.22
-# 版本: v2.4.5 (nginx 始终写入自包含主配置+mime.types，不再修补系统残缺文件)
+# 版本: v2.4.8 (菜单 5.1 查看节点 / 5.2 Nginx管理)
 # =========================
 
 export LANG=en_US.UTF-8
@@ -1993,38 +1993,19 @@ uninstall_singbox() {
 
 # 创建快捷指令（优先运行本机已保存的脚本，避免 sb 拉到远程旧版）
 create_shortcut() {
-    local local_script="${work_dir}/sing-box.sh"
-    # 将当前正在执行的脚本保存到本地，避免 sb 回退到未修复的远程版
-    local src=""
-    if [ -n "${BASH_SOURCE[0]:-}" ] && [ -r "${BASH_SOURCE[0]}" ] && [ -f "${BASH_SOURCE[0]}" ]; then
-        src="${BASH_SOURCE[0]}"
-    elif [ -n "${0:-}" ] && [ -r "$0" ] && [ -f "$0" ]; then
-        src="$0"
-    fi
-    if [ -n "$src" ]; then
-        cp -f "$src" "$local_script" 2>/dev/null || cat "$src" > "$local_script" 2>/dev/null || true
-    fi
-    if [ ! -s "$local_script" ]; then
-        yellow "未找到可保存的本地脚本，sb 将回退到远程版本（请用: bash /path/to/sing-box-v2.4.5.sh 安装以固定版本）"
-    else
-        chmod 755 "$local_script"
-        green "已保存本地脚本副本: ${local_script}"
-    fi
-
+    # sb 始终从远程拉取执行（不保存、不优先本地副本）
     cat > "$work_dir/sb.sh" << 'EOF'
 #!/usr/bin/env bash
-# 优先执行本机保存的脚本；不存在时才拉取远程
-LOCAL_SCRIPT="/etc/sing-box/sing-box.sh"
 REMOTE_URL="${SB_REMOTE_URL:-https://raw.githubusercontent.com/gxjxzgx/sing-box/refs/heads/main/sing-box1.sh}"
-if [ -f "$LOCAL_SCRIPT" ] && [ -s "$LOCAL_SCRIPT" ]; then
-    exec bash "$LOCAL_SCRIPT" "$@"
-else
-    exec bash <(curl -Ls "$REMOTE_URL") "$@"
-fi
+exec bash <(curl -fsSL "$REMOTE_URL") "$@"
 EOF
     chmod +x "$work_dir/sb.sh"
     ln -sf "$work_dir/sb.sh" /usr/bin/sb
-    [ -s /usr/bin/sb ] && green "\n快捷指令 sb 创建成功（优先: ${local_script}）\n" || red "\n快捷指令创建失败\n"
+    if [ -L /usr/bin/sb ] || [ -x /usr/bin/sb ]; then
+        green "\n快捷指令 sb 创建成功（始终远程拉取: ${SB_REMOTE_URL:-https://raw.githubusercontent.com/gxjxzgx/sing-box/refs/heads/main/sing-box1.sh}）\n"
+    else
+        red "\n快捷指令创建失败\n"
+    fi
 }
 
 
@@ -3101,6 +3082,143 @@ change_argo_domain() {
 }
 
 # 查看当前节点信息（仅打印节点链接）
+
+# ---------- Nginx 管理 ----------
+_load_argo_port_for_nginx() {
+    # 优先环境变量 → argo_fixed.conf → 现有 argo-ws.conf → 默认 8001
+    if [ -n "${ARGO_PORT:-}" ] && [[ "$ARGO_PORT" =~ ^[0-9]+$ ]]; then
+        return 0
+    fi
+    if [ -f "${work_dir}/argo_fixed.conf" ]; then
+        # shellcheck source=/dev/null
+        source "${work_dir}/argo_fixed.conf" 2>/dev/null || true
+    fi
+    if [ -z "${ARGO_PORT:-}" ] || ! [[ "${ARGO_PORT}" =~ ^[0-9]+$ ]]; then
+        if [ -f /etc/nginx/conf.d/argo-ws.conf ]; then
+            ARGO_PORT=$(grep -oE 'listen[[:space:]]+[0-9]+' /etc/nginx/conf.d/argo-ws.conf 2>/dev/null | head -1 | awk '{print $2}')
+        fi
+    fi
+    ARGO_PORT="${ARGO_PORT:-8001}"
+    export ARGO_PORT
+}
+
+manage_nginx() {
+    while true; do
+        clear; echo ""
+        local ngx_st
+        ngx_st=$(check_nginx 2>/dev/null)
+        green "=== Nginx 管理 ===\n"
+        green "当前状态: $ngx_st\n"
+        if command_exists nginx; then
+            yellow "配置检测: $(nginx -t 2>&1 | tail -1)\n"
+        else
+            red "系统未安装 nginx 命令\n"
+        fi
+        _load_argo_port_for_nginx
+        yellow "当前 Argo 入口端口(ARGO_PORT): ${purple}${ARGO_PORT}${re}\n"
+
+        green "1. 启动 Nginx"
+        skyblue "------------"
+        green "2. 停止 Nginx"
+        skyblue "------------"
+        green "3. 重启 Nginx"
+        skyblue "------------"
+        green "4. 重新生成 Argo 路径配置 (argo-ws.conf + 主配置)"
+        skyblue "----------------------------------------------"
+        green "5. 查看 nginx -t 完整输出"
+        skyblue "----------------------"
+        green "6. 查看 argo-ws.conf"
+        skyblue "----------------"
+        green "7. 修改 Argo 入口监听端口并重载"
+        skyblue "----------------------------"
+        purple "0. 返回主菜单"
+        skyblue "-----------"
+        reading "\n请输入选择: " ngx_choice
+        echo ""
+        case "${ngx_choice}" in
+            1)
+                if ! command_exists nginx; then
+                    yellow "正在安装 nginx..."
+                    manage_packages install nginx
+                fi
+                start_nginx
+                ;;
+            2)
+                manage_service "nginx" "stop"
+                ;;
+            3)
+                if ! command_exists nginx; then
+                    red "nginx 未安装"
+                else
+                    restart_nginx
+                fi
+                ;;
+            4)
+                if ! command_exists nginx; then
+                    manage_packages install nginx
+                fi
+                _load_argo_port_for_nginx
+                if add_nginx_conf; then
+                    green "Nginx Argo 配置已重新生成"
+                else
+                    red "配置生成失败，请查看上方错误信息"
+                fi
+                ;;
+            5)
+                if command_exists nginx; then
+                    nginx -t
+                else
+                    red "nginx 未安装"
+                fi
+                ;;
+            6)
+                if [ -f /etc/nginx/conf.d/argo-ws.conf ]; then
+                    echo ""
+                    cat /etc/nginx/conf.d/argo-ws.conf
+                    echo ""
+                else
+                    red "文件不存在: /etc/nginx/conf.d/argo-ws.conf"
+                    yellow "可选择 4 重新生成配置"
+                fi
+                ;;
+            7)
+                _load_argo_port_for_nginx
+                reading "请输入新的 Argo 入口端口 (当前 ${ARGO_PORT}): " new_ap
+                if [ -z "$new_ap" ]; then
+                    yellow "已取消"
+                elif ! [[ "$new_ap" =~ ^[0-9]+$ ]] || [ "$new_ap" -lt 1 ] || [ "$new_ap" -gt 65535 ]; then
+                    red "端口无效"
+                else
+                    ARGO_PORT="$new_ap"
+                    export ARGO_PORT
+                    if [ -f /etc/nginx/conf.d/argo-ws.conf ]; then
+                        sed -i "s/listen [0-9]\\+;/listen ${ARGO_PORT};/g" /etc/nginx/conf.d/argo-ws.conf
+                        sed -i "s/listen \\[::\\]:[0-9]\\+;/listen [::]:${ARGO_PORT};/g" /etc/nginx/conf.d/argo-ws.conf
+                    else
+                        add_nginx_conf
+                    fi
+                    allow_port ${ARGO_PORT}/tcp >/dev/null 2>&1
+                    if nginx -t 2>/dev/null; then
+                        restart_nginx
+                        green "Argo 入口端口已更新为 ${purple}${ARGO_PORT}${re}"
+                    else
+                        red "配置检测失败"
+                        nginx -t
+                    fi
+                fi
+                ;;
+            0)
+                return
+                ;;
+            *)
+                red "无效选项"
+                ;;
+        esac
+        echo ""
+        read -n 1 -s -r -p $'\033[1;91m按任意键继续...\033[0m'
+    done
+}
+
 check_nodes() {
     if [ ! -f "${work_dir}/url.txt" ]; then
         red "节点信息文件不存在，请先安装 sing-box"; return 1
@@ -3898,7 +4016,8 @@ menu() {
     green "3. sing-box管理"
     green "4. Argo隧道管理"
     echo "==============="
-    green "5. 查看节点信息"
+    green "5.1 查看节点信息"
+    green "5.2 Nginx管理"
     green "6. 修改节点配置"
     green "7. 查看节点文件说明"
     green "8. WARP分流管理"
@@ -3957,7 +4076,7 @@ case "$1" in
         # 无参数：进入交互式主菜单
         while true; do
             menu
-            reading "请输入选择(0-11): " choice
+            reading "请输入选择(0-11 / 5.1 / 5.2): " choice
             echo ""
             need_pause=true
             case "${choice}" in
@@ -3995,7 +4114,14 @@ case "$1" in
                 2)  uninstall_singbox;  need_pause=false ;;
                 3)  manage_singbox;     need_pause=false ;;
                 4)  manage_argo;        need_pause=true ;;
-                5)  check_nodes;        need_pause=true ;;
+                5|5.1)
+                    check_nodes
+                    need_pause=true
+                    ;;
+                5.2)
+                    manage_nginx
+                    need_pause=false
+                    ;;
                 6)  change_config;      need_pause=true ;;
                 7)  show_node_files;    need_pause=true ;;
                 8)  warp_manage;        need_pause=false ;;
