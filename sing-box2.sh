@@ -2,7 +2,7 @@
 
 # =========================
 # 老王sing-box多协议安装脚本（个人修改版）
-# 协议: vless-reality | hysteria2 | tuic | vless-ws(直连)
+# 协议: vless-reality | hysteria2 | tuic | vless-ws(直连, 无TLS)
 #       vmess-ws / vless-ws / trojan-ws (Argo 隧道)
 # 可额外添加: anytls / socks5 / ss2022
 #
@@ -28,7 +28,7 @@
 #  12. 移除主菜单「Nginx管理」（Nginx 仍由安装/Argo 自动配置，状态仅展示）
 #
 # 基于: eooce/sing-box  修改日期: 2026.9.22
-# 版本: v2.4
+# 版本: v2.4.1 (nginx 配置修复：取消行号 sed、暴露 nginx -t 错误、准确判断重启结果)
 # =========================
 
 export LANG=en_US.UTF-8
@@ -1025,15 +1025,9 @@ EOF
           "uuid": "$uuid"
         }
       ],
-      "tls": {
-        "enabled": true,
-        "certificate_path": "$work_dir/cert.pem",
-        "key_path": "$work_dir/private.key"
-      },
       "transport": {
         "type": "ws",
-        "path": "/vless",
-        "early_data_header_name": "Sec-WebSocket-Protocol"
+        "path": "/vless-ws"
       }
     },
     {
@@ -1387,7 +1381,7 @@ hysteria2://${uuid}@${server_ip}:${hy2_port}/?sni=www.bing.com&insecure=1&pinSHA
 
 tuic://${uuid}:${uuid}@${server_ip}:${tuic_port}?sni=www.bing.com&congestion_control=bbr&udp_relay_mode=native&alpn=h3&allow_insecure=1#${prefix}-tuic
 
-vless://${uuid}@${server_ip}:${vless_ws_direct_port}?encryption=none&security=tls&sni=www.bing.com&fp=firefox&type=ws&host=${server_ip}&path=%2Fvless&allowInsecure=1#${prefix}-vless-ws
+vless://${uuid}@${server_ip}:${vless_ws_direct_port}?encryption=none&security=none&type=ws&host=${server_ip}&path=%2Fvless-ws#${prefix}-vless-ws
 
 vmess://$(echo "$VMESS" | base64 -w0)
 
@@ -1421,10 +1415,15 @@ add_nginx_conf() {
         return 1
     else
         manage_service "nginx" "stop" > /dev/null 2>&1
-        pkill nginx > /dev/null 2>&1
+        pkill -x nginx > /dev/null 2>&1 || pkill nginx > /dev/null 2>&1
     fi
 
-    mkdir -p /etc/nginx/conf.d
+    mkdir -p /etc/nginx/conf.d /var/log/nginx /run
+    # 避免 Debian/Ubuntu 默认站点与 Argo 入口端口冲突
+    if [ -L /etc/nginx/sites-enabled/default ]; then
+        rm -f /etc/nginx/sites-enabled/default
+        yellow "已禁用 sites-enabled/default，避免端口冲突"
+    fi
     [[ -f "/etc/nginx/conf.d/sing-box.conf" ]] && cp /etc/nginx/conf.d/sing-box.conf /etc/nginx/conf.d/sing-box.conf.bak.sb
 
     # 内部端口（与 install_singbox 保持一致）
@@ -1485,17 +1484,99 @@ server {
 }
 EOF
 
+    # 确保主配置包含 conf.d，禁止按行号硬编码 sed（易破坏不同发行版 nginx.conf）
     if [ -f "/etc/nginx/nginx.conf" ]; then
         cp /etc/nginx/nginx.conf /etc/nginx/nginx.conf.bak.sb > /dev/null 2>&1
-        sed -i -e '15{/include \/etc\/nginx\/modules\/\*\.conf/d;}' \
-               -e '18{/include \/etc\/nginx\/conf\.d\/\*\.conf/d;}' /etc/nginx/nginx.conf > /dev/null 2>&1
-        if ! grep -q "include.*conf.d" /etc/nginx/nginx.conf; then
-            http_end_line=$(grep -n "^}" /etc/nginx/nginx.conf | tail -1 | cut -d: -f1)
-            [ -n "$http_end_line" ] && sed -i "${http_end_line}i \    include /etc/nginx/conf.d/*.conf;" /etc/nginx/nginx.conf > /dev/null 2>&1
+        if ! grep -qE 'include[[:space:]]+/etc/nginx/conf\.d/\*\.conf' /etc/nginx/nginx.conf; then
+            # 在 http { 块内追加 include（匹配最后一个以 } 结束前的 http 作用域）
+            if grep -qE '^[[:space:]]*http[[:space:]]*\{' /etc/nginx/nginx.conf; then
+                # 在第一个 "http {" 之后插入 include 行（若尚未存在）
+                awk '
+                    BEGIN { done=0 }
+                    /^[[:space:]]*http[[:space:]]*\{/ && !done {
+                        print
+                        print "    include /etc/nginx/conf.d/*.conf;"
+                        done=1
+                        next
+                    }
+                    { print }
+                ' /etc/nginx/nginx.conf > /etc/nginx/nginx.conf.tmp.sb \
+                    && mv /etc/nginx/nginx.conf.tmp.sb /etc/nginx/nginx.conf
+            else
+                yellow "未在 nginx.conf 中找到 http {} 块，将写入最小可用主配置"
+                _write_minimal_nginx_conf
+            fi
         fi
     else
-        cat > /etc/nginx/nginx.conf << 'EOF'
-user nginx;
+        _write_minimal_nginx_conf
+    fi
+
+    local nginx_test_out
+    nginx_test_out=$(nginx -t 2>&1)
+    local nginx_test_rc=$?
+    if [ $nginx_test_rc -eq 0 ]; then
+        nginx -s reload > /dev/null 2>&1 || start_nginx
+        if command_exists systemctl && systemctl is-active --quiet nginx 2>/dev/null; then
+            green "nginx 配置检测通过，服务已加载"
+        elif pgrep -x nginx >/dev/null 2>&1; then
+            green "nginx 配置检测通过，进程已运行"
+        else
+            yellow "nginx 配置检测通过，但服务未处于 active 状态，正在启动..."
+            start_nginx
+        fi
+    else
+        yellow "nginx 配置检测失败，详细信息如下："
+        echo "$nginx_test_out" | while IFS= read -r line; do red "  $line"; done
+        yellow "尝试恢复主配置并重启..."
+        if [ -f "/etc/nginx/nginx.conf.bak.sb" ]; then
+            cp /etc/nginx/nginx.conf.bak.sb /etc/nginx/nginx.conf > /dev/null 2>&1
+            # 恢复后仍保留 argo-ws.conf；再次确保 include
+            if ! grep -qE 'include[[:space:]]+/etc/nginx/conf\.d/\*\.conf' /etc/nginx/nginx.conf; then
+                if grep -qE '^[[:space:]]*http[[:space:]]*\{' /etc/nginx/nginx.conf; then
+                    awk '
+                        BEGIN { done=0 }
+                        /^[[:space:]]*http[[:space:]]*\{/ && !done {
+                            print
+                            print "    include /etc/nginx/conf.d/*.conf;"
+                            done=1
+                            next
+                        }
+                        { print }
+                    ' /etc/nginx/nginx.conf > /etc/nginx/nginx.conf.tmp.sb \
+                        && mv /etc/nginx/nginx.conf.tmp.sb /etc/nginx/nginx.conf
+                fi
+            fi
+        fi
+        nginx_test_out=$(nginx -t 2>&1)
+        nginx_test_rc=$?
+        if [ $nginx_test_rc -eq 0 ]; then
+            restart_nginx
+            if command_exists systemctl && systemctl is-active --quiet nginx 2>/dev/null; then
+                green "已恢复配置并成功重启 nginx"
+            elif pgrep -x nginx >/dev/null 2>&1; then
+                green "已恢复配置，nginx 进程已运行"
+            else
+                red "配置已通过检测，但 nginx 仍未成功启动，请执行: journalctl -xeu nginx.service"
+                return 1
+            fi
+        else
+            red "恢复后 nginx 配置仍检测失败："
+            echo "$nginx_test_out" | while IFS= read -r line; do red "  $line"; done
+            red "请检查端口 ${ARGO_PORT} 是否被占用: ss -tlnp | grep :${ARGO_PORT}"
+            return 1
+        fi
+    fi
+    return 0
+}
+
+# 写入最小可用 nginx 主配置（无发行版差异）
+_write_minimal_nginx_conf() {
+    local nginx_user="nginx"
+    id nginx >/dev/null 2>&1 || nginx_user="www-data"
+    id "$nginx_user" >/dev/null 2>&1 || nginx_user="root"
+    mkdir -p /var/log/nginx /run
+    cat > /etc/nginx/nginx.conf << EOF
+user ${nginx_user};
 worker_processes auto;
 error_log /var/log/nginx/error.log;
 pid /run/nginx.pid;
@@ -1510,19 +1591,6 @@ http {
     include /etc/nginx/conf.d/*.conf;
 }
 EOF
-    fi
-
-    if nginx -t > /dev/null 2>&1; then
-        nginx -s reload > /dev/null 2>&1 || start_nginx > /dev/null 2>&1
-        green "nginx订阅配置已加载"
-    else
-        yellow "nginx配置检测失败，尝试重启..."
-        restart_nginx > /dev/null 2>&1
-        if [ $? -ne 0 ]; then
-            [[ -f "/etc/nginx/nginx.conf.bak.sb" ]] && cp "/etc/nginx/nginx.conf.bak.sb" /etc/nginx/nginx.conf > /dev/null 2>&1
-            restart_nginx > /dev/null 2>&1
-        fi
-    fi
 }
 
 # 从已安装配置中获取UUID
@@ -1664,10 +1732,26 @@ manage_service() {
             fi
 
             sleep 1
-            if pgrep -f "${service_file}" >/dev/null 2>&1 || [[ "$(check_service "$service_name" "$service_file" 2>/dev/null)" == *"running"* ]]; then
+            local ok=0
+            if [ "$service_name" = "nginx" ] && command_exists systemctl; then
+                systemctl is-active --quiet nginx 2>/dev/null && ok=1
+            fi
+            if [ "$ok" -eq 0 ]; then
+                if pgrep -x nginx >/dev/null 2>&1 && [ "$service_name" = "nginx" ]; then
+                    ok=1
+                elif pgrep -f "${service_file}" >/dev/null 2>&1 || [[ "$(check_service "$service_name" "$service_file" 2>/dev/null)" == *"running"* ]]; then
+                    ok=1
+                fi
+            fi
+            if [ "$ok" -eq 1 ]; then
                 green "${service_name} 服务已成功重启\n"
+                return 0
             else
                 red "${service_name} 服务重启失败\n"
+                if [ "$service_name" = "nginx" ] && command_exists systemctl; then
+                    yellow "请查看: systemctl status nginx.service ; journalctl -xeu nginx.service"
+                fi
+                return 1
             fi
             ;;
 
@@ -2144,8 +2228,11 @@ auto_install() {
     add_nginx_conf
     create_shortcut
     if command_exists nginx; then
-        restart_nginx
-        green "Nginx 已重启完成"
+        if restart_nginx; then
+            green "Nginx 已重启完成"
+        else
+            red "Nginx 重启未成功，请执行: nginx -t && systemctl status nginx.service"
+        fi
     fi
     green "\nsing-box 安装完成\n"
 }
@@ -2403,11 +2490,12 @@ change_config() {
                 "5") new_sni="www.nazhumi.com" ;;
             esac
             jq --arg sni "$new_sni" \
-               '(.inbounds[] | select(.type == "vless") | .tls.server_name) = $sni |
-                (.inbounds[] | select(.type == "vless") | .tls.reality.handshake.server) = $sni' \
+               '(.inbounds[] | select(.tag == "vless-reality") | .tls.server_name) = $sni |
+                (.inbounds[] | select(.tag == "vless-reality") | .tls.reality.handshake.server) = $sni' \
                "${conf_dir}/inbounds.json" > "${conf_dir}/inbounds.json.tmp" && mv "${conf_dir}/inbounds.json.tmp" "${conf_dir}/inbounds.json"
             restart_singbox
-            sed -i "s/\(vless:\/\/[^\?]*\?\([^\&]*\&\)*sni=\)[^&]*/\1$new_sni/" $client_dir
+            # 仅更新 Reality 节点的 sni，避免误改无 TLS 的 vless-ws 直连
+            sed -i -E "/flow=xtls-rprx-vision/s/(sni=)[^&]*/\1${new_sni}/" $client_dir
             refresh_sub
             while IFS= read -r line; do yellow "$line"; done < ${work_dir}/url.txt
             green "\nReality sni已修改为：${purple}${new_sni}${re}\n"
@@ -3700,8 +3788,11 @@ case "$1" in
                         create_shortcut
                         # 安装完成后明确重启 Nginx
                         if command_exists nginx; then
-                            restart_nginx
-                            green "Nginx 已重启完成"
+                            if restart_nginx; then
+                                green "Nginx 已重启完成"
+                            else
+                                red "Nginx 重启未成功，请执行: nginx -t && systemctl status nginx.service"
+                            fi
                         fi
                     fi
                     ;;
