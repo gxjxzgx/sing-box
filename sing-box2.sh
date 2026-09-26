@@ -28,7 +28,7 @@
 #  12. 移除主菜单「Nginx管理」（Nginx 仍由安装/Argo 自动配置，状态仅展示）
 #
 # 基于: eooce/sing-box  修改日期: 2026.9.22
-# 版本: v2.4.3 (补全 mime.types；杜绝 nginx 假成功提示)
+# 版本: v2.4.4 (修复损坏的 mime.types 截断/缺括号；强制重写)
 # =========================
 
 export LANG=en_US.UTF-8
@@ -1671,8 +1671,24 @@ EOF
                 return 1
             fi
         else
+            # mime.types 仍坏时强制覆盖再试一次
+            if echo "$nginx_test_out" | grep -qi 'mime.types'; then
+                yellow "强制重写损坏的 mime.types 并重试..."
+                _write_safe_mime_types
+                _ensure_nginx_ready
+                nginx_test_out=$(nginx -t 2>&1)
+                nginx_test_rc=$?
+                if [ $nginx_test_rc -eq 0 ]; then
+                    restart_nginx
+                    if command_exists systemctl && systemctl is-active --quiet nginx 2>/dev/null; then
+                        green "强制修复 mime.types 后 nginx 已正常"
+                        return 0
+                    fi
+                fi
+            fi
             red "恢复后 nginx 配置仍检测失败："
             echo "$nginx_test_out" | while IFS= read -r line; do red "  $line"; done
+            red "请检查: ls -l /etc/nginx/mime.types ; head -5 /etc/nginx/mime.types ; tail -5 /etc/nginx/mime.types"
             red "请检查端口 ${ARGO_PORT} 是否被占用: ss -tlnp | grep :${ARGO_PORT}"
             return 1
         fi
@@ -1693,47 +1709,94 @@ _resolve_nginx_user() {
     echo "root"
 }
 
-_ensure_nginx_mime_types() {
-    # 部分精简系统安装 nginx 后缺少 mime.types，导致 nginx -t 失败
-    mkdir -p /etc/nginx /var/log/nginx /run /var/lib/nginx /var/cache/nginx
-    if [ -f /etc/nginx/mime.types ] && [ -s /etc/nginx/mime.types ]; then
-        return 0
-    fi
-    # 尝试从常见路径复制
-    local src
-    for src in /usr/share/nginx/mime.types /etc/mime.types /usr/local/nginx/conf/mime.types; do
-        if [ -f "$src" ] && [ -s "$src" ]; then
-            cp -f "$src" /etc/nginx/mime.types
-            return 0
-        fi
-    done
-    # 写入精简 mime.types（满足 -t 与 WebSocket 代理即可）
+_write_safe_mime_types() {
+    # 写入语法完整、可被 nginx -t 接受的 mime.types（覆盖损坏文件）
     cat > /etc/nginx/mime.types << 'MIMEOF'
 types {
-    text/html                                        html htm shtml;
-    text/css                                         css;
-    text/xml                                         xml;
-    image/gif                                        gif;
-    image/jpeg                                       jpeg jpg;
-    application/javascript                           js;
-    application/json                                 json;
-    application/octet-stream                         bin exe dmg;
-    application/pdf                                  pdf;
-    application/xhtml+xml                            xhtml;
-    application/xml                                  xsl;
-    application/zip                                  zip;
-    application/x-rar-compressed                     rar;
-    audio/mpeg                                       mp3;
-    video/mp4                                        mp4;
-    image/png                                        png;
-    image/svg+xml                                    svg svgz;
-    image/webp                                       webp;
-    image/x-icon                                     ico;
-    text/plain                                       txt;
-    text/event-stream                                event-stream;
+    text/html                             html htm shtml;
+    text/css                              css;
+    text/xml                              xml;
+    image/gif                             gif;
+    image/jpeg                            jpeg jpg;
+    application/javascript                js;
+    application/json                      json;
+    application/octet-stream              bin exe dmg;
+    application/pdf                       pdf;
+    application/xhtml+xml                 xhtml;
+    application/xml                       xsl;
+    application/zip                       zip;
+    application/x-rar-compressed          rar;
+    audio/mpeg                            mp3;
+    video/mp4                             mp4;
+    image/png                             png;
+    image/svg+xml                         svg svgz;
+    image/webp                            webp;
+    image/x-icon                          ico;
+    text/plain                            txt;
+    text/event-stream                     event-stream;
 }
 MIMEOF
-    yellow "已自动补全缺失的 /etc/nginx/mime.types"
+}
+
+_mime_types_looks_valid() {
+    local f="/etc/nginx/mime.types"
+    [ -f "$f" ] && [ -s "$f" ] || return 1
+    # 必须含 types { 与配对的结束 }
+    grep -qE 'types[[:space:]]*\{' "$f" || return 1
+    # 粗略检查：最后一个非空行应为 }
+    local last
+    last=$(grep -vE '^[[:space:]]*$|^[[:space:]]*#' "$f" | tail -1)
+    echo "$last" | grep -qE '\}' || return 1
+    # 行数异常偏大且疑似截断时视为无效（曾出现 2428 行 EOF）
+    local lines
+    lines=$(wc -l < "$f" 2>/dev/null || echo 0)
+    if [ "$lines" -gt 500 ]; then
+        # 大文件也要求括号平衡
+        local open close
+        open=$(grep -o '{' "$f" | wc -l)
+        close=$(grep -o '}' "$f" | wc -l)
+        [ "$open" -eq "$close" ] || return 1
+    fi
+    return 0
+}
+
+_ensure_nginx_mime_types() {
+    # 缺失、空文件、语法损坏（截断/缺 }）时一律重写
+    mkdir -p /etc/nginx /var/log/nginx /run /var/lib/nginx /var/cache/nginx
+
+    if _mime_types_looks_valid; then
+        return 0
+    fi
+
+    # 备份损坏文件便于排查
+    if [ -f /etc/nginx/mime.types ]; then
+        cp -f /etc/nginx/mime.types "/etc/nginx/mime.types.broken.$(date +%s)" 2>/dev/null || true
+        yellow "检测到 /etc/nginx/mime.types 缺失或语法损坏，正在修复..."
+    fi
+
+    # 优先使用其它完整副本
+    local src
+    for src in /usr/share/nginx/mime.types /usr/share/nginx/conf/mime.types /usr/local/nginx/conf/mime.types; do
+        if [ -f "$src" ] && [ -s "$src" ]; then
+            # 简单校验源文件
+            if grep -qE 'types[[:space:]]*\{' "$src" && grep -qE '\}' "$src"; then
+                cp -f "$src" /etc/nginx/mime.types
+                if _mime_types_looks_valid; then
+                    green "已从 ${src} 恢复 mime.types"
+                    return 0
+                fi
+            fi
+        fi
+    done
+
+    # 写入安全精简版（覆盖损坏内容）
+    _write_safe_mime_types
+    if _mime_types_looks_valid; then
+        green "已写入安全的 /etc/nginx/mime.types"
+    else
+        red "写入 mime.types 后仍校验失败，请检查磁盘与权限"
+        return 1
+    fi
 }
 
 _ensure_nginx_ready() {
