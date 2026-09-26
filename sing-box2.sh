@@ -28,7 +28,7 @@
 #  12. 移除主菜单「Nginx管理」（Nginx 仍由安装/Argo 自动配置，状态仅展示）
 #
 # 基于: eooce/sing-box  修改日期: 2026.9.22
-# 版本: v2.4.8 (菜单 5.1 查看节点 / 5.2 Nginx管理)
+# 版本: v2.5.4 (change_argo_domain 缺失时补建 Argo 节点; get_quick_tunnel 加长等待)
 # =========================
 
 export LANG=en_US.UTF-8
@@ -251,21 +251,21 @@ manage_packages() {
     action=$1
     shift
 
-    # 首次安装更新系统
+    # 首次安装仅刷新软件源索引，不做全系统 upgrade（避免生产机被动升级内核等）
     if [ "$action" == "install" ] && [ ! -d "$work_dir" ]; then
-        yellow "正在更新系统软件包...\n"
+        yellow "正在刷新软件源索引...\n"
         if command_exists apt; then
-            DEBIAN_FRONTEND=noninteractive apt update -y && DEBIAN_FRONTEND=noninteractive apt upgrade -y
+            DEBIAN_FRONTEND=noninteractive apt update -y
         elif command_exists dnf; then
-            dnf update -y
+            dnf check-update -y || true
         elif command_exists yum; then
-            yum update -y
+            yum check-update -y || true
         elif command_exists apk; then
-            apk update && apk upgrade
+            apk update
         else
             yellow "Unknown system!\n"
         fi
-        green "finished updated system\n"
+        green "软件源索引已刷新\n"
     fi
 
     for package in "$@"; do
@@ -1430,25 +1430,35 @@ get_info() {
         green "使用固定隧道域名: ${purple}${argodomain}${re}"
     fi
 
-    # 若无固定域名，则从临时隧道日志解析
+    # 若无固定域名，则从临时隧道日志解析（加长等待，cloudflared 常需 10–30 秒）
     if [ -z "$argodomain" ]; then
-        if [ -f "${work_dir}/argo.log" ]; then
-            for i in {1..5}; do
-                purple "第 $i 次尝试获取ArgoDomain中..."
-                argodomain=$(sed -n 's|.*https://\([^/]*trycloudflare\.com\).*|\1|p' "${work_dir}/argo.log")
-                [ -n "$argodomain" ] && break
-                sleep 2
-            done
-        else
+        if [ ! -f "${work_dir}/argo.log" ]; then
             restart_argo
-            sleep 6
-            argodomain=$(sed -n 's|.*https://\([^/]*trycloudflare\.com\).*|\1|p' "${work_dir}/argo.log")
+            sleep 3
         fi
+        local _argo_try
+        for _argo_try in $(seq 1 15); do
+            purple "第 ${_argo_try}/15 次尝试获取 ArgoDomain..."
+            if [ -f "${work_dir}/argo.log" ]; then
+                argodomain=$(sed -n 's|.*https://\([^/]*trycloudflare\.com\).*|\1|p' "${work_dir}/argo.log" | head -1)
+                [ -z "$argodomain" ] && argodomain=$(grep -oE '[[:alnum:]+\.-]+\.trycloudflare\.com' "${work_dir}/argo.log" 2>/dev/null | head -1)
+            fi
+            [ -n "$argodomain" ] && break
+            # 中途重启一次 argo 提高成功率
+            if [ "$_argo_try" -eq 5 ]; then
+                yellow "仍未获取到域名，尝试重启 Argo 服务..."
+                restart_argo >/dev/null 2>&1 || true
+            fi
+            sleep 2
+        done
     fi
 
+    local argo_domain_ok=1
     if [ -z "$argodomain" ]; then
-        yellow "未能获取 Argo 域名，节点中的隧道链接可能无效，请稍后在「Argo隧道管理」中重新获取或配置固定隧道"
-        argodomain="未获取到域名"
+        argo_domain_ok=0
+        yellow "未能获取 Argo 临时域名（超时）。本次将跳过写入 Argo 节点，避免生成无效订阅。"
+        yellow "请稍后在「Argo隧道管理」中重新获取临时域名，或配置固定隧道后再查看节点。"
+        argodomain=""
     fi
 
     green "\nArgoDomain：${purple}$argodomain${re}\n"
@@ -1487,12 +1497,16 @@ get_info() {
             echo "vless://${uuid}@${server_ip}:${vless_ws_direct_port}?encryption=none&security=none&type=ws&host=${server_ip}&path=%2Fvless-ws#${prefix}-vless-ws"
             echo ""
         fi
-        echo "vmess://$(echo "$VMESS" | base64 -w0)"
-        echo ""
-        echo "vless://${uuid}@${CFIP}:${CFPORT}?encryption=none&security=tls&sni=${argodomain}&fp=firefox&type=ws&host=${argodomain}&path=%2Fvless-argo%3Fed%3D2560#${prefix}-argo-vless"
-        echo ""
-        echo "trojan://${uuid}@${CFIP}:${CFPORT}?security=tls&sni=${argodomain}&fp=firefox&type=ws&host=${argodomain}&path=%2Ftrojan-argo%3Fed%3D2560#${prefix}-argo-trojan"
-        echo ""
+        if [ "${argo_domain_ok:-1}" = "1" ] && [ -n "$argodomain" ]; then
+            echo "vmess://$(echo "$VMESS" | base64 -w0)"
+            echo ""
+            echo "vless://${uuid}@${CFIP}:${CFPORT}?encryption=none&security=tls&sni=${argodomain}&fp=firefox&type=ws&host=${argodomain}&path=%2Fvless-argo%3Fed%3D2560#${prefix}-argo-vless"
+            echo ""
+            echo "trojan://${uuid}@${CFIP}:${CFPORT}?security=tls&sni=${argodomain}&fp=firefox&type=ws&host=${argodomain}&path=%2Ftrojan-argo%3Fed%3D2560#${prefix}-argo-trojan"
+            echo ""
+        else
+            yellow "已跳过 Argo 节点写入（域名未就绪）"
+        fi
     } > "${work_dir}/url.txt"
 
     if [ -n "$extra_lines" ]; then
@@ -2379,9 +2393,15 @@ change_hosts() {
 
 # 非交互静默安装（-i 参数；仍走官方优先下载与 IPv4 逻辑）
 auto_install() {
-    if [ -x "${work_dir}/sing-box" ]; then
-        yellow "sing-box 已经安装，跳过安装流程。"
-        exit 0
+    local force_install="${1:-0}"
+    if [ -x "${work_dir}/sing-box" ] && [ "$force_install" != "1" ]; then
+        yellow "sing-box 已经安装。"
+        yellow "如需重装请先执行: sb -u  或使用: sb -i --force"
+        exit 1
+    fi
+    if [ -x "${work_dir}/sing-box" ] && [ "$force_install" = "1" ]; then
+        yellow "检测到已安装，--force 将先卸载再安装..."
+        auto_uninstall
     fi
 
     green "开始无交互式安装 sing-box..."
@@ -2400,7 +2420,8 @@ auto_install() {
         exit 1
     fi
 
-    sleep 5
+    # 给 cloudflared 更多启动时间，再由 get_info 内轮询域名
+    sleep 3
     get_info
     add_nginx_conf
     create_shortcut
@@ -2518,6 +2539,7 @@ change_config() {
                         break
                     done
                     # 仅修改 tag=vless-reality，避免误改 vless-ws
+                    cp -f "$inbounds_file" "${inbounds_file}.bak.port" 2>/dev/null || true
                     if ! jq --argjson port "$new_port" \
                         '(.inbounds[] | select(.tag == "vless-reality")).listen_port = $port' \
                         "$inbounds_file" > "${inbounds_file}.tmp"; then
@@ -2525,13 +2547,13 @@ change_config() {
                         rm -f "${inbounds_file}.tmp"
                         return 1
                     fi
-                    # 校验配置合法性
+                    mv "${inbounds_file}.tmp" "$inbounds_file"
                     if ! "${work_dir}/sing-box" check -C "${conf_dir}" >/dev/null 2>&1; then
                         red "配置校验失败，已回滚"
-                        rm -f "${inbounds_file}.tmp"
+                        [ -f "${inbounds_file}.bak.port" ] && mv -f "${inbounds_file}.bak.port" "$inbounds_file"
                         return 1
                     fi
-                    mv "${inbounds_file}.tmp" "$inbounds_file"
+                    rm -f "${inbounds_file}.bak.port"
                     allow_port $new_port/tcp > /dev/null 2>&1
                     restart_singbox
                     # 仅更新 reality 直连节点端口（排除 argo 的 vless-ws）
@@ -2552,6 +2574,7 @@ change_config() {
                         fi
                         break
                     done
+                    cp -f "$inbounds_file" "${inbounds_file}.bak.port" 2>/dev/null || true
                     if ! jq --argjson port "$new_port" \
                         '(.inbounds[] | select(.tag == "hysteria2")).listen_port = $port' \
                         "$inbounds_file" > "${inbounds_file}.tmp"; then
@@ -2559,12 +2582,13 @@ change_config() {
                         rm -f "${inbounds_file}.tmp"
                         return 1
                     fi
+                    mv "${inbounds_file}.tmp" "$inbounds_file"
                     if ! "${work_dir}/sing-box" check -C "${conf_dir}" >/dev/null 2>&1; then
                         red "配置校验失败，已回滚"
-                        rm -f "${inbounds_file}.tmp"
+                        [ -f "${inbounds_file}.bak.port" ] && mv -f "${inbounds_file}.bak.port" "$inbounds_file"
                         return 1
                     fi
-                    mv "${inbounds_file}.tmp" "$inbounds_file"
+                    rm -f "${inbounds_file}.bak.port"
                     allow_port $new_port/udp > /dev/null 2>&1
                     restart_singbox
                     sed -i -E "s#(hysteria2://[^@]+@[^:]+:)[0-9]+#\1${new_port}#" "$client_dir"
@@ -2584,6 +2608,7 @@ change_config() {
                         fi
                         break
                     done
+                    cp -f "$inbounds_file" "${inbounds_file}.bak.port" 2>/dev/null || true
                     if ! jq --argjson port "$new_port" \
                         '(.inbounds[] | select(.tag == "tuic")).listen_port = $port' \
                         "$inbounds_file" > "${inbounds_file}.tmp"; then
@@ -2591,12 +2616,13 @@ change_config() {
                         rm -f "${inbounds_file}.tmp"
                         return 1
                     fi
+                    mv "${inbounds_file}.tmp" "$inbounds_file"
                     if ! "${work_dir}/sing-box" check -C "${conf_dir}" >/dev/null 2>&1; then
                         red "配置校验失败，已回滚"
-                        rm -f "${inbounds_file}.tmp"
+                        [ -f "${inbounds_file}.bak.port" ] && mv -f "${inbounds_file}.bak.port" "$inbounds_file"
                         return 1
                     fi
-                    mv "${inbounds_file}.tmp" "$inbounds_file"
+                    rm -f "${inbounds_file}.bak.port"
                     allow_port $new_port/udp > /dev/null 2>&1
                     restart_singbox
                     sed -i -E "s#(tuic://[^@]+@[^:]+:)[0-9]+#\1${new_port}#" "$client_dir"
@@ -2606,11 +2632,17 @@ change_config() {
                     ;;
                 4)
                     # Argo 对外端口 = Nginx 监听端口（内部三个协议端口不变）
-                    reading "\n请输入Argo对外端口 (当前Nginx入口, 回车跳过将使用随机端口): " new_port
-                    [ -z "$new_port" ] && new_port=$(shuf -i 2000-65000 -n 1)
-                    if ! [[ "$new_port" =~ ^[0-9]+$ ]] || [ "$new_port" -lt 1 ] || [ "$new_port" -gt 65535 ]; then
-                        red "端口无效"; return 1
-                    fi
+                    while true; do
+                        reading "\n请输入Argo对外端口 (当前Nginx入口, 回车跳过将使用随机端口): " new_port
+                        [ -z "$new_port" ] && new_port=$(shuf -i 2000-65000 -n 1)
+                        if ! [[ "$new_port" =~ ^[0-9]+$ ]] || [ "$new_port" -lt 1 ] || [ "$new_port" -gt 65535 ]; then
+                            red "端口无效"; continue
+                        fi
+                        if port_in_use "$new_port"; then
+                            red "端口 ${new_port} 已被占用，请重新输入"; continue
+                        fi
+                        break
+                    done
                     allow_port $new_port/tcp > /dev/null 2>&1
                     if [ -f /etc/nginx/conf.d/argo-ws.conf ]; then
                         sed -i "s/listen [0-9]\+;/listen ${new_port};/g" /etc/nginx/conf.d/argo-ws.conf
@@ -2638,22 +2670,57 @@ change_config() {
         2)
             reading "\n请输入新的UUID(直接回车随机生成UUID): " new_uuid
             [ -z "$new_uuid" ] && new_uuid=$(cat /proc/sys/kernel/random/uuid)
-            jq --arg uuid "$new_uuid" \
-               '(.inbounds[] | select(.users != null) | .users[] | select(.uuid != null).uuid) = $uuid |
-                (.inbounds[] | select(.users != null) | .users[] | select(.password != null).password) = $uuid' \
-               "${conf_dir}/inbounds.json" > "${conf_dir}/inbounds.json.tmp" && mv "${conf_dir}/inbounds.json.tmp" "${conf_dir}/inbounds.json"
+            if ! echo "$new_uuid" | grep -Eq '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'; then
+                red "UUID 格式无效"; return 1
+            fi
+            # Socks5 用户名/密码保持与添加时一致：前8位 / 后12位，避免整段 UUID 污染密码
+            local sk_user sk_pass
+            sk_user=$(printf '%s' "${new_uuid:0:8}")
+            sk_pass=$(printf '%s' "${new_uuid: -12}")
+            cp -f "${conf_dir}/inbounds.json" "${conf_dir}/inbounds.json.bak.uuid" 2>/dev/null || true
+            if ! jq --arg uuid "$new_uuid" --arg sk_user "$sk_user" --arg sk_pass "$sk_pass" '
+                (.inbounds[] | select(.users != null) | .users[] | select(.uuid != null).uuid) = $uuid |
+                (.inbounds[] | select(.tag != "socks5-in" and .users != null) | .users[] | select(.password != null).password) = $uuid |
+                (.inbounds[] | select(.tag == "socks5-in") | .users[0].username) = $sk_user |
+                (.inbounds[] | select(.tag == "socks5-in") | .users[0].password) = $sk_pass
+            ' "${conf_dir}/inbounds.json" > "${conf_dir}/inbounds.json.tmp"; then
+                red "配置修改失败"; rm -f "${conf_dir}/inbounds.json.tmp"; return 1
+            fi
+            # 先替换再校验，确保 check 针对的是新配置
+            mv "${conf_dir}/inbounds.json.tmp" "${conf_dir}/inbounds.json"
+            if ! "${work_dir}/sing-box" check -C "${conf_dir}" >/dev/null 2>&1; then
+                red "配置校验失败，已回滚"
+                [ -f "${conf_dir}/inbounds.json.bak.uuid" ] && mv -f "${conf_dir}/inbounds.json.bak.uuid" "${conf_dir}/inbounds.json"
+                return 1
+            fi
+            rm -f "${conf_dir}/inbounds.json.bak.uuid"
             restart_singbox
             sed -i -E 's/(vless:\/\/|hysteria2:\/\/|anytls:\/\/|trojan:\/\/)[^@]*(@.*)/\1'"$new_uuid"'\2/' $client_dir
             sed -i -E "s#tuic://[0-9a-f-]{36}:[0-9a-f-]{36}@#tuic://$new_uuid:$new_uuid@#g" $client_dir
-            isp=$(get_isp "node")
-            argodomain=$(grep -oE 'https://[[:alnum:]+\.-]+\.trycloudflare\.com' "${work_dir}/argo.log" | sed 's@https://@@')
-            [ -z "$argodomain" ] && argodomain=$(grep -oE '[[:alnum:]+\.-]+\.trycloudflare\.com' "${work_dir}/argo.log" | head -1)
-            VMESS="{ \"v\": \"2\", \"ps\": \"${isp}\", \"add\": \"${CFIP}\", \"port\": \"443\", \"id\": \"${new_uuid}\", \"aid\": \"0\", \"scy\": \"none\", \"net\": \"ws\", \"type\": \"none\", \"host\": \"${argodomain}\", \"path\": \"/vmess-argo?ed=2560\", \"tls\": \"tls\", \"sni\": \"${argodomain}\", \"alpn\": \"\", \"fp\": \"\", \"allowInsecure\": \"false\"}"
-            encoded_vmess=$(echo "$VMESS" | base64 -w0)
-            sed -i -E '/vmess:\/\//{s@vmess://.*@vmess://'"$encoded_vmess"'@}' $client_dir
+            # 同步更新 socks:// 订阅链接中的账号密码（base64(user:pass)）
+            if grep -q '^socks://' "$client_dir" 2>/dev/null; then
+                local sk_auth sk_b64
+                sk_auth=$(printf '%s:%s' "$sk_user" "$sk_pass")
+                sk_b64=$(printf '%s' "$sk_auth" | base64 -w0 2>/dev/null || printf '%s' "$sk_auth" | base64 | tr -d '\n')
+                sed -i -E "s#socks://[^@]+@#socks://${sk_b64}@#g" "$client_dir"
+            fi
+            # 更新全部 vmess 的 id，保留 ps/add/port/host/sni 等
+            local _vm_line _vm_enc _vm_dec _vm_upd _vm_new
+            while IFS= read -r _vm_line; do
+                [ -z "$_vm_line" ] && continue
+                _vm_enc="${_vm_line#vmess://}"
+                _vm_dec=$(echo "$_vm_enc" | base64 --decode 2>/dev/null) || continue
+                _vm_upd=$(echo "$_vm_dec" | jq --arg id "$new_uuid" '.id = $id' 2>/dev/null) || continue
+                [ -z "$_vm_upd" ] && continue
+                _vm_new=$(echo "$_vm_upd" | base64 -w0 2>/dev/null || echo "$_vm_upd" | base64 | tr -d '\n')
+                sed -i "s|${_vm_line}|vmess://${_vm_new}|" "$client_dir"
+            done < <(grep -o 'vmess://[^[:space:]]*' "$client_dir" 2>/dev/null || true)
             refresh_sub
             while IFS= read -r line; do yellow "$line"; done < ${work_dir}/url.txt
             green "\nUUID已修改为：${purple}${new_uuid}${re}\n"
+            if jq -e '.inbounds[] | select(.tag == "socks5-in")' "${conf_dir}/inbounds.json" >/dev/null 2>&1; then
+                green "Socks5 用户名/密码已同步为 UUID 前8位/后12位，并已更新订阅链接\n"
+            fi
             ;;
         3)
             clear
@@ -2666,10 +2733,20 @@ change_config() {
                 "4") new_sni="www.cerebrium.ai" ;;
                 "5") new_sni="www.nazhumi.com" ;;
             esac
-            jq --arg sni "$new_sni" \
+            cp -f "${conf_dir}/inbounds.json" "${conf_dir}/inbounds.json.bak.sni" 2>/dev/null || true
+            if ! jq --arg sni "$new_sni" \
                '(.inbounds[] | select(.tag == "vless-reality") | .tls.server_name) = $sni |
                 (.inbounds[] | select(.tag == "vless-reality") | .tls.reality.handshake.server) = $sni' \
-               "${conf_dir}/inbounds.json" > "${conf_dir}/inbounds.json.tmp" && mv "${conf_dir}/inbounds.json.tmp" "${conf_dir}/inbounds.json"
+               "${conf_dir}/inbounds.json" > "${conf_dir}/inbounds.json.tmp"; then
+                red "配置修改失败"; rm -f "${conf_dir}/inbounds.json.tmp"; return 1
+            fi
+            mv "${conf_dir}/inbounds.json.tmp" "${conf_dir}/inbounds.json"
+            if ! "${work_dir}/sing-box" check -C "${conf_dir}" >/dev/null 2>&1; then
+                red "配置校验失败，已回滚"
+                [ -f "${conf_dir}/inbounds.json.bak.sni" ] && mv -f "${conf_dir}/inbounds.json.bak.sni" "${conf_dir}/inbounds.json"
+                return 1
+            fi
+            rm -f "${conf_dir}/inbounds.json.bak.sni"
             restart_singbox
             # 仅更新 Reality 节点的 sni，避免误改无 TLS 的 vless-ws 直连
             sed -i -E "/flow=xtls-rprx-vision/s/(sni=)[^&]*/\1${new_sni}/" $client_dir
@@ -2811,29 +2888,36 @@ IEOF
                 prefix="${node_prefix}-${isp}"
             fi
 
-            # 更新各协议节点备注
-            sed -i -E "s|(vless://[^#]+)#.*|\1#${prefix}-vless-reality|" "$client_dir"
+            # 更新各协议节点备注（顺序：先区分 argo / 直连 ws，再处理 reality，避免互相覆盖）
             sed -i -E "s|(hysteria2://[^#]+)#.*|\1#${prefix}-hysteria2|" "$client_dir"
             sed -i -E "s|(tuic://[^#]+)#.*|\1#${prefix}-tuic|" "$client_dir"
             sed -i -E "s|(trojan://[^#]+)#.*|\1#${prefix}-argo-trojan|" "$client_dir"
+            sed -i -E "s|(anytls://[^#]+)#.*|\1#${prefix}-anytls|" "$client_dir"
+            sed -i -E "s|(socks://[^#]+)#.*|\1#${prefix}-socks5|" "$client_dir"
+            sed -i -E "s|(ss://[^#]+)#.*|\1#${prefix}-ss2022|" "$client_dir"
 
-            # 更新 vless-ws argo
+            # vless-ws argo 隧道
             sed -i -E "s|(vless://[^#]*path=%2Fvless-argo[^#]*)#.*|\1#${prefix}-argo-vless|" "$client_dir"
             sed -i -E "s|(vless://[^#]*path=/vless-argo[^#]*)#.*|\1#${prefix}-argo-vless|" "$client_dir"
 
-            # 更新 vmess ps 字段
-            vmess_url=$(grep -o 'vmess://[^ ]*' "$client_dir" | head -1)
-            if [ -n "$vmess_url" ]; then
-                encoded="${vmess_url#vmess://}"
-                decoded=$(echo "$encoded" | base64 -d 2>/dev/null)
-                if [ -n "$decoded" ]; then
-                    updated=$(echo "$decoded" | jq --arg ps "${prefix}-argo-vmess" '.ps = $ps' 2>/dev/null)
-                    if [ -n "$updated" ]; then
-                        new_encoded=$(echo "$updated" | base64 -w0 2>/dev/null || echo "$updated" | base64 | tr -d '\n')
-                        sed -i "s|$vmess_url|vmess://$new_encoded|" "$client_dir"
-                    fi
-                fi
-            fi
+            # vless-ws 直连（无 TLS，path 为 /vless-ws，非 argo）
+            sed -i -E "s|(vless://[^#]*path=%2Fvless-ws[^#]*)#.*|\1#${prefix}-vless-ws|" "$client_dir"
+            sed -i -E "s|(vless://[^#]*path=/vless-ws[^#]*)#.*|\1#${prefix}-vless-ws|" "$client_dir"
+
+            # Reality（含 flow=xtls-rprx-vision）
+            sed -i -E "s|(vless://[^#]*flow=xtls-rprx-vision[^#]*)#.*|\1#${prefix}-vless-reality|" "$client_dir"
+
+            # 更新全部 vmess 的 ps 字段
+            local _vm_line _vm_enc _vm_dec _vm_upd _vm_new
+            while IFS= read -r _vm_line; do
+                [ -z "$_vm_line" ] && continue
+                _vm_enc="${_vm_line#vmess://}"
+                _vm_dec=$(echo "$_vm_enc" | base64 -d 2>/dev/null || echo "$_vm_enc" | base64 --decode 2>/dev/null) || continue
+                _vm_upd=$(echo "$_vm_dec" | jq --arg ps "${prefix}-argo-vmess" '.ps = $ps' 2>/dev/null) || continue
+                [ -z "$_vm_upd" ] && continue
+                _vm_new=$(echo "$_vm_upd" | base64 -w0 2>/dev/null || echo "$_vm_upd" | base64 | tr -d '\n')
+                sed -i "s|${_vm_line}|vmess://${_vm_new}|" "$client_dir"
+            done < <(grep -o 'vmess://[^[:space:]]*' "$client_dir" 2>/dev/null || true)
 
             refresh_sub
             green "\n节点前缀已更新，可复制以下节点或更新订阅\n"
@@ -2941,15 +3025,20 @@ manage_argo() {
             reading "请输入 Argo 入口端口 (当前: ${current_argo_port}，回车保持): " input_port
             if [ -n "$input_port" ]; then
                 if [[ "$input_port" =~ ^[0-9]+$ ]] && [ "$input_port" -ge 1 ] && [ "$input_port" -le 65535 ]; then
-                    ARGO_PORT="$input_port"
-                    export ARGO_PORT
-                    if [ -f /etc/nginx/conf.d/argo-ws.conf ]; then
-                        sed -i "s/listen [0-9]\+;/listen ${ARGO_PORT};/g" /etc/nginx/conf.d/argo-ws.conf
-                        sed -i "s/listen \[::\]:[0-9]\+;/listen [::]:${ARGO_PORT};/g" /etc/nginx/conf.d/argo-ws.conf
-                        nginx -t >/dev/null 2>&1 && nginx -s reload >/dev/null 2>&1 || restart_nginx >/dev/null 2>&1
+                    if port_in_use "$input_port"; then
+                        red "端口 ${input_port} 已被占用，保持 ${current_argo_port}"
+                        ARGO_PORT="$current_argo_port"
+                    else
+                        ARGO_PORT="$input_port"
+                        export ARGO_PORT
+                        if [ -f /etc/nginx/conf.d/argo-ws.conf ]; then
+                            sed -i "s/listen [0-9]\+;/listen ${ARGO_PORT};/g" /etc/nginx/conf.d/argo-ws.conf
+                            sed -i "s/listen \[::\]:[0-9]\+;/listen [::]:${ARGO_PORT};/g" /etc/nginx/conf.d/argo-ws.conf
+                            nginx -t >/dev/null 2>&1 && nginx -s reload >/dev/null 2>&1 || restart_nginx >/dev/null 2>&1
+                        fi
+                        allow_port ${ARGO_PORT}/tcp >/dev/null 2>&1
+                        green "Argo 入口端口已更新为: ${purple}${ARGO_PORT}${re}"
                     fi
-                    allow_port ${ARGO_PORT}/tcp >/dev/null 2>&1
-                    green "Argo 入口端口已更新为: ${purple}${ARGO_PORT}${re}"
                 else
                     red "端口无效，保持 ${current_argo_port}"
                     ARGO_PORT="$current_argo_port"
@@ -3006,16 +3095,25 @@ get_quick_tunnel() {
     restart_argo
     yellow "获取临时argo域名中，请稍等...\n"
     sleep 3
-    if [ -f /etc/sing-box/argo.log ]; then
-        for i in {1..5}; do
-            purple "第 $i 次尝试获取ArgoDoamin中..."
-            get_argodomain=$(sed -n 's|.*https://\([^/]*trycloudflare\.com\).*|\1|p' "/etc/sing-box/argo.log")
-            [ -n "$get_argodomain" ] && break
-            sleep 2
-        done
-    else
-        restart_argo; sleep 6
-        get_argodomain=$(sed -n 's|.*https://\([^/]*trycloudflare\.com\).*|\1|p' "/etc/sing-box/argo.log")
+    get_argodomain=""
+    local i
+    for i in $(seq 1 15); do
+        purple "第 $i/15 次尝试获取 ArgoDomain..."
+        if [ -f "${work_dir}/argo.log" ]; then
+            get_argodomain=$(sed -n 's|.*https://\([^/]*trycloudflare\.com\).*|\1|p' "${work_dir}/argo.log" | head -1)
+            [ -z "$get_argodomain" ] && get_argodomain=$(grep -oE '[[:alnum:]+\.-]+\.trycloudflare\.com' "${work_dir}/argo.log" 2>/dev/null | head -1)
+        fi
+        [ -n "$get_argodomain" ] && break
+        if [ "$i" -eq 5 ]; then
+            yellow "仍未获取到，尝试再次重启 Argo..."
+            restart_argo >/dev/null 2>&1 || true
+        fi
+        sleep 2
+    done
+    if [ -z "$get_argodomain" ]; then
+        red "未能获取临时 Argo 域名，请稍后重试或改用固定隧道"
+        ArgoDomain=""
+        return 1
     fi
     green "ArgoDomain：${purple}$get_argodomain${re}\n"
     ArgoDomain=$get_argodomain
@@ -3027,48 +3125,91 @@ change_argo_domain() {
         red "ArgoDomain 为空，无法更新节点"
         return 1
     fi
+    # 节点文件不存在时创建空文件，便于后续补写 Argo 节点
     if [ ! -f "$client_dir" ]; then
-        red "节点文件不存在: $client_dir"
-        return 1
+        mkdir -p "$(dirname "$client_dir")"
+        : > "$client_dir"
+        yellow "节点文件不存在，已新建: $client_dir"
     fi
 
     content=$(cat "$client_dir")
 
-    # 1. 更新 vmess（host 与 sni）
-    vmess_url=$(grep -o 'vmess://[^[:space:]]*' "$client_dir" | head -1)
-    if [ -n "$vmess_url" ]; then
-        encoded_vmess="${vmess_url#vmess://}"
-        decoded_vmess=$(echo "$encoded_vmess" | base64 --decode 2>/dev/null)
-        if [ -n "$decoded_vmess" ]; then
-            updated_vmess=$(echo "$decoded_vmess" | jq --arg d "$ArgoDomain" '.host = $d | .sni = $d' 2>/dev/null)
-            if [ -n "$updated_vmess" ]; then
-                encoded_updated=$(echo "$updated_vmess" | base64 -w0 2>/dev/null || echo "$updated_vmess" | base64 | tr -d '\n')
-                new_vmess_url="vmess://${encoded_updated}"
-                content=$(echo "$content" | sed "s|$vmess_url|$new_vmess_url|")
-                green "vmess 节点已更新"
+    # ---- 解析 uuid / 前缀 / 优选，用于缺失时补建 ----
+    local _uuid _isp _prefix _cfip _cfport
+    _uuid=$(jq -r '.inbounds[] | select(.users != null) | .users[]? | select(.uuid != null) | .uuid' "${conf_dir}/inbounds.json" 2>/dev/null | head -1)
+    [ -z "$_uuid" ] && _uuid=$(jq -r '.inbounds[] | select(.users != null) | .users[]? | select(.password != null) | .password' "${conf_dir}/inbounds.json" 2>/dev/null | head -1)
+    [ -z "$_uuid" ] && _uuid="${uuid:-}"
+    _isp=$(get_isp "node" 2>/dev/null || echo "node")
+    if [ -z "${node_prefix:-}" ]; then
+        _prefix="$_isp"
+    else
+        _prefix="${node_prefix}-${_isp}"
+    fi
+    _cfip="${CFIP:-cdns.doon.eu.org}"
+    _cfport="${CFPORT:-443}"
+
+    # 1. 更新已有全部 vmess 的 host/sni
+    local _vm_line _vm_enc _vm_dec _vm_upd _vm_new _vm_updated=0
+    while IFS= read -r _vm_line; do
+        [ -z "$_vm_line" ] && continue
+        _vm_enc="${_vm_line#vmess://}"
+        _vm_dec=$(echo "$_vm_enc" | base64 --decode 2>/dev/null) || continue
+        _vm_upd=$(echo "$_vm_dec" | jq --arg d "$ArgoDomain" '.host = $d | .sni = $d' 2>/dev/null) || continue
+        [ -z "$_vm_upd" ] && continue
+        _vm_new=$(echo "$_vm_upd" | base64 -w0 2>/dev/null || echo "$_vm_upd" | base64 | tr -d '\n')
+        content=$(echo "$content" | sed "s|${_vm_line}|vmess://${_vm_new}|")
+        _vm_updated=1
+    done < <(grep -o 'vmess://[^[:space:]]*' "$client_dir" 2>/dev/null || true)
+    [ "$_vm_updated" = "1" ] && green "vmess 节点已更新"
+
+    # 2. 更新已有 vless-argo（按 path 限定行）
+    if echo "$content" | grep -qE 'path=%2Fvless-argo|path=/vless-argo'; then
+        content=$(echo "$content" | sed -E "/path=%2Fvless-argo|path=\\/vless-argo/ s#(sni=)[^&[:space:]#]+#\\1${ArgoDomain}#g")
+        content=$(echo "$content" | sed -E "/path=%2Fvless-argo|path=\\/vless-argo/ s#(host=)[^&[:space:]#]+#\\1${ArgoDomain}#g")
+        green "vless-argo 节点已更新"
+    fi
+
+    # 3. 更新已有 trojan-argo
+    if echo "$content" | grep -qE 'path=%2Ftrojan-argo|path=/trojan-argo'; then
+        content=$(echo "$content" | sed -E "/path=%2Ftrojan-argo|path=\\/trojan-argo/ s#(sni=)[^&[:space:]#]+#\\1${ArgoDomain}#g")
+        content=$(echo "$content" | sed -E "/path=%2Ftrojan-argo|path=\\/trojan-argo/ s#(host=)[^&[:space:]#]+#\\1${ArgoDomain}#g")
+        green "trojan-argo 节点已更新"
+    fi
+
+    # 4. 缺失则补建（安装时域名超时跳过写入后的补救路径）
+    if [ -n "$_uuid" ]; then
+        if ! echo "$content" | grep -q 'vmess://'; then
+            local _vmess_json _vmess_b64
+            _vmess_json=$(jq -nc \
+                --arg ps "${_prefix}-argo-vmess" \
+                --arg add "$_cfip" \
+                --argjson port "$(printf '%s' "$_cfport" | grep -E '^[0-9]+$' || echo 443)" \
+                --arg id "$_uuid" \
+                --arg host "$ArgoDomain" \
+                --arg sni "$ArgoDomain" \
+                '{v:"2",ps:$ps,add:$add,port:($port|tostring),id:$id,aid:"0",scy:"auto",net:"ws",type:"none",host:$host,path:"/vmess-argo?ed=2560",tls:"tls",sni:$sni,alpn:"",fp:"firefox",allowInsecure:"false"}' 2>/dev/null)
+            if [ -n "$_vmess_json" ]; then
+                _vmess_b64=$(echo "$_vmess_json" | base64 -w0 2>/dev/null || echo "$_vmess_json" | base64 | tr -d '\n')
+                content="${content}"$'\n'"vmess://${_vmess_b64}"
+                green "已补建 vmess-argo 节点"
             fi
         fi
+        if ! echo "$content" | grep -qE 'path=%2Fvless-argo|path=/vless-argo'; then
+            content="${content}"$'\n'"vless://${_uuid}@${_cfip}:${_cfport}?encryption=none&security=tls&sni=${ArgoDomain}&fp=firefox&type=ws&host=${ArgoDomain}&path=%2Fvless-argo%3Fed%3D2560#${_prefix}-argo-vless"
+            green "已补建 vless-argo 节点"
+        fi
+        if ! echo "$content" | grep -qE 'path=%2Ftrojan-argo|path=/trojan-argo'; then
+            content="${content}"$'\n'"trojan://${_uuid}@${_cfip}:${_cfport}?security=tls&sni=${ArgoDomain}&fp=firefox&type=ws&host=${ArgoDomain}&path=%2Ftrojan-argo%3Fed%3D2560#${_prefix}-argo-trojan"
+            green "已补建 trojan-argo 节点"
+        fi
+    else
+        yellow "未能从配置读取 UUID，若 Argo 节点仍缺失请重新安装或手动补全"
     fi
 
-    # 2. 更新 vless-ws 隧道节点（sni= 与 host=）
-    if echo "$content" | grep -qE 'path=%2Fvless-argo|path=/vless-argo'; then
-        content=$(echo "$content" | sed -E "s#(vless://[^[:space:]#]*[?&]sni=)[^&[:space:]#]+#\1${ArgoDomain}#g")
-        content=$(echo "$content" | sed -E "s#(vless://[^[:space:]#]*[?&]host=)[^&[:space:]#]+#\1${ArgoDomain}#g")
-        green "vless-ws 隧道节点已更新"
-    fi
-
-    # 3. 更新 trojan-ws 隧道节点（sni= 与 host=）
-    if echo "$content" | grep -qE 'path=%2Ftrojan-argo|path=/trojan-argo'; then
-        content=$(echo "$content" | sed -E "s#(trojan://[^[:space:]#]*[?&]sni=)[^&[:space:]#]+#\1${ArgoDomain}#g")
-        content=$(echo "$content" | sed -E "s#(trojan://[^[:space:]#]*[?&]host=)[^&[:space:]#]+#\1${ArgoDomain}#g")
-        green "trojan-ws 隧道节点已更新"
-    fi
-
-    # 写回文件并刷新订阅
-    echo "$content" > "$client_dir"
+    # 清理多余空行后写回
+    echo "$content" | sed '/^$/N;/^\n$/D' > "$client_dir"
     refresh_sub
 
-    # 输出全部更新后的节点
     echo ""
     green "=== 更新后的节点信息 ===\n"
     while IFS= read -r line; do
@@ -3077,11 +3218,44 @@ change_argo_domain() {
     done < "$client_dir"
     echo ""
 
-    # Argo 域名变更后推送节点信息到 Telegram
     send_tg_nodes 2>/dev/null || true
 }
 
 # 查看当前节点信息（仅打印节点链接）
+
+
+# 主菜单 5：节点信息 / Nginx 管理 子菜单
+menu_nodes_nginx() {
+    while true; do
+        clear; echo ""
+        green "=== 节点信息 / Nginx 管理 ===\n"
+        green "1. 查看节点信息"
+        skyblue "------------"
+        green "2. Nginx管理"
+        skyblue "----------"
+        purple "0. 返回主菜单"
+        skyblue "-----------"
+        reading "\n请输入选择: " sub_choice
+        echo ""
+        case "${sub_choice}" in
+            1)
+                check_nodes
+                echo ""
+                read -n 1 -s -r -p $'\033[1;91m按任意键继续...\033[0m'
+                ;;
+            2)
+                manage_nginx
+                ;;
+            0)
+                return
+                ;;
+            *)
+                red "无效选项"
+                sleep 1
+                ;;
+        esac
+    done
+}
 
 # ---------- Nginx 管理 ----------
 _load_argo_port_for_nginx() {
@@ -3183,11 +3357,13 @@ manage_nginx() {
                 ;;
             7)
                 _load_argo_port_for_nginx
-                reading "请输入新的 Argo 入口端口 (当前 ${ARGO_PORT}): " new_ap
+                reading "请输入新的 Argo 入口端口 (当前 ${ARGO_PORT}，回车取消): " new_ap
                 if [ -z "$new_ap" ]; then
                     yellow "已取消"
                 elif ! [[ "$new_ap" =~ ^[0-9]+$ ]] || [ "$new_ap" -lt 1 ] || [ "$new_ap" -gt 65535 ]; then
                     red "端口无效"
+                elif port_in_use "$new_ap"; then
+                    red "端口 ${new_ap} 已被占用"
                 else
                     ARGO_PORT="$new_ap"
                     export ARGO_PORT
@@ -3200,7 +3376,21 @@ manage_nginx() {
                     allow_port ${ARGO_PORT}/tcp >/dev/null 2>&1
                     if nginx -t 2>/dev/null; then
                         restart_nginx
-                        green "Argo 入口端口已更新为 ${purple}${ARGO_PORT}${re}"
+                        # 持久化并同步 cloudflared 指向新端口（与 change_config 一致）
+                        if [ -f "${work_dir}/argo_fixed.conf" ]; then
+                            if grep -q '^ARGO_PORT=' "${work_dir}/argo_fixed.conf" 2>/dev/null; then
+                                sed -i "s/^ARGO_PORT=.*/ARGO_PORT=\"${ARGO_PORT}\"/" "${work_dir}/argo_fixed.conf"
+                            else
+                                echo "ARGO_PORT=\"${ARGO_PORT}\"" >> "${work_dir}/argo_fixed.conf"
+                            fi
+                        fi
+                        rewrite_argo_service
+                        restart_argo
+                        sleep 2
+                        if [ -f "${work_dir}/argo-start.sh" ] && grep -q -- '--url http://localhost' "${work_dir}/argo-start.sh" 2>/dev/null; then
+                            get_quick_tunnel && change_argo_domain
+                        fi
+                        green "Argo 入口端口已更新为 ${purple}${ARGO_PORT}${re}（Nginx + Argo 隧道已同步）"
                     else
                         red "配置检测失败"
                         nginx -t
@@ -3260,18 +3450,26 @@ change_cfip() {
             ;;
     esac
 
-    content=$(cat "$client_dir")
-    vmess_url=$(grep -o 'vmess://[^ ]*' "$client_dir")
-    encoded_part="${vmess_url#vmess://}"
-    decoded_json=$(echo "$encoded_part" | base64 --decode 2>/dev/null)
-    updated_json=$(echo "$decoded_json" | jq --arg cfip "$cfip" --argjson cfport "$cfport" '.add = $cfip | .port = $cfport')
-    new_encoded_part=$(echo "$updated_json" | base64 -w0)
-    new_vmess_url="vmess://$new_encoded_part"
-    new_content=$(echo "$content" | sed "s|$vmess_url|$new_vmess_url|")
-    echo "$new_content" > "$client_dir"
+    # 更新全部 vmess 的 add/port
+    local _vm_line _vm_enc _vm_dec _vm_upd _vm_new _count=0
+    while IFS= read -r _vm_line; do
+        [ -z "$_vm_line" ] && continue
+        _vm_enc="${_vm_line#vmess://}"
+        _vm_dec=$(echo "$_vm_enc" | base64 --decode 2>/dev/null) || continue
+        _vm_upd=$(echo "$_vm_dec" | jq --arg cfip "$cfip" --argjson cfport "$cfport" '.add = $cfip | .port = ($cfport|tonumber)' 2>/dev/null) || continue
+        [ -z "$_vm_upd" ] && continue
+        _vm_new=$(echo "$_vm_upd" | base64 -w0 2>/dev/null || echo "$_vm_upd" | base64 | tr -d '\n')
+        sed -i "s|${_vm_line}|vmess://${_vm_new}|" "$client_dir"
+        _count=$((_count + 1))
+    done < <(grep -o 'vmess://[^[:space:]]*' "$client_dir" 2>/dev/null || true)
+
+    # 同步更新 argo 的 vless/trojan 节点中的 CFIP:CFPORT（仅 argo path 行）
+    sed -i -E "/path=%2Fvless-argo|path=\/vless-argo/ s#@[^:?]+(:[0-9]+)?\?#@${cfip}:${cfport}?#" "$client_dir" 2>/dev/null || true
+    sed -i -E "/path=%2Ftrojan-argo|path=\/trojan-argo/ s#@[^:?]+(:[0-9]+)?\?#@${cfip}:${cfport}?#" "$client_dir" 2>/dev/null || true
+
+    export CFIP="$cfip" CFPORT="$cfport"
     refresh_sub
-    green "\nvmess节点优选域名已更新为：${purple}${cfip}:${cfport}${re}\n"
-    purple "$new_vmess_url\n"
+    green "\n优选域名已更新为：${purple}${cfip}:${cfport}${re}（vmess 更新 ${_count} 条）\n"
 }
 
 # WARP 分流管理
@@ -3384,16 +3582,21 @@ add_rule_menu() {
         selected_out="${out_tags[$((out_choice-1))]}"
     fi
 
+    # 复用已有出站时：仅原地追加 rule_set，其它出站规则必须保留
     jq --arg tag "$rule_tag" --arg out "$selected_out" '
         if (.route.rules | length) == 0 then
             .route.rules = [{"rule_set": [$tag], "outbound": $out}]
+        elif any(.route.rules[]; .outbound == $out) then
+            .route.rules = [
+                .route.rules[] |
+                if .outbound == $out then
+                    .rule_set = ((.rule_set // []) + [$tag] | unique)
+                else
+                    .
+                end
+            ]
         else
-            (first(.route.rules[] | select(.outbound == $out)) | .rule_set) as $existing
-            | if $existing then
-                .route.rules = [.route.rules[] | select(.outbound == $out).rule_set += [$tag]]
-              else
-                .route.rules += [{"rule_set": [$tag], "outbound": $out}]
-              end
+            .route.rules += [{"rule_set": [$tag], "outbound": $out}]
         end
     ' "$route_file" > "${route_file}.tmp" && mv "${route_file}.tmp" "$route_file"
 
@@ -3429,10 +3632,24 @@ set_global_outbound() {
     fi
     local selected_out="${proxy_tags[$((out_choice-1))]}"
 
-    # 从 outbounds.json 中删除 direct 出站，防止流量绕过代理
+    # 将路由 final 设为所选代理，并暂时移除 direct，避免流量绕过
+    # 保留 route.json / endpoints.json，避免后续分流菜单操作已删除文件
     jq 'del(.outbounds[] | select(.tag == "direct"))' \
         "$outbound_file" > "${outbound_file}.tmp" && mv "${outbound_file}.tmp" "$outbound_file"
-    rm -rf ${route_file} ${conf_dir}/endpoints.json
+    if [ -f "$route_file" ]; then
+        jq --arg out "$selected_out" '.route.final = $out' \
+            "$route_file" > "${route_file}.tmp" && mv "${route_file}.tmp" "$route_file"
+    else
+        # 若 route 已不存在，写入最小可用配置
+        cat > "$route_file" << EOF
+{
+  "route": {
+    "rules": [],
+    "final": "${selected_out}"
+  }
+}
+EOF
+    fi
     restart_singbox
     green "\n已设置全局代理出站：${purple}${selected_out}${re}"
     yellow "所有流量将通过 ${selected_out} 转发，如需恢复请选择「恢复服务器原IP出站」\n"
@@ -4016,8 +4233,7 @@ menu() {
     green "3. sing-box管理"
     green "4. Argo隧道管理"
     echo "==============="
-    green "5.1 查看节点信息"
-    green "5.2 Nginx管理"
+    green "5. 节点信息 / Nginx管理"
     green "6. 修改节点配置"
     green "7. 查看节点文件说明"
     green "8. WARP分流管理"
@@ -4038,8 +4254,12 @@ trap 'red "\n强制退出"; exit' INT
 # ---- 参数解析入口 ----
 case "$1" in
     -i | --install)
-        auto_install
-        exit 0
+        if [ "${2:-}" = "--force" ] || [ "${2:-}" = "-f" ]; then
+            auto_install 1
+        else
+            auto_install 0
+        fi
+        exit $?
         ;;
     -u | --uninstall)
         auto_uninstall
@@ -4058,11 +4278,12 @@ case "$1" in
         echo ""
         green "用法: [sb或脚本] [参数], 示例: sb -c"
         echo ""
-        green "  -i, --install     无交互安装 sing-box"
-        green "  -c, --check       查看节点信息（url.txt）"
-        green "  -r, --restart     重新获取 Argo 临时隧道并更新节点"
-        green "  -u, --uninstall   无交互卸载 sing-box（含 nginx）"
-        green "  -h, --help        显示此帮助信息"
+        green "  -i, --install          无交互安装 sing-box（已安装则退出码 1）"
+        green "  -i --force, -i -f     强制重装（先卸载再安装）"
+        green "  -c, --check            查看节点信息（url.txt）"
+        green "  -r, --restart          重新获取 Argo 临时隧道并更新节点"
+        green "  -u, --uninstall        无交互卸载 sing-box（含 nginx）"
+        green "  -h, --help             显示此帮助信息"
         echo ""
         green "  不带参数          进入交互式主菜单"
         echo ""
@@ -4076,7 +4297,7 @@ case "$1" in
         # 无参数：进入交互式主菜单
         while true; do
             menu
-            reading "请输入选择(0-11 / 5.1 / 5.2): " choice
+            reading "请输入选择(0-11): " choice
             echo ""
             need_pause=true
             case "${choice}" in
@@ -4097,7 +4318,7 @@ case "$1" in
                         else
                             echo "Unsupported init system"; exit 1
                         fi
-                        sleep 5
+                        sleep 3
                         get_info
                         add_nginx_conf
                         create_shortcut
@@ -4114,12 +4335,8 @@ case "$1" in
                 2)  uninstall_singbox;  need_pause=false ;;
                 3)  manage_singbox;     need_pause=false ;;
                 4)  manage_argo;        need_pause=true ;;
-                5|5.1)
-                    check_nodes
-                    need_pause=true
-                    ;;
-                5.2)
-                    manage_nginx
+                5)
+                    menu_nodes_nginx
                     need_pause=false
                     ;;
                 6)  change_config;      need_pause=true ;;
