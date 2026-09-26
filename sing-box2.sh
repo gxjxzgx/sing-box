@@ -28,7 +28,7 @@
 #  12. 移除主菜单「Nginx管理」（Nginx 仍由安装/Argo 自动配置，状态仅展示）
 #
 # 基于: eooce/sing-box  修改日期: 2026.9.22
-# 版本: v2.4.2 (修复 getpwnam nginx 用户；空端口 y 随机/n 跳过直连)
+# 版本: v2.4.3 (补全 mime.types；杜绝 nginx 假成功提示)
 # =========================
 
 export LANG=en_US.UTF-8
@@ -1522,6 +1522,9 @@ add_nginx_conf() {
         pkill -x nginx > /dev/null 2>&1 || pkill nginx > /dev/null 2>&1
     fi
 
+    # 先补全运行时依赖（mime.types / 用户 / 目录），再写站点配置
+    _ensure_nginx_ready
+
     mkdir -p /etc/nginx/conf.d /var/log/nginx /run
     # 避免 Debian/Ubuntu 默认站点与 Argo 入口端口冲突
     if [ -L /etc/nginx/sites-enabled/default ]; then
@@ -1615,8 +1618,8 @@ EOF
         _write_minimal_nginx_conf
     fi
 
-    # 修复 user 指令（系统无 nginx 用户时 getpwnam 会失败）
-    _fix_nginx_user_directive /etc/nginx/nginx.conf
+    # 补全 mime.types / 用户 / 目录（精简系统常见缺失）
+    _ensure_nginx_ready
 
     local nginx_test_out
     nginx_test_out=$(nginx -t 2>&1)
@@ -1654,7 +1657,7 @@ EOF
                 fi
             fi
         fi
-        _fix_nginx_user_directive /etc/nginx/nginx.conf
+        _ensure_nginx_ready
         nginx_test_out=$(nginx -t 2>&1)
         nginx_test_rc=$?
         if [ $nginx_test_rc -eq 0 ]; then
@@ -1690,6 +1693,66 @@ _resolve_nginx_user() {
     echo "root"
 }
 
+_ensure_nginx_mime_types() {
+    # 部分精简系统安装 nginx 后缺少 mime.types，导致 nginx -t 失败
+    mkdir -p /etc/nginx /var/log/nginx /run /var/lib/nginx /var/cache/nginx
+    if [ -f /etc/nginx/mime.types ] && [ -s /etc/nginx/mime.types ]; then
+        return 0
+    fi
+    # 尝试从常见路径复制
+    local src
+    for src in /usr/share/nginx/mime.types /etc/mime.types /usr/local/nginx/conf/mime.types; do
+        if [ -f "$src" ] && [ -s "$src" ]; then
+            cp -f "$src" /etc/nginx/mime.types
+            return 0
+        fi
+    done
+    # 写入精简 mime.types（满足 -t 与 WebSocket 代理即可）
+    cat > /etc/nginx/mime.types << 'MIMEOF'
+types {
+    text/html                                        html htm shtml;
+    text/css                                         css;
+    text/xml                                         xml;
+    image/gif                                        gif;
+    image/jpeg                                       jpeg jpg;
+    application/javascript                           js;
+    application/json                                 json;
+    application/octet-stream                         bin exe dmg;
+    application/pdf                                  pdf;
+    application/xhtml+xml                            xhtml;
+    application/xml                                  xsl;
+    application/zip                                  zip;
+    application/x-rar-compressed                     rar;
+    audio/mpeg                                       mp3;
+    video/mp4                                        mp4;
+    image/png                                        png;
+    image/svg+xml                                    svg svgz;
+    image/webp                                       webp;
+    image/x-icon                                     ico;
+    text/plain                                       txt;
+    text/event-stream                                event-stream;
+}
+MIMEOF
+    yellow "已自动补全缺失的 /etc/nginx/mime.types"
+}
+
+_ensure_nginx_ready() {
+    # 统一在 nginx -t / 启动前调用：用户、mime.types、目录
+    mkdir -p /etc/nginx/conf.d /var/log/nginx /run /var/lib/nginx /var/cache/nginx
+    _ensure_nginx_mime_types
+    if [ -f /etc/nginx/nginx.conf ]; then
+        _fix_nginx_user_directive /etc/nginx/nginx.conf
+    fi
+    # 若主配置仍引用不存在的文件，尽量消除致命 include
+    if [ -f /etc/nginx/nginx.conf ]; then
+        # modules 目录不存在时注释掉 modules include，避免次要失败
+        if grep -qE 'include[[:space:]]+/etc/nginx/modules-enabled' /etc/nginx/nginx.conf \
+            && [ ! -d /etc/nginx/modules-enabled ]; then
+            sed -i -E 's|^([[:space:]]*include[[:space:]]+/etc/nginx/modules-enabled/.*)|# \1|' /etc/nginx/nginx.conf
+        fi
+    fi
+}
+
 _fix_nginx_user_directive() {
     # 修正 nginx.conf 中的 user 行；无 user 行则在文件首行附近插入
     local conf="${1:-/etc/nginx/nginx.conf}"
@@ -1701,9 +1764,7 @@ _fix_nginx_user_directive() {
     else
         sed -i "1i user ${nginx_user};" "$conf"
     fi
-    # 确保运行时目录存在
     mkdir -p /var/log/nginx /run
-    # 若用户不存在则创建（极少见，_resolve 已兜底 root）
     if ! id "$nginx_user" >/dev/null 2>&1; then
         if command_exists useradd; then
             useradd -r -s /sbin/nologin "$nginx_user" 2>/dev/null || true
@@ -1716,7 +1777,8 @@ _fix_nginx_user_directive() {
 _write_minimal_nginx_conf() {
     local nginx_user
     nginx_user=$(_resolve_nginx_user)
-    mkdir -p /var/log/nginx /run
+    _ensure_nginx_mime_types
+    mkdir -p /var/log/nginx /run /etc/nginx/conf.d
     cat > /etc/nginx/nginx.conf << EOF
 user ${nginx_user};
 worker_processes auto;
@@ -1871,7 +1933,7 @@ manage_service() {
             elif command_exists systemctl; then
                 systemctl daemon-reload >/dev/null 2>&1
                 if [ "$service_name" = "nginx" ]; then
-                    _fix_nginx_user_directive /etc/nginx/nginx.conf 2>/dev/null || true
+                    _ensure_nginx_ready 2>/dev/null || true
                 fi
                 systemctl start "$service_name" 2>/tmp/sb-svc-start.err
                 local start_rc=$?
@@ -1886,22 +1948,22 @@ manage_service() {
             sleep 1
             local ok=0
             if [ "$service_name" = "nginx" ] && command_exists systemctl; then
-                systemctl is-active --quiet nginx 2>/dev/null && ok=1
-            fi
-            if [ "$ok" -eq 0 ]; then
-                if pgrep -x nginx >/dev/null 2>&1 && [ "$service_name" = "nginx" ]; then
+                # 仅以 systemd 状态为准，避免残留进程导致假成功
+                if systemctl is-active --quiet nginx 2>/dev/null; then
                     ok=1
-                elif pgrep -f "${service_file}" >/dev/null 2>&1 || [[ "$(check_service "$service_name" "$service_file" 2>/dev/null)" == *"running"* ]]; then
-                    ok=1
+                else
+                    ok=0
                 fi
+            elif pgrep -f "${service_file}" >/dev/null 2>&1 || [[ "$(check_service "$service_name" "$service_file" 2>/dev/null)" == *"running"* ]]; then
+                ok=1
             fi
             if [ "$ok" -eq 1 ]; then
                 green "${service_name} 服务已成功重启\n"
                 return 0
             else
                 red "${service_name} 服务重启失败\n"
-                if [ "$service_name" = "nginx" ] && command_exists systemctl; then
-                    yellow "请查看: systemctl status nginx.service ; journalctl -xeu nginx.service"
+                if [ "$service_name" = "nginx" ]; then
+                    yellow "请执行: nginx -t ; systemctl status nginx.service ; journalctl -xeu nginx.service"
                 fi
                 return 1
             fi
