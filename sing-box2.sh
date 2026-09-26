@@ -28,7 +28,7 @@
 #  12. 移除主菜单「Nginx管理」（Nginx 仍由安装/Argo 自动配置，状态仅展示）
 #
 # 基于: eooce/sing-box  修改日期: 2026.9.22
-# 版本: v2.5.4 (change_argo_domain 缺失时补建 Argo 节点; get_quick_tunnel 加长等待)
+# 版本: v2.5.5 (Alpine nginx: 避免双实例抢端口; 真实启停判定; 不再假成功)
 # =========================
 
 export LANG=en_US.UTF-8
@@ -238,7 +238,17 @@ check_argo() {
 # 检查nginx状态
 check_nginx() {
     command_exists nginx || { red "not installed"; return 2; }
-    check_service "nginx" "$(command -v nginx)"
+    # OpenRC/systemd 状态 + 二进制直启的 master 均视为 running
+    if command_exists rc-service && rc-service nginx status 2>/dev/null | grep -q started; then
+        green "running"; return 0
+    fi
+    if command_exists systemctl && systemctl is-active --quiet nginx 2>/dev/null; then
+        green "running"; return 0
+    fi
+    if pgrep -f 'nginx: master process' >/dev/null 2>&1 || pgrep -x nginx >/dev/null 2>&1; then
+        green "running"; return 0
+    fi
+    yellow "not running"; return 1
 }
 
 # 根据系统类型安装、卸载依赖
@@ -1719,31 +1729,10 @@ EOF
 
     green "nginx -t 检测通过"
 
-    # 启动：优先 systemctl，失败则直接 nginx 二进制拉起
-    if command_exists systemctl; then
-        systemctl reset-failed nginx 2>/dev/null || true
-        systemctl daemon-reload 2>/dev/null || true
-        systemctl enable nginx 2>/dev/null || true
-        systemctl start nginx 2>/tmp/sb-nginx-start.err
-        sleep 1
-        if systemctl is-active --quiet nginx 2>/dev/null; then
-            green "nginx 服务已启动 (systemctl)"
-            return 0
-        fi
-        [ -s /tmp/sb-nginx-start.err ] && cat /tmp/sb-nginx-start.err | while IFS= read -r l; do red "$l"; done
+    if _nginx_start; then
+        return 0
     fi
-
-    # 回退：直接用 nginx 主进程启动（不依赖 unit）
-    if nginx 2>/tmp/sb-nginx-bin.err; then
-        sleep 0.5
-        if pgrep -x nginx >/dev/null 2>&1; then
-            green "nginx 已通过二进制直接启动"
-            return 0
-        fi
-    fi
-    [ -s /tmp/sb-nginx-bin.err ] && cat /tmp/sb-nginx-bin.err | while IFS= read -r l; do red "$l"; done
-
-    red "nginx 启动失败。请执行: nginx -t ; journalctl -xeu nginx.service | tail -30"
+    red "nginx 启动失败。请执行: nginx -t ; ss -lntp | grep -E \":${ARGO_PORT:-8001} \" ; rc-service nginx status 2>/dev/null || systemctl status nginx"
     return 1
 }
 
@@ -1801,6 +1790,135 @@ get_current_uuid() {
 
 # 通用服务管理函数
 # 通用服务管理函数（已修复状态检测 + 强制清理残留进程）
+
+# ---------- Nginx 启停（Alpine OpenRC / systemd / 二进制统一）----------
+_nginx_is_running() {
+    # 以 master 进程为准，避免 pgrep 路径误匹配
+    pgrep -f 'nginx: master process' >/dev/null 2>&1 && return 0
+    pgrep -x nginx >/dev/null 2>&1 && return 0
+    return 1
+}
+
+_nginx_stop_all() {
+    # 先走服务管理器，再清理可能由「nginx 二进制直启」留下的进程
+    if command_exists rc-service; then
+        rc-service nginx stop >/dev/null 2>&1 || true
+    elif command_exists systemctl; then
+        systemctl stop nginx >/dev/null 2>&1 || true
+    fi
+    if command_exists nginx; then
+        nginx -s stop >/dev/null 2>&1 || true
+        nginx -s quit >/dev/null 2>&1 || true
+    fi
+    sleep 0.5
+    if _nginx_is_running; then
+        pkill -15 -f 'nginx: master process' 2>/dev/null || true
+        pkill -15 -x nginx 2>/dev/null || true
+        sleep 0.8
+    fi
+    if _nginx_is_running; then
+        pkill -9 -f 'nginx: master process' 2>/dev/null || true
+        pkill -9 -x nginx 2>/dev/null || true
+        sleep 0.3
+    fi
+    # 不再用 return 码表示失败，由调用方检查
+    return 0
+}
+
+_nginx_who_holds_port() {
+    local p="${1:-}"
+    [ -z "$p" ] && return 0
+    if command_exists ss; then
+        ss -lntp 2>/dev/null | grep -E ":${p}\\b" || true
+    elif command_exists lsof; then
+        lsof -i ":${p}" -sTCP:LISTEN 2>/dev/null || true
+    fi
+}
+
+_nginx_start() {
+    if ! command_exists nginx; then
+        red "nginx 未安装"
+        return 1
+    fi
+    if ! nginx -t >/dev/null 2>&1; then
+        red "nginx -t 失败，拒绝启动"
+        nginx -t
+        return 1
+    fi
+
+    # 若已在跑且可响应，视为成功
+    if _nginx_is_running; then
+        if nginx -s reload >/dev/null 2>&1; then
+            green "nginx 已在运行（已 reload）"
+            return 0
+        fi
+        # reload 失败则彻底停掉再启
+        _nginx_stop_all
+    fi
+
+    local port="${ARGO_PORT:-}"
+    if [ -z "$port" ] && [ -f /etc/nginx/conf.d/argo-ws.conf ]; then
+        port=$(grep -oE 'listen[[:space:]]+[0-9]+' /etc/nginx/conf.d/argo-ws.conf 2>/dev/null | head -1 | awk '{print $2}')
+    fi
+    port="${port:-8001}"
+
+    # 启动前确认端口空闲（排除将由本进程占用的情况：已无 nginx）
+    if command_exists ss && ss -lntp 2>/dev/null | grep -qE ":${port}\\b"; then
+        yellow "端口 ${port} 仍被占用，尝试释放 nginx 后重试..."
+        _nginx_stop_all
+        sleep 0.5
+        if ss -lntp 2>/dev/null | grep -qE ":${port}\\b"; then
+            red "端口 ${port} 仍被占用，占用进程如下："
+            _nginx_who_holds_port "$port" | while IFS= read -r l; do red "  $l"; done
+            return 1
+        fi
+    fi
+
+    local started=0
+    if command_exists rc-service; then
+        # Alpine：优先 OpenRC，避免「二进制直启」与 rc-service 双实例抢端口
+        rc-update add nginx default >/dev/null 2>&1 || true
+        if rc-service nginx start >/tmp/sb-nginx-start.err 2>&1; then
+            sleep 1
+            if rc-service nginx status 2>/dev/null | grep -q started && _nginx_is_running; then
+                started=1
+                green "nginx 服务已启动 (OpenRC)"
+            fi
+        fi
+    elif command_exists systemctl; then
+        systemctl reset-failed nginx 2>/dev/null || true
+        systemctl daemon-reload 2>/dev/null || true
+        systemctl enable nginx 2>/dev/null || true
+        if systemctl start nginx >/tmp/sb-nginx-start.err 2>&1; then
+            sleep 1
+            if systemctl is-active --quiet nginx 2>/dev/null; then
+                started=1
+                green "nginx 服务已启动 (systemctl)"
+            fi
+        fi
+    fi
+
+    if [ "$started" -eq 0 ]; then
+        # 回退二进制直启（仅当服务管理器不可用或失败且端口已空闲）
+        _nginx_stop_all
+        if nginx >/tmp/sb-nginx-bin.err 2>&1; then
+            sleep 0.5
+            if _nginx_is_running; then
+                started=1
+                green "nginx 已通过二进制直接启动"
+            fi
+        fi
+        [ -s /tmp/sb-nginx-bin.err ] && grep -q . /tmp/sb-nginx-bin.err && \
+            while IFS= read -r l; do [ -n "$l" ] && red "$l"; done < /tmp/sb-nginx-bin.err
+    fi
+
+    if [ "$started" -eq 1 ]; then
+        return 0
+    fi
+    [ -s /tmp/sb-nginx-start.err ] && while IFS= read -r l; do [ -n "$l" ] && red "$l"; done < /tmp/sb-nginx-start.err
+    return 1
+}
+
 manage_service() {
     local service_name="$1"
     local action="$2"
@@ -1842,20 +1960,29 @@ manage_service() {
             fi
 
             yellow "正在启动 ${service_name} 服务...\n"
+            if [ "$service_name" = "nginx" ]; then
+                if _nginx_start; then
+                    return 0
+                else
+                    red "nginx 服务启动失败\n"
+                    return 1
+                fi
+            fi
             if command_exists rc-service; then
                 rc-service "$service_name" start
             elif command_exists systemctl; then
-                # 清除可能的 failed 状态，解决停止后无法直接启动的问题
                 systemctl reset-failed "$service_name" 2>/dev/null
                 systemctl daemon-reload
                 systemctl start "$service_name"
             fi
 
             sleep 1
-            if pgrep -f "${service_file}" >/dev/null 2>&1 || [[ "$(check_service "$service_name" "$service_file" 2>/dev/null)" == *"running"* ]]; then
+            if [[ "$(check_service "$service_name" "$service_file" 2>/dev/null)" == *"running"* ]]; then
                 green "${service_name} 服务已成功启动\n"
+                return 0
             else
                 red "${service_name} 服务启动失败\n"
+                return 1
             fi
             ;;
 
@@ -1870,22 +1997,27 @@ manage_service() {
             fi
 
             yellow "正在停止 ${service_name} 服务...\n"
+            if [ "$service_name" = "nginx" ]; then
+                _nginx_stop_all
+                if _nginx_is_running; then
+                    red "nginx 停止失败，仍有进程残留\n"
+                    return 1
+                fi
+                green "nginx 服务已彻底停止\n"
+                return 0
+            fi
 
-            # 先正常停止
             if command_exists rc-service; then
                 rc-service "$service_name" stop
             elif command_exists systemctl; then
                 systemctl stop "$service_name"
             fi
-
             sleep 1
 
-            # 检查并强制清理残留进程
             local process_pattern=""
             case "$service_name" in
                 "sing-box") process_pattern="${work_dir}/sing-box" ;;
                 "argo")     process_pattern="${work_dir}/argo" ;;
-                "nginx")    process_pattern="nginx: master process" ;;
             esac
 
             if [ -n "$process_pattern" ] && pgrep -f "$process_pattern" >/dev/null 2>&1; then
@@ -1896,11 +2028,12 @@ manage_service() {
                 sleep 0.5
             fi
 
-            # 最终确认
             if [ -n "$process_pattern" ] && pgrep -f "$process_pattern" >/dev/null 2>&1; then
                 red "${service_name} 停止失败，仍有进程残留，请手动检查\n"
+                return 1
             else
                 green "${service_name} 服务已彻底停止\n"
+                return 0
             fi
             ;;
 
@@ -1911,52 +2044,38 @@ manage_service() {
             fi
 
             yellow "正在重启 ${service_name} 服务...\n"
+            if [ "$service_name" = "nginx" ]; then
+                _nginx_stop_all
+                sleep 0.5
+                if _nginx_start; then
+                    green "nginx 服务已成功重启\n"
+                    return 0
+                fi
+                red "nginx 服务重启失败\n"
+                yellow "请执行: nginx -t ; ss -lntp | head -30 ; rc-service nginx status 2>/dev/null || systemctl status nginx"
+                return 1
+            fi
 
-            # 先执行完整停止（含强制清理）
             manage_service "$service_name" "stop" >/dev/null 2>&1
-
             sleep 1
-
-            # 再启动
             if command_exists rc-service; then
                 rc-service "$service_name" start
             elif command_exists systemctl; then
                 systemctl daemon-reload >/dev/null 2>&1
-                if [ "$service_name" = "nginx" ]; then
-                    _ensure_nginx_ready 2>/dev/null || true
-                fi
                 systemctl start "$service_name" 2>/tmp/sb-svc-start.err
-                local start_rc=$?
-                if [ $start_rc -ne 0 ] && [ -s /tmp/sb-svc-start.err ]; then
-                    # 将 systemd 错误以红色显示，避免误报成功
+                if [ $? -ne 0 ] && [ -s /tmp/sb-svc-start.err ]; then
                     while IFS= read -r _eline; do
                         [ -n "$_eline" ] && red "$_eline"
                     done < /tmp/sb-svc-start.err
                 fi
             fi
-
             sleep 1
-            local ok=0
-            if [ "$service_name" = "nginx" ] && command_exists systemctl; then
-                # 仅以 systemd 状态为准，避免残留进程导致假成功
-                if systemctl is-active --quiet nginx 2>/dev/null; then
-                    ok=1
-                else
-                    ok=0
-                fi
-            elif pgrep -f "${service_file}" >/dev/null 2>&1 || [[ "$(check_service "$service_name" "$service_file" 2>/dev/null)" == *"running"* ]]; then
-                ok=1
-            fi
-            if [ "$ok" -eq 1 ]; then
+            if [[ "$(check_service "$service_name" "$service_file" 2>/dev/null)" == *"running"* ]]; then
                 green "${service_name} 服务已成功重启\n"
                 return 0
-            else
-                red "${service_name} 服务重启失败\n"
-                if [ "$service_name" = "nginx" ]; then
-                    yellow "请执行: nginx -t ; systemctl status nginx.service ; journalctl -xeu nginx.service"
-                fi
-                return 1
             fi
+            red "${service_name} 服务重启失败\n"
+            return 1
             ;;
 
         *)
