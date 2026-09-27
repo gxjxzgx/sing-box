@@ -28,7 +28,7 @@
 #  12. 移除主菜单「Nginx管理」（Nginx 仍由安装/Argo 自动配置，状态仅展示）
 #
 # 基于: eooce/sing-box  修改日期: 2026.9.22
-# 版本: v2.5.4 (change_argo_domain 缺失时补建 Argo 节点; get_quick_tunnel 加长等待)
+# 版本: v2.5.8 (port_in_use 恢复 UDP 检测; TCP 仍仅认 EADDRINUSE)
 # =========================
 
 export LANG=en_US.UTF-8
@@ -125,53 +125,92 @@ port_in_use() {
     command_exists python3 && py=python3
     [ -z "$py" ] && command_exists python && py=python
 
-    # 方法1：实际 bind（最可靠；有 python 时优先）
+    # 方法1：TCP + UDP 实际 bind。仅 EADDRINUSE 视为占用
     if [ -n "$py" ]; then
-        if $py -c "
-import socket, sys
+        $py -c "
+import socket, sys, errno
 p = int(sys.argv[1])
-try:
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    s.bind(('0.0.0.0', p))
-    s.close()
-    sys.exit(1)
-except Exception:
-    sys.exit(0)
-" "$port" 2>/dev/null; then
+in_use = False
+eaddr = (getattr(errno, 'EADDRINUSE', 98), getattr(errno, 'WSAEADDRINUSE', 10048))
+for fam, addr in ((socket.AF_INET, '0.0.0.0'), (socket.AF_INET6, '::')):
+    for sock_type in (socket.SOCK_STREAM, socket.SOCK_DGRAM):
+        try:
+            s = socket.socket(fam, sock_type)
+            try:
+                if fam == socket.AF_INET6:
+                    s.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+            except Exception:
+                pass
+            s.bind((addr, p))
+            s.close()
+        except OSError as e:
+            if e.errno in eaddr:
+                in_use = True
+                break
+        except Exception:
+            pass
+    if in_use:
+        break
+sys.exit(0 if in_use else 1)
+" "$port" 2>/dev/null
+        local py_rc=$?
+        if [ "$py_rc" -eq 0 ]; then
             return 0
-        else
+        elif [ "$py_rc" -eq 1 ]; then
             return 1
         fi
     fi
 
-    # 方法2：/proc/net 只比较 local_address 端口（第2列末段），不扫整行
+    # 方法2：/proc/net — TCP 仅 LISTEN(0A)；UDP 有记录即占用（无 LISTEN 状态位）
     local hex
     hex=$(printf '%04X' "$port" 2>/dev/null) || hex=""
-    if [ -n "$hex" ]; then
+    if [ -n "$hex" ] && [ -r /proc/net/tcp ]; then
         if awk -v h="$hex" '
             NR > 1 {
                 n = split($2, a, ":")
-                if (n >= 2 && toupper(a[n]) == h) exit 0
+                if (n >= 2 && toupper(a[n]) == h && toupper($4) == "0A") exit 0
             }
             END { exit 1 }
-        ' /proc/net/tcp /proc/net/tcp6 /proc/net/udp /proc/net/udp6 2>/dev/null; then
+        ' /proc/net/tcp /proc/net/tcp6 2>/dev/null; then
             return 0
         fi
-        # /proc 可读且未命中 → 视为空闲（避免再被 ss 误报）
-        if [ -r /proc/net/tcp ]; then
-            return 1
+        if [ -r /proc/net/udp ] || [ -r /proc/net/udp6 ]; then
+            if awk -v h="$hex" '
+                NR > 1 {
+                    n = split($2, a, ":")
+                    if (n >= 2 && toupper(a[n]) == h) exit 0
+                }
+                END { exit 1 }
+            ' /proc/net/udp /proc/net/udp6 2>/dev/null; then
+                return 0
+            fi
         fi
+        return 1
     fi
 
-    # 方法3：ss 回退
+    # 方法3：ss 查 TCP LISTEN + UDP
     if command_exists ss; then
-        if ss -tuln 2>/dev/null | grep -E 'LISTEN|UNCONN' | grep -qE "[:.]${port}([^0-9]|$)"; then
+        if ss -tln 2>/dev/null | grep LISTEN | grep -qE "[:.]${port}([^0-9]|$)"; then
+            return 0
+        fi
+        if ss -uln 2>/dev/null | grep -qE "[:.]${port}([^0-9]|$)"; then
             return 0
         fi
     fi
 
     return 1
+}
+
+port_holder_info() {
+    local port="$1"
+    [ -z "$port" ] && return 0
+    if command_exists ss; then
+        ss -lntp 2>/dev/null | grep -E ":${port}\\b" || true
+        ss -lnup 2>/dev/null | grep -E ":${port}\\b" || true
+    elif command_exists lsof; then
+        lsof -iTCP:"${port}" -sTCP:LISTEN 2>/dev/null || true
+        lsof -iUDP:"${port}" 2>/dev/null || true
+    fi
 }
 
 # 交互获取可用端口；参数: 提示语 默认空则随机
@@ -238,7 +277,17 @@ check_argo() {
 # 检查nginx状态
 check_nginx() {
     command_exists nginx || { red "not installed"; return 2; }
-    check_service "nginx" "$(command -v nginx)"
+    # OpenRC/systemd 状态 + 二进制直启的 master 均视为 running
+    if command_exists rc-service && rc-service nginx status 2>/dev/null | grep -q started; then
+        green "running"; return 0
+    fi
+    if command_exists systemctl && systemctl is-active --quiet nginx 2>/dev/null; then
+        green "running"; return 0
+    fi
+    if pgrep -f 'nginx: master process' >/dev/null 2>&1 || pgrep -x nginx >/dev/null 2>&1; then
+        green "running"; return 0
+    fi
+    yellow "not running"; return 1
 }
 
 # 根据系统类型安装、卸载依赖
@@ -716,33 +765,80 @@ install_singbox() {
     fi
 
     # ---------- Argo 端口（ARGO_PORT 及 +10~+12，无独立订阅端口）----------
-    # 被占用时明确提示哪个端口，并交互式输入新的 ARGO 起始端口
+    # 重装场景：若仅是本机旧 nginx 占着默认入口，先停掉以免误报 8001 被占用
+    if command_exists nginx && type _nginx_stop_all >/dev/null 2>&1; then
+        if port_in_use "${ARGO_PORT:-8001}" 2>/dev/null; then
+            local _hold
+            _hold=$(port_holder_info "${ARGO_PORT:-8001}" 2>/dev/null || true)
+            if echo "$_hold" | grep -qi nginx; then
+                yellow "检测到旧 nginx 占用 Argo 入口端口，安装前先停止..."
+                _nginx_stop_all >/dev/null 2>&1 || true
+            fi
+        fi
+    elif command_exists nginx; then
+        if port_in_use "${ARGO_PORT:-8001}" 2>/dev/null; then
+            local _hold
+            _hold=$(port_holder_info "${ARGO_PORT:-8001}" 2>/dev/null || true)
+            if echo "$_hold" | grep -qi nginx; then
+                yellow "检测到旧 nginx 占用 Argo 入口端口，安装前先停止..."
+                nginx -s stop >/dev/null 2>&1 || true
+                command_exists rc-service && rc-service nginx stop >/dev/null 2>&1 || true
+                pkill -x nginx >/dev/null 2>&1 || true
+                sleep 0.5
+            fi
+        fi
+    fi
+    # Argo 端口冲突检测：
+    # - 与直连重叠 / ss 能看到监听进程 → 真实冲突，需换端口
+    # - port_in_use 为真但 ss 无监听进程 → 视为误报，直接沿用当前端口，不打断安装
     while true; do
         base="${ARGO_PORT:-8001}"
-        conflict_list=""
-        conflict_detail=""
+        real_conflict_list=""
+        real_conflict_detail=""
+        false_positive_list=""
         for offset_name in "0:Argo入口" "10:VMess内部" "11:VLESS内部" "12:Trojan内部"; do
             off="${offset_name%%:*}"
             name="${offset_name#*:}"
             p=$((base + off))
-            # 与直连端口重叠也算冲突
-            if [ "$p" = "$vless_port" ] || [ "$p" = "$((vless_port+1))" ] || [ "$p" = "$((vless_port+2))" ] || [ "$p" = "$((vless_port+3))" ]; then
-                conflict_list="${conflict_list} ${p}"
-                conflict_detail="${conflict_detail}\n  - ${p} (${name}) 与直连端口重叠"
+            # 与直连端口重叠：真实冲突
+            if [ -n "${vless_port:-}" ] && {
+                [ "$p" = "$vless_port" ] || [ "$p" = "$((vless_port+1))" ] || [ "$p" = "$((vless_port+2))" ] || [ "$p" = "$((vless_port+3))" ]
+            }; then
+                real_conflict_list="${real_conflict_list} ${p}"
+                real_conflict_detail="${real_conflict_detail}\n  - ${p} (${name}) 与直连端口重叠"
                 continue
             fi
             if port_in_use "$p"; then
-                conflict_list="${conflict_list} ${p}"
-                conflict_detail="${conflict_detail}\n  - ${p} (${name}) 已被占用"
+                _holder=$(port_holder_info "$p" 2>/dev/null || true)
+                if [ -n "$_holder" ]; then
+                    real_conflict_list="${real_conflict_list} ${p}"
+                    real_conflict_detail="${real_conflict_detail}\n  - ${p} (${name}) 已被占用"
+                else
+                    # 检测器认为占用，但 ss 看不到 LISTEN → 误报，忽略
+                    false_positive_list="${false_positive_list} ${p}"
+                fi
             fi
         done
-        if [ -z "$conflict_list" ]; then
+        if [ -n "$false_positive_list" ] && [ -z "$real_conflict_list" ]; then
+            yellow "端口检测对${false_positive_list} 曾报占用，但系统无监听进程，已按空闲处理（沿用 ${base}，无需改端口）"
             ARGO_PORT="$base"
             export ARGO_PORT
             break
         fi
-        red "Argo 相关端口冲突 (当前 ARGO 起始=${base}):"
-        echo -e "${red}${conflict_detail}${re}"
+        if [ -z "$real_conflict_list" ]; then
+            ARGO_PORT="$base"
+            export ARGO_PORT
+            break
+        fi
+        red "Argo 相关端口真实冲突 (当前 ARGO 起始=${base}):"
+        echo -e "${red}${real_conflict_detail}${re}"
+        yellow "占用详情:"
+        for _cp in $real_conflict_list; do
+            yellow "  端口 ${_cp}:"
+            port_holder_info "$_cp" | while IFS= read -r _line; do
+                [ -n "$_line" ] && echo -e "    ${purple}${_line}${re}"
+            done
+        done
         yellow "将占用: Argo=${base}  内部WS=${base}+10~+12"
         if [ -t 0 ]; then
             reading "请输入新的 Argo 起始端口 (回车自动随机空闲端口): " input_argo
@@ -753,17 +849,22 @@ install_singbox() {
                 fi
                 ARGO_PORT="$input_argo"
             else
-                # 自动找一组空闲
                 found=""
                 for _ in $(seq 1 80); do
                     cand=$(shuf -i 2000-64000 -n 1)
                     ok=1
                     for off in 0 10 11 12; do
                         p=$((cand + off))
-                        if [ "$p" = "$vless_port" ] || [ "$p" = "$((vless_port+1))" ] || [ "$p" = "$((vless_port+2))" ] || [ "$p" = "$((vless_port+3))" ]; then
+                        if [ -n "${vless_port:-}" ] && {
+                            [ "$p" = "$vless_port" ] || [ "$p" = "$((vless_port+1))" ] || [ "$p" = "$((vless_port+2))" ] || [ "$p" = "$((vless_port+3))" ]
+                        }; then
                             ok=0; break
                         fi
-                        port_in_use "$p" && { ok=0; break; }
+                        # 自动分配时同样：仅 ss 能看到占用才算冲突
+                        if port_in_use "$p"; then
+                            _h=$(port_holder_info "$p" 2>/dev/null || true)
+                            [ -n "$_h" ] && { ok=0; break; }
+                        fi
                     done
                     if [ "$ok" -eq 1 ]; then
                         found=$cand
@@ -780,17 +881,21 @@ install_singbox() {
             fi
             export ARGO_PORT
         else
-            # 非交互：自动随机
             found=""
             for _ in $(seq 1 80); do
                 cand=$(shuf -i 2000-64000 -n 1)
                 ok=1
                 for off in 0 10 11 12; do
                     p=$((cand + off))
-                    if [ "$p" = "$vless_port" ] || [ "$p" = "$((vless_port+1))" ] || [ "$p" = "$((vless_port+2))" ] || [ "$p" = "$((vless_port+3))" ]; then
+                    if [ -n "${vless_port:-}" ] && {
+                        [ "$p" = "$vless_port" ] || [ "$p" = "$((vless_port+1))" ] || [ "$p" = "$((vless_port+2))" ] || [ "$p" = "$((vless_port+3))" ]
+                    }; then
                         ok=0; break
                     fi
-                    port_in_use "$p" && { ok=0; break; }
+                    if port_in_use "$p"; then
+                        _h=$(port_holder_info "$p" 2>/dev/null || true)
+                        [ -n "$_h" ] && { ok=0; break; }
+                    fi
                 done
                 [ "$ok" -eq 1 ] && { found=$cand; break; }
             done
@@ -800,8 +905,11 @@ install_singbox() {
                 green "已自动分配 Argo 起始端口: ${purple}${ARGO_PORT}${re}"
                 break
             else
-                red "无法分配可用的 Argo 端口，请手动指定"
-                exit 1
+                # 非交互且找不到：仍沿用默认，避免安装中断
+                yellow "无法确认空闲端口，沿用 ARGO_PORT=${base}"
+                ARGO_PORT="$base"
+                export ARGO_PORT
+                break
             fi
         fi
     done
@@ -1719,31 +1827,10 @@ EOF
 
     green "nginx -t 检测通过"
 
-    # 启动：优先 systemctl，失败则直接 nginx 二进制拉起
-    if command_exists systemctl; then
-        systemctl reset-failed nginx 2>/dev/null || true
-        systemctl daemon-reload 2>/dev/null || true
-        systemctl enable nginx 2>/dev/null || true
-        systemctl start nginx 2>/tmp/sb-nginx-start.err
-        sleep 1
-        if systemctl is-active --quiet nginx 2>/dev/null; then
-            green "nginx 服务已启动 (systemctl)"
-            return 0
-        fi
-        [ -s /tmp/sb-nginx-start.err ] && cat /tmp/sb-nginx-start.err | while IFS= read -r l; do red "$l"; done
+    if _nginx_start; then
+        return 0
     fi
-
-    # 回退：直接用 nginx 主进程启动（不依赖 unit）
-    if nginx 2>/tmp/sb-nginx-bin.err; then
-        sleep 0.5
-        if pgrep -x nginx >/dev/null 2>&1; then
-            green "nginx 已通过二进制直接启动"
-            return 0
-        fi
-    fi
-    [ -s /tmp/sb-nginx-bin.err ] && cat /tmp/sb-nginx-bin.err | while IFS= read -r l; do red "$l"; done
-
-    red "nginx 启动失败。请执行: nginx -t ; journalctl -xeu nginx.service | tail -30"
+    red "nginx 启动失败。请执行: nginx -t ; ss -lntp | grep -E \":${ARGO_PORT:-8001} \" ; rc-service nginx status 2>/dev/null || systemctl status nginx"
     return 1
 }
 
@@ -1801,6 +1888,135 @@ get_current_uuid() {
 
 # 通用服务管理函数
 # 通用服务管理函数（已修复状态检测 + 强制清理残留进程）
+
+# ---------- Nginx 启停（Alpine OpenRC / systemd / 二进制统一）----------
+_nginx_is_running() {
+    # 以 master 进程为准，避免 pgrep 路径误匹配
+    pgrep -f 'nginx: master process' >/dev/null 2>&1 && return 0
+    pgrep -x nginx >/dev/null 2>&1 && return 0
+    return 1
+}
+
+_nginx_stop_all() {
+    # 先走服务管理器，再清理可能由「nginx 二进制直启」留下的进程
+    if command_exists rc-service; then
+        rc-service nginx stop >/dev/null 2>&1 || true
+    elif command_exists systemctl; then
+        systemctl stop nginx >/dev/null 2>&1 || true
+    fi
+    if command_exists nginx; then
+        nginx -s stop >/dev/null 2>&1 || true
+        nginx -s quit >/dev/null 2>&1 || true
+    fi
+    sleep 0.5
+    if _nginx_is_running; then
+        pkill -15 -f 'nginx: master process' 2>/dev/null || true
+        pkill -15 -x nginx 2>/dev/null || true
+        sleep 0.8
+    fi
+    if _nginx_is_running; then
+        pkill -9 -f 'nginx: master process' 2>/dev/null || true
+        pkill -9 -x nginx 2>/dev/null || true
+        sleep 0.3
+    fi
+    # 不再用 return 码表示失败，由调用方检查
+    return 0
+}
+
+_nginx_who_holds_port() {
+    local p="${1:-}"
+    [ -z "$p" ] && return 0
+    if command_exists ss; then
+        ss -lntp 2>/dev/null | grep -E ":${p}\\b" || true
+    elif command_exists lsof; then
+        lsof -i ":${p}" -sTCP:LISTEN 2>/dev/null || true
+    fi
+}
+
+_nginx_start() {
+    if ! command_exists nginx; then
+        red "nginx 未安装"
+        return 1
+    fi
+    if ! nginx -t >/dev/null 2>&1; then
+        red "nginx -t 失败，拒绝启动"
+        nginx -t
+        return 1
+    fi
+
+    # 若已在跑且可响应，视为成功
+    if _nginx_is_running; then
+        if nginx -s reload >/dev/null 2>&1; then
+            green "nginx 已在运行（已 reload）"
+            return 0
+        fi
+        # reload 失败则彻底停掉再启
+        _nginx_stop_all
+    fi
+
+    local port="${ARGO_PORT:-}"
+    if [ -z "$port" ] && [ -f /etc/nginx/conf.d/argo-ws.conf ]; then
+        port=$(grep -oE 'listen[[:space:]]+[0-9]+' /etc/nginx/conf.d/argo-ws.conf 2>/dev/null | head -1 | awk '{print $2}')
+    fi
+    port="${port:-8001}"
+
+    # 启动前确认端口空闲（排除将由本进程占用的情况：已无 nginx）
+    if command_exists ss && ss -lntp 2>/dev/null | grep -qE ":${port}\\b"; then
+        yellow "端口 ${port} 仍被占用，尝试释放 nginx 后重试..."
+        _nginx_stop_all
+        sleep 0.5
+        if ss -lntp 2>/dev/null | grep -qE ":${port}\\b"; then
+            red "端口 ${port} 仍被占用，占用进程如下："
+            _nginx_who_holds_port "$port" | while IFS= read -r l; do red "  $l"; done
+            return 1
+        fi
+    fi
+
+    local started=0
+    if command_exists rc-service; then
+        # Alpine：优先 OpenRC，避免「二进制直启」与 rc-service 双实例抢端口
+        rc-update add nginx default >/dev/null 2>&1 || true
+        if rc-service nginx start >/tmp/sb-nginx-start.err 2>&1; then
+            sleep 1
+            if rc-service nginx status 2>/dev/null | grep -q started && _nginx_is_running; then
+                started=1
+                green "nginx 服务已启动 (OpenRC)"
+            fi
+        fi
+    elif command_exists systemctl; then
+        systemctl reset-failed nginx 2>/dev/null || true
+        systemctl daemon-reload 2>/dev/null || true
+        systemctl enable nginx 2>/dev/null || true
+        if systemctl start nginx >/tmp/sb-nginx-start.err 2>&1; then
+            sleep 1
+            if systemctl is-active --quiet nginx 2>/dev/null; then
+                started=1
+                green "nginx 服务已启动 (systemctl)"
+            fi
+        fi
+    fi
+
+    if [ "$started" -eq 0 ]; then
+        # 回退二进制直启（仅当服务管理器不可用或失败且端口已空闲）
+        _nginx_stop_all
+        if nginx >/tmp/sb-nginx-bin.err 2>&1; then
+            sleep 0.5
+            if _nginx_is_running; then
+                started=1
+                green "nginx 已通过二进制直接启动"
+            fi
+        fi
+        [ -s /tmp/sb-nginx-bin.err ] && grep -q . /tmp/sb-nginx-bin.err && \
+            while IFS= read -r l; do [ -n "$l" ] && red "$l"; done < /tmp/sb-nginx-bin.err
+    fi
+
+    if [ "$started" -eq 1 ]; then
+        return 0
+    fi
+    [ -s /tmp/sb-nginx-start.err ] && while IFS= read -r l; do [ -n "$l" ] && red "$l"; done < /tmp/sb-nginx-start.err
+    return 1
+}
+
 manage_service() {
     local service_name="$1"
     local action="$2"
@@ -1842,20 +2058,29 @@ manage_service() {
             fi
 
             yellow "正在启动 ${service_name} 服务...\n"
+            if [ "$service_name" = "nginx" ]; then
+                if _nginx_start; then
+                    return 0
+                else
+                    red "nginx 服务启动失败\n"
+                    return 1
+                fi
+            fi
             if command_exists rc-service; then
                 rc-service "$service_name" start
             elif command_exists systemctl; then
-                # 清除可能的 failed 状态，解决停止后无法直接启动的问题
                 systemctl reset-failed "$service_name" 2>/dev/null
                 systemctl daemon-reload
                 systemctl start "$service_name"
             fi
 
             sleep 1
-            if pgrep -f "${service_file}" >/dev/null 2>&1 || [[ "$(check_service "$service_name" "$service_file" 2>/dev/null)" == *"running"* ]]; then
+            if [[ "$(check_service "$service_name" "$service_file" 2>/dev/null)" == *"running"* ]]; then
                 green "${service_name} 服务已成功启动\n"
+                return 0
             else
                 red "${service_name} 服务启动失败\n"
+                return 1
             fi
             ;;
 
@@ -1870,22 +2095,27 @@ manage_service() {
             fi
 
             yellow "正在停止 ${service_name} 服务...\n"
+            if [ "$service_name" = "nginx" ]; then
+                _nginx_stop_all
+                if _nginx_is_running; then
+                    red "nginx 停止失败，仍有进程残留\n"
+                    return 1
+                fi
+                green "nginx 服务已彻底停止\n"
+                return 0
+            fi
 
-            # 先正常停止
             if command_exists rc-service; then
                 rc-service "$service_name" stop
             elif command_exists systemctl; then
                 systemctl stop "$service_name"
             fi
-
             sleep 1
 
-            # 检查并强制清理残留进程
             local process_pattern=""
             case "$service_name" in
                 "sing-box") process_pattern="${work_dir}/sing-box" ;;
                 "argo")     process_pattern="${work_dir}/argo" ;;
-                "nginx")    process_pattern="nginx: master process" ;;
             esac
 
             if [ -n "$process_pattern" ] && pgrep -f "$process_pattern" >/dev/null 2>&1; then
@@ -1896,11 +2126,12 @@ manage_service() {
                 sleep 0.5
             fi
 
-            # 最终确认
             if [ -n "$process_pattern" ] && pgrep -f "$process_pattern" >/dev/null 2>&1; then
                 red "${service_name} 停止失败，仍有进程残留，请手动检查\n"
+                return 1
             else
                 green "${service_name} 服务已彻底停止\n"
+                return 0
             fi
             ;;
 
@@ -1911,52 +2142,38 @@ manage_service() {
             fi
 
             yellow "正在重启 ${service_name} 服务...\n"
+            if [ "$service_name" = "nginx" ]; then
+                _nginx_stop_all
+                sleep 0.5
+                if _nginx_start; then
+                    green "nginx 服务已成功重启\n"
+                    return 0
+                fi
+                red "nginx 服务重启失败\n"
+                yellow "请执行: nginx -t ; ss -lntp | head -30 ; rc-service nginx status 2>/dev/null || systemctl status nginx"
+                return 1
+            fi
 
-            # 先执行完整停止（含强制清理）
             manage_service "$service_name" "stop" >/dev/null 2>&1
-
             sleep 1
-
-            # 再启动
             if command_exists rc-service; then
                 rc-service "$service_name" start
             elif command_exists systemctl; then
                 systemctl daemon-reload >/dev/null 2>&1
-                if [ "$service_name" = "nginx" ]; then
-                    _ensure_nginx_ready 2>/dev/null || true
-                fi
                 systemctl start "$service_name" 2>/tmp/sb-svc-start.err
-                local start_rc=$?
-                if [ $start_rc -ne 0 ] && [ -s /tmp/sb-svc-start.err ]; then
-                    # 将 systemd 错误以红色显示，避免误报成功
+                if [ $? -ne 0 ] && [ -s /tmp/sb-svc-start.err ]; then
                     while IFS= read -r _eline; do
                         [ -n "$_eline" ] && red "$_eline"
                     done < /tmp/sb-svc-start.err
                 fi
             fi
-
             sleep 1
-            local ok=0
-            if [ "$service_name" = "nginx" ] && command_exists systemctl; then
-                # 仅以 systemd 状态为准，避免残留进程导致假成功
-                if systemctl is-active --quiet nginx 2>/dev/null; then
-                    ok=1
-                else
-                    ok=0
-                fi
-            elif pgrep -f "${service_file}" >/dev/null 2>&1 || [[ "$(check_service "$service_name" "$service_file" 2>/dev/null)" == *"running"* ]]; then
-                ok=1
-            fi
-            if [ "$ok" -eq 1 ]; then
+            if [[ "$(check_service "$service_name" "$service_file" 2>/dev/null)" == *"running"* ]]; then
                 green "${service_name} 服务已成功重启\n"
                 return 0
-            else
-                red "${service_name} 服务重启失败\n"
-                if [ "$service_name" = "nginx" ]; then
-                    yellow "请执行: nginx -t ; systemctl status nginx.service ; journalctl -xeu nginx.service"
-                fi
-                return 1
             fi
+            red "${service_name} 服务重启失败\n"
+            return 1
             ;;
 
         *)
