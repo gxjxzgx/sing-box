@@ -9,7 +9,7 @@
 # 端口规划:
 #   直连: Reality=vless_port  HY2=+1  TUIC=+2  VLESS-WS直连=+3
 #   Argo: ARGO_PORT(入口)  内部WS=+10~+12 (仅本机，不对外)
-#   已去掉独立 HTTP 订阅端口与订阅链接/二维码输出
+#   订阅: Nginx 同端口路径 /s/<token>（base64）与 /s/<token>/raw（明文），无独立订阅端口
 #
 # 本修改版变更摘要:
 #   1. sing-box / cloudflared 优先官方下载，失败回退镜像
@@ -28,9 +28,10 @@
 #  12. 移除主菜单「Nginx管理」（Nginx 仍由安装/Argo 自动配置，状态仅展示）
 #
 # 基于: eooce/sing-box  修改日期: 2026.9.22
-# 版本: v2.5.9 (统一端口误报判定: port_really_in_use，直连端口与Argo端口检测标准一致)
-# 补丁: v2.5.10 (修复 change_config 中 reality/hysteria2/tuic 端口修改时，
-#      因 [^:]+ 正则无法兼容 IPv6 主机地址导致订阅链接被写坏的问题)
+# 版本: v2.5.12
+#   - v2.5.9~11: 端口误报 / IPv6 改端口 / host= 同步 / WS直连改端口 / 配置回读
+#   - v2.5.12: get_info 无公钥时仍输出 HY2/TUIC/WS；恢复 HTTP 订阅链接
+#              (Nginx 路径 /s/<token> 与 /s/<token>/raw，经 Argo 或直连端口可访问)
 # =========================
 
 export LANG=en_US.UTF-8
@@ -444,6 +445,93 @@ refresh_sub() {
         base64 "$src" | tr -d '\n\r' > "${work_dir}/sub.txt"
     fi
     chmod 644 "${work_dir}/sub.txt" 2>/dev/null || true
+}
+
+# 订阅路径令牌：安装时生成并写入 install.conf；已有则复用
+ensure_sub_token() {
+    local tok=""
+    if [ -f "${work_dir}/install.conf" ]; then
+        # shellcheck source=/dev/null
+        source "${work_dir}/install.conf" 2>/dev/null || true
+        tok="${SUB_TOKEN:-}"
+    fi
+    if [ -z "$tok" ] || ! echo "$tok" | grep -Eq '^[A-Za-z0-9_-]{8,64}$'; then
+        if command_exists openssl; then
+            tok=$(openssl rand -hex 12 2>/dev/null)
+        fi
+        [ -z "$tok" ] && tok=$(cat /proc/sys/kernel/random/uuid 2>/dev/null | tr -d '-' | head -c 24)
+        [ -z "$tok" ] && tok=$(tr -dc 'a-f0-9' </dev/urandom 2>/dev/null | head -c 24)
+        [ -z "$tok" ] && tok="sb$(date +%s)"
+        SUB_TOKEN="$tok"
+        # 合并写入 install.conf，保留已有 SKIP_DIRECT
+        local skip="${SKIP_DIRECT:-0}"
+        if [ -f "${work_dir}/install.conf" ]; then
+            # shellcheck source=/dev/null
+            source "${work_dir}/install.conf" 2>/dev/null || true
+            skip="${SKIP_DIRECT:-$skip}"
+        fi
+        {
+            printf 'SKIP_DIRECT=%s\n' "$skip"
+            printf 'SUB_TOKEN=%s\n' "$SUB_TOKEN"
+        } > "${work_dir}/install.conf"
+        chmod 644 "${work_dir}/install.conf" 2>/dev/null || true
+    else
+        SUB_TOKEN="$tok"
+    fi
+    export SUB_TOKEN
+}
+
+# 打印订阅链接（直连端口 + Argo 域名）
+print_sub_urls() {
+    ensure_sub_token
+    local ip domain argo_port
+    ip=$(get_realip 2>/dev/null || echo "服务器IP")
+    # 去掉 IPv6 方括号用于 URL 时需保留或改用 [ip]
+    argo_port="${ARGO_PORT:-}"
+    if [ -z "$argo_port" ] && [ -f "${work_dir}/argo_fixed.conf" ]; then
+        # shellcheck source=/dev/null
+        source "${work_dir}/argo_fixed.conf" 2>/dev/null || true
+        argo_port="${ARGO_PORT:-}"
+    fi
+    if [ -z "$argo_port" ] && [ -f /etc/nginx/conf.d/argo-ws.conf ]; then
+        argo_port=$(grep -oE 'listen[[:space:]]+[0-9]+' /etc/nginx/conf.d/argo-ws.conf 2>/dev/null | head -1 | awk '{print $2}')
+    fi
+    argo_port="${argo_port:-8001}"
+
+    domain=""
+    if [ -f "${work_dir}/argo_fixed.conf" ]; then
+        # shellcheck source=/dev/null
+        source "${work_dir}/argo_fixed.conf" 2>/dev/null || true
+        [ "${ARGO_USE_FIXED:-0}" = "1" ] && [ -n "${ARGO_DOMAIN:-}" ] && domain="$ARGO_DOMAIN"
+    fi
+    if [ -z "$domain" ] && [ -f "${work_dir}/argo.log" ]; then
+        domain=$(sed -n 's|.*https://\([^/]*trycloudflare\.com\).*|\1|p' "${work_dir}/argo.log" 2>/dev/null | head -1)
+        [ -z "$domain" ] && domain=$(grep -oE '[[:alnum:]+\.-]+\.trycloudflare\.com' "${work_dir}/argo.log" 2>/dev/null | head -1)
+    fi
+
+    echo ""
+    green "=== 订阅链接（客户端直接导入） ==="
+    yellow "路径令牌已固定，改节点后无需更换链接；勿泄露给他人"
+    # 直连：经 Nginx 入口端口
+    # IPv6 主机需方括号
+    local host_for_url="$ip"
+    if echo "$ip" | grep -q '^\[.*\]$'; then
+        host_for_url="$ip"
+    elif echo "$ip" | grep -q ':'; then
+        host_for_url="[$ip]"
+    fi
+    green "Base64 订阅(推荐):"
+    purple "  http://${host_for_url}:${argo_port}/s/${SUB_TOKEN}"
+    green "明文节点列表:"
+    purple "  http://${host_for_url}:${argo_port}/s/${SUB_TOKEN}/raw"
+    if [ -n "$domain" ] && [ "$domain" != "未获取到域名" ]; then
+        green "Argo/HTTPS 订阅(推荐外网):"
+        purple "  https://${domain}/s/${SUB_TOKEN}"
+        green "Argo 明文节点:"
+        purple "  https://${domain}/s/${SUB_TOKEN}/raw"
+    fi
+    yellow "本地文件: ${work_dir}/sub.txt  |  ${work_dir}/url.txt"
+    echo ""
 }
 
 # 处理防火墙
@@ -1046,11 +1134,26 @@ install_singbox() {
             exit 1
         fi
         green "Reality 密钥已生成"
+        # 持久化 Reality 公钥，供 get_info 在新 shell 中回读
+        {
+            printf 'PUBLIC_KEY=%s\n' "$public_key"
+            printf 'PRIVATE_KEY=%s\n' "$private_key"
+        } > "${work_dir}/reality.keys"
+        chmod 600 "${work_dir}/reality.keys" 2>/dev/null || true
         allow_port $vless_port/tcp $hy2_port/udp $tuic_port/udp $vless_ws_direct_port/tcp ${ARGO_PORT}/tcp > /dev/null 2>&1
     else
         allow_port ${ARGO_PORT}/tcp > /dev/null 2>&1
         green "已跳过 Reality 密钥与直连端口放行"
+        rm -f "${work_dir}/reality.keys" 2>/dev/null || true
     fi
+
+    # 持久化 SKIP_DIRECT + 订阅令牌
+    ensure_sub_token
+    {
+        printf 'SKIP_DIRECT=%s\n' "${SKIP_DIRECT:-0}"
+        printf 'SUB_TOKEN=%s\n' "${SUB_TOKEN}"
+    } > "${work_dir}/install.conf"
+    chmod 644 "${work_dir}/install.conf" 2>/dev/null || true
 
     openssl ecparam -genkey -name prime256v1 -out "${work_dir}/private.key"
     openssl req -new -x509 -days 3650 -key "${work_dir}/private.key" -out "${work_dir}/cert.pem" -subj "/CN=bing.com"
@@ -1597,13 +1700,41 @@ get_info() {
 
     green "\nArgoDomain：${purple}$argodomain${re}\n"
 
+    # 回读安装选项 / 密钥 / UUID（新 shell 调用 get_info 时内存变量为空）
+    if [ -f "${work_dir}/install.conf" ]; then
+        # shellcheck source=/dev/null
+        source "${work_dir}/install.conf" 2>/dev/null || true
+    fi
+    SKIP_DIRECT="${SKIP_DIRECT:-0}"
+    if [ -z "$uuid" ]; then
+        uuid=$(get_current_uuid | tr -d '\n\r')
+    fi
+    if [ -z "$public_key" ] && [ -f "${work_dir}/reality.keys" ]; then
+        # shellcheck source=/dev/null
+        source "${work_dir}/reality.keys" 2>/dev/null || true
+        public_key="${PUBLIC_KEY:-$public_key}"
+    fi
+    if [ -z "$fingerprint" ] && [ -f "${work_dir}/cert.pem" ]; then
+        fingerprint=$(openssl x509 -noout -fingerprint -sha256 -in "${work_dir}/cert.pem" 2>/dev/null | cut -d'=' -f2 | sed 's/:/%3A/g')
+    fi
+    # 配置中无 Reality 入站则视为已跳过直连
+    if [ -f "${conf_dir}/inbounds.json" ]; then
+        if ! jq -e '.inbounds[] | select(.tag=="vless-reality")' "${conf_dir}/inbounds.json" >/dev/null 2>&1; then
+            SKIP_DIRECT=1
+        fi
+    fi
+
     # 若未在安装流程中赋值，从配置读取端口
     if [ -z "$vless_port" ] || [ -z "$hy2_port" ] || [ -z "$tuic_port" ] || [ -z "$vless_ws_direct_port" ]; then
-        [ -z "$vless_port" ] && vless_port=$(jq -r '.inbounds[] | select(.tag=="vless-reality") | .listen_port' "${conf_dir}/inbounds.json" 2>/dev/null)
-        [ -z "$hy2_port" ] && hy2_port=$(jq -r '.inbounds[] | select(.tag=="hysteria2") | .listen_port' "${conf_dir}/inbounds.json" 2>/dev/null)
-        [ -z "$tuic_port" ] && tuic_port=$(jq -r '.inbounds[] | select(.tag=="tuic") | .listen_port' "${conf_dir}/inbounds.json" 2>/dev/null)
-        [ -z "$vless_ws_direct_port" ] && vless_ws_direct_port=$(jq -r '.inbounds[] | select(.tag=="vless-ws-direct") | .listen_port' "${conf_dir}/inbounds.json" 2>/dev/null)
+        [ -z "$vless_port" ] && vless_port=$(jq -r '.inbounds[] | select(.tag=="vless-reality") | .listen_port // empty' "${conf_dir}/inbounds.json" 2>/dev/null)
+        [ -z "$hy2_port" ] && hy2_port=$(jq -r '.inbounds[] | select(.tag=="hysteria2") | .listen_port // empty' "${conf_dir}/inbounds.json" 2>/dev/null)
+        [ -z "$tuic_port" ] && tuic_port=$(jq -r '.inbounds[] | select(.tag=="tuic") | .listen_port // empty' "${conf_dir}/inbounds.json" 2>/dev/null)
+        [ -z "$vless_ws_direct_port" ] && vless_ws_direct_port=$(jq -r '.inbounds[] | select(.tag=="vless-ws-direct") | .listen_port // empty' "${conf_dir}/inbounds.json" 2>/dev/null)
     fi
+
+    # Reality SNI 以配置为准（用户可能已修改伪装域名）
+    reality_sni=$(jq -r '.inbounds[] | select(.tag=="vless-reality") | .tls.server_name // empty' "${conf_dir}/inbounds.json" 2>/dev/null)
+    [ -z "$reality_sni" ] && reality_sni="www.iij.ad.jp"
 
     # 节点前缀处理
     if [ -z "$node_prefix" ]; then
@@ -1619,17 +1750,27 @@ get_info() {
         extra_lines=$(grep -vE '^(vless://|vmess://|hysteria2://|tuic://|trojan://)' "${client_dir}" || true)
     fi
 
-    # 写入节点链接：直连四协议可选；Argo 三协议始终写入
+    # 写入节点链接：直连协议按能力分别输出（无公钥时仍写 HY2/TUIC/WS）；Argo 三协议始终写入
     {
-        if [ "${SKIP_DIRECT:-0}" != "1" ] && [ -n "$vless_port" ] && [ -n "$public_key" ]; then
-            echo "vless://${uuid}@${server_ip}:${vless_port}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=www.iij.ad.jp&fp=firefox&pbk=${public_key}&type=tcp&headerType=none#${prefix}-vless-reality"
-            echo ""
-            echo "hysteria2://${uuid}@${server_ip}:${hy2_port}/?sni=www.bing.com&insecure=1&pinSHA256=${fingerprint}&alpn=h3&obfs=none#${prefix}-hysteria2"
-            echo ""
-            echo "tuic://${uuid}:${uuid}@${server_ip}:${tuic_port}?sni=www.bing.com&congestion_control=bbr&udp_relay_mode=native&alpn=h3&allow_insecure=1#${prefix}-tuic"
-            echo ""
-            echo "vless://${uuid}@${server_ip}:${vless_ws_direct_port}?encryption=none&security=none&type=ws&host=${server_ip}&path=%2Fvless-ws#${prefix}-vless-ws"
-            echo ""
+        if [ "${SKIP_DIRECT:-0}" != "1" ]; then
+            if [ -n "$vless_port" ] && [ -n "$public_key" ]; then
+                echo "vless://${uuid}@${server_ip}:${vless_port}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${reality_sni}&fp=firefox&pbk=${public_key}&type=tcp&headerType=none#${prefix}-vless-reality"
+                echo ""
+            elif [ -n "$vless_port" ] && [ -z "$public_key" ]; then
+                yellow "缺少 Reality 公钥 (reality.keys)，已跳过 Reality 节点" >&2
+            fi
+            if [ -n "$hy2_port" ] && [ -n "$fingerprint" ]; then
+                echo "hysteria2://${uuid}@${server_ip}:${hy2_port}/?sni=www.bing.com&insecure=1&pinSHA256=${fingerprint}&alpn=h3&obfs=none#${prefix}-hysteria2"
+                echo ""
+            fi
+            if [ -n "$tuic_port" ]; then
+                echo "tuic://${uuid}:${uuid}@${server_ip}:${tuic_port}?sni=www.bing.com&congestion_control=bbr&udp_relay_mode=native&alpn=h3&allow_insecure=1#${prefix}-tuic"
+                echo ""
+            fi
+            if [ -n "$vless_ws_direct_port" ]; then
+                echo "vless://${uuid}@${server_ip}:${vless_ws_direct_port}?encryption=none&security=none&type=ws&host=${server_ip}&path=%2Fvless-ws#${prefix}-vless-ws"
+                echo ""
+            fi
         fi
         if [ "${argo_domain_ok:-1}" = "1" ] && [ -n "$argodomain" ]; then
             echo "vmess://$(echo "$VMESS" | base64 -w0)"
@@ -1639,7 +1780,7 @@ get_info() {
             echo "trojan://${uuid}@${CFIP}:${CFPORT}?security=tls&sni=${argodomain}&fp=firefox&type=ws&host=${argodomain}&path=%2Ftrojan-argo%3Fed%3D2560#${prefix}-argo-trojan"
             echo ""
         else
-            yellow "已跳过 Argo 节点写入（域名未就绪）"
+            yellow "已跳过 Argo 节点写入（域名未就绪）" >&2
         fi
     } > "${work_dir}/url.txt"
 
@@ -1651,6 +1792,8 @@ get_info() {
     echo ""
     while IFS= read -r line; do echo -e "${purple}$line"; done < ${work_dir}/url.txt
     refresh_sub
+    ensure_sub_token
+    print_sub_urls
     yellow "\n温馨提醒:"
     yellow "节点默认优先 IPv4；若仍为 IPv6，可在「修改节点配置」中切换\n"
     red "若 hysteria2/tuic 不通，请将客户端「跳过证书验证」设为 true 或更换内核\n"
@@ -1739,7 +1882,9 @@ http {
 }
 EOF
 
-    # ---------- 3. Argo 路径分流 ----------
+    # ---------- 3. Argo 路径分流 + HTTP 订阅 ----------
+    ensure_sub_token
+    local sub_tok="${SUB_TOKEN}"
     cat > /etc/nginx/conf.d/argo-ws.conf << EOF
 server {
     listen ${ARGO_PORT};
@@ -1780,6 +1925,23 @@ server {
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
         proxy_read_timeout 300s;
         proxy_send_timeout 300s;
+    }
+
+    # Base64 订阅（客户端导入）
+    location = /s/${sub_tok} {
+        default_type text/plain;
+        charset utf-8;
+        alias ${work_dir}/sub.txt;
+        add_header Cache-Control "no-store";
+        add_header Access-Control-Allow-Origin *;
+    }
+    # 明文节点列表
+    location = /s/${sub_tok}/raw {
+        default_type text/plain;
+        charset utf-8;
+        alias ${work_dir}/url.txt;
+        add_header Cache-Control "no-store";
+        add_header Access-Control-Allow-Origin *;
     }
 
     location / { return 404; }
@@ -2764,6 +2926,8 @@ change_config() {
             skyblue "------------"
             green "4. 修改Argo对外端口（Nginx入口，三协议共用）"
             skyblue "------------"
+            green "5. 修改VLESS-WS直连端口（无TLS）"
+            skyblue "------------"
             purple "0. 返回上一级菜单"
             skyblue "------------"
             reading "请输入选择: " choice
@@ -2924,8 +3088,52 @@ change_config() {
                     fi
                     green "\nArgo对外端口已修改为：${purple}${new_port}${re}（三个协议仍共用此入口）\n"
                     ;;
+                5)
+                    # VLESS-WS 直连（无 TLS）
+                    if ! jq -e '.inbounds[] | select(.tag=="vless-ws-direct")' "$inbounds_file" >/dev/null 2>&1; then
+                        red "当前未安装 VLESS-WS 直连协议（可能已选择跳过直连）"
+                        break
+                    fi
+                    while true; do
+                        reading "\n请输入 VLESS-WS 直连端口 (回车随机): " new_port
+                        [ -z "$new_port" ] && new_port=$(shuf -i 2000-65000 -n 1)
+                        if ! [[ "$new_port" =~ ^[0-9]+$ ]] || [ "$new_port" -lt 1 ] || [ "$new_port" -gt 65535 ]; then
+                            red "端口无效"; continue
+                        fi
+                        port_really_in_use "$new_port"
+                        _rc=$?
+                        if [ "$_rc" -eq 0 ]; then
+                            red "端口 ${new_port} 已被占用，请重新输入"; continue
+                        elif [ "$_rc" -eq 2 ]; then
+                            yellow "端口 ${new_port} 检测曾报占用，但系统无实际监听进程，按空闲处理"
+                        fi
+                        break
+                    done
+                    cp -f "$inbounds_file" "${inbounds_file}.bak.port" 2>/dev/null || true
+                    if ! jq --argjson port "$new_port" \
+                        '(.inbounds[] | select(.tag == "vless-ws-direct")).listen_port = $port' \
+                        "$inbounds_file" > "${inbounds_file}.tmp"; then
+                        red "配置修改失败"
+                        rm -f "${inbounds_file}.tmp"
+                        return 1
+                    fi
+                    mv "${inbounds_file}.tmp" "$inbounds_file"
+                    if ! "${work_dir}/sing-box" check -C "${conf_dir}" >/dev/null 2>&1; then
+                        red "配置校验失败，已回滚"
+                        [ -f "${inbounds_file}.bak.port" ] && mv -f "${inbounds_file}.bak.port" "$inbounds_file"
+                        return 1
+                    fi
+                    rm -f "${inbounds_file}.bak.port"
+                    allow_port $new_port/tcp > /dev/null 2>&1
+                    restart_singbox
+                    # 仅更新无 TLS 的 vless-ws 直连节点（path=/vless-ws），兼容 IPv6
+                    sed -i -E "/path=%2Fvless-ws|path=\/vless-ws/ s/:[0-9]+\?/:${new_port}?/" "$client_dir"
+                    refresh_sub
+                    while IFS= read -r line; do yellow "$line"; done < ${work_dir}/url.txt
+                    green "\nVLESS-WS 直连端口已修改为：${purple}${new_port}${re}\n"
+                    ;;
                 0) change_config ;;
-                *) red "无效的选项，请输入 1 到 4" ;;
+                *) red "无效的选项，请输入 1 到 5" ;;
             esac
             ;;
         2)
@@ -3091,7 +3299,10 @@ IEOF
                 return 1
             fi
             if grep -Eq '^(vless|hysteria2|tuic|anytls|socks|ss)://[^@]+@\[[0-9a-fA-F:]+\]' "$client_dir"; then
+                # 替换 @ 后的 IPv6 主机
                 sed -i -E "/^(vless|hysteria2|tuic|anytls|socks|ss):\/\// s#@\[[0-9a-fA-F:]+\]#@${new_ipv4}#g" "$client_dir"
+                # 同步直连节点 host=（无 TLS 的 vless-ws 依赖 Host 头；仅改 path=/vless-ws 行，不动 argo）
+                sed -i -E "/path=%2Fvless-ws|path=\/vless-ws/ s#(host=)\[[0-9a-fA-F:]+\]#\1${new_ipv4}#g" "$client_dir"
                 green "\n已将 IPv6 修改为 IPv4: $new_ipv4 可复制以下节点或更新订阅\n"
                 check_nodes
             else
@@ -3116,6 +3327,9 @@ IEOF
             fi
             if grep -Eq '^(vless|hysteria2|tuic|anytls|socks|ss)://[^@]+@([0-9]{1,3}\.){3}[0-9]{1,3}' "$client_dir"; then
                 sed -i -E "/^(vless|hysteria2|tuic|anytls|socks|ss):\/\// s#@(([0-9]{1,3}\.){3}[0-9]{1,3})#@[${new_ipv6}]#g" "$client_dir"
+                # 同步直连 vless-ws 的 host= 为 [ipv6]
+                sed -i -E "/path=%2Fvless-ws|path=\/vless-ws/ s#(host=)([0-9]{1,3}\.){3}[0-9]{1,3}#\1[${new_ipv6}]#g" "$client_dir"
+                sed -i -E "/path=%2Fvless-ws|path=\/vless-ws/ s#(host=)\[[0-9a-fA-F:]+\]#\1[${new_ipv6}]#g" "$client_dir"
                 green "\n已将 IPv4 修改为 IPv6: [${new_ipv6}] 可复制以下节点或更新订阅\n"
                 check_nodes
             else
@@ -3192,12 +3406,12 @@ IEOF
 # 本修改版已取消独立 HTTP 订阅端口；仅提示本地节点文件位置
 show_node_files() {
     clear; echo ""
-    green "=== 节点文件说明 ===\n"
-    yellow "本版本已去掉独立 HTTP 订阅端口与订阅链接输出。\n"
+    green "=== 节点文件 / 订阅链接 ===\n"
     green "明文节点列表: ${purple}${work_dir}/url.txt${re}"
     green "base64 订阅体: ${purple}${work_dir}/sub.txt${re}"
     echo ""
     if [ -f "${work_dir}/url.txt" ]; then
+        print_sub_urls
         yellow "当前节点预览:\n"
         while IFS= read -r line; do
             [ -z "$line" ] && continue
