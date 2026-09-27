@@ -29,6 +29,8 @@
 #
 # 基于: eooce/sing-box  修改日期: 2026.9.22
 # 版本: v2.5.9 (统一端口误报判定: port_really_in_use，直连端口与Argo端口检测标准一致)
+# 补丁: v2.5.10 (修复 change_config 中 reality/hysteria2/tuic 端口修改时，
+#      因 [^:]+ 正则无法兼容 IPv6 主机地址导致订阅链接被写坏的问题)
 # =========================
 
 export LANG=en_US.UTF-8
@@ -2801,8 +2803,8 @@ change_config() {
                     rm -f "${inbounds_file}.bak.port"
                     allow_port $new_port/tcp > /dev/null 2>&1
                     restart_singbox
-                    # 仅更新 reality 直连节点端口（排除 argo 的 vless-ws）
-                    sed -i -E "/vless:\/\/.*flow=xtls-rprx-vision/s/(@[^:]+:)[0-9]+/\1${new_port}/" "$client_dir"
+                    # 仅更新 reality 直连节点端口（排除 argo 的 vless-ws）；用端口后紧跟 ? 定位，兼容 IPv6 主机地址
+                    sed -i -E "/vless:\/\/.*flow=xtls-rprx-vision/ s/:[0-9]+\?/:${new_port}?/" "$client_dir"
                     refresh_sub
                     while IFS= read -r line; do yellow "$line"; done < ${work_dir}/url.txt
                     green "\nvless-reality端口已修改成：${purple}$new_port${re}\n"
@@ -2840,7 +2842,8 @@ change_config() {
                     rm -f "${inbounds_file}.bak.port"
                     allow_port $new_port/udp > /dev/null 2>&1
                     restart_singbox
-                    sed -i -E "s#(hysteria2://[^@]+@[^:]+:)[0-9]+#\1${new_port}#" "$client_dir"
+                    # 用端口后紧跟 /? 定位，兼容 IPv6 主机地址
+                    sed -i -E "/hysteria2:\/\// s#:[0-9]+/\?#:${new_port}/?#" "$client_dir"
                     refresh_sub
                     while IFS= read -r line; do yellow "$line"; done < ${work_dir}/url.txt
                     green "\nhysteria2端口已修改为：${purple}${new_port}${re}\n"
@@ -2878,7 +2881,8 @@ change_config() {
                     rm -f "${inbounds_file}.bak.port"
                     allow_port $new_port/udp > /dev/null 2>&1
                     restart_singbox
-                    sed -i -E "s#(tuic://[^@]+@[^:]+:)[0-9]+#\1${new_port}#" "$client_dir"
+                    # 用端口后紧跟 ? 定位，兼容 IPv6 主机地址
+                    sed -i -E "/tuic:\/\// s/:[0-9]+\?/:${new_port}?/" "$client_dir"
                     refresh_sub
                     while IFS= read -r line; do yellow "$line"; done < ${work_dir}/url.txt
                     green "\ntuic端口已修改为：${purple}${new_port}${re}\n"
