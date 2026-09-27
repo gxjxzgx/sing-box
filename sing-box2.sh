@@ -1,11 +1,11 @@
 #!/bin/bash
 set -e
-B64=""
-for i in 0 1 2 3; do
-  B64+="$(curl -fsSL "https://raw.githubusercontent.com/gxjxzgx/sing-box/main/.sb/part$i")"
-done
-TMP=$(mktemp)
-trap 'rm -f "$TMP"' EXIT
-echo "$B64" | base64 -d > "$TMP"
-chmod +x "$TMP"
-exec bash "$TMP" "$@"
+RAW="https://raw.githubusercontent.com/gxjxzgx/sing-box/60b449eca069c48d86ab5ed0726fb7a786fdacf3/sing-box2.sh"
+if command -v curl >/dev/null 2>&1; then
+  exec bash <(curl -fsSL "$RAW") "$@"
+elif command -v wget >/dev/null 2>&1; then
+  exec bash <(wget -qO- "$RAW") "$@"
+else
+  echo "需要 curl 或 wget" >&2
+  exit 1
+fi
