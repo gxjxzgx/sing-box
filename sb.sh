@@ -4,12 +4,12 @@
 # 老王 sing-box 多协议安装脚本（个人修改版）
 #
 # 协议:
-#   直连: vless-reality | hysteria2 | tuic | vless-ws（无 TLS）
+#   直连: vless-reality | hysteria2 | tuic | anytls
 #   Argo: vmess-ws | vless-ws | trojan-ws（经 Nginx + cloudflared）
-#   可选: anytls | socks5 | shadowsocks-2022
+#   可选: vless-ws（无 TLS）| socks5 | shadowsocks-2022
 #
 # 端口规划:
-#   直连  Reality=vless_port  HY2=+1  TUIC=+2  VLESS-WS直连=+3
+#   直连  Reality=vless_port  HY2=+1  TUIC=+2  AnyTLS=+3
 #   Argo  ARGO_PORT 为 Nginx 对外入口；内部 WS 为 ARGO_PORT+10~+12（仅本机）
 #   订阅  独立端口 SUB_PORT（默认可改）+ Argo 入口路径 /s/<token>
 #         直连: http://IP:SUB_PORT/s/<token>
@@ -27,9 +27,14 @@
 #
 # 基于: eooce/sing-box
 # 修改日期: 2026.9.27
-# 版本: v2.5.18
-#   v2.5.9~17  功能累积（端口/订阅/小磁盘等）
-#   v2.5.18  统一各菜单排版：分隔线、标题、返回项、输入提示一致
+# 版本: v2.6.0（全面优化版）
+#   v2.5.9~19 功能累积（端口/订阅/小磁盘/菜单/直连第4协议等）
+#   v2.6.0   1) 协议增删/WARP分流类函数统一走"备份→改配置→sing-box check→失败回滚"
+#            2) add_socks5_proxy 的协议解析改用纯 POSIX 正则，去掉 grep -P（Alpine busybox 兼容）
+#            3) Alpine 下自动 apk add bash（脚本自身用到大量 bash 专属语法，不能假设已装）
+#            4) remove_url_by_tag 的 sed 定界符改为 # 并对 tag 做安全校验，避免特殊字符注入
+#            5) nginx.conf / mime.types 备份文件只保留最近一份，不再无限堆积
+#            6) sing-box 最新版本获取增加 GitHub API 限流提示与本地缓存版本号 fallback
 # =========================
 export LANG=en_US.UTF-8
 # 定义颜色
@@ -68,6 +73,36 @@ export CFPORT=${CFPORT:-'443'}
 command_exists() {
     command -v "$1" >/dev/null 2>&1
 }
+
+# ---------- [优化新增] 跨平台 base64 解码封装 ----------
+# GNU coreutils 的 base64 支持长选项 --decode；Alpine 默认的 busybox base64
+# 只认短选项 -d，不认 --decode（--decode 在 busybox 下会解析失败/静默无输出）。
+# 脚本此前在改 UUID / 改 Argo 域名 / 改优选IP 三处都只写了 --decode，
+# 导致 Alpine 上这几个操作会让 vmess 节点悄悄更新失败而不报错。
+# 统一用这个函数：优先 -d（两种实现都支持标准短选项），失败再退回 --decode。
+b64_decode() {
+    base64 -d 2>/dev/null || base64 --decode 2>/dev/null
+}
+
+# ---------- [v2.6.0新增] Alpine 下确保 bash 已安装 ----------
+# 脚本大量使用数组、local、printf %q 等 bash 专属语法，busybox ash 无法解释。
+# 若通过 `apk add bash` 之前的裸 Alpine 直接跑本脚本，这里补装一次。
+ensure_bash_on_alpine() {
+    if command_exists apk && [ -z "${BASH_VERSION:-}" ]; then
+        # 理论上走到这里说明当前解释器不是 bash，但脚本已声明 #!/bin/bash，
+        # 正常情况下不会发生；此判断主要防御被 sh 强行调用的场景。
+        apk add --no-cache bash >/dev/null 2>&1 || true
+    elif command_exists apk && ! command_exists bash; then
+        yellow "检测到 Alpine 且未安装 bash，正在安装..."
+        apk add --no-cache bash >/dev/null 2>&1
+        if command_exists bash; then
+            green "bash 安装成功"
+        else
+            red "bash 安装失败，脚本后续可能无法正常运行，请手动执行: apk add bash"
+        fi
+    fi
+}
+ensure_bash_on_alpine
 
 # 自动清理 Argo 隧道令牌：去除常见前缀，仅保留有效 Token（通常以 eyJ 开头）
 # 支持粘贴完整命令，例如：
@@ -432,6 +467,22 @@ get_isp() {
     echo "${result:-$fallback}"
 }
 
+# [优化新增] 统一节点前缀计算
+# 默认安装的协议（Reality/HY2/TUIC/AnyTLS/Argo三协议）都用 ${node_prefix}-${isp}
+# 拼出前缀，但 manage_protocols 里手动新增的 Socks5 / VLESS-WS直连 / SS2022
+# 三个协议此前各自单独取 isp 直接拼节点名，完全没带用户设置的 node_prefix，
+# 也没有协议后缀，风格和默认协议不一致。这里抽成统一函数，谁调用都一样。
+build_node_prefix() {
+    local fallback="${1:-node}"
+    local isp
+    isp=$(get_isp "$fallback")
+    if [ -z "${node_prefix:-}" ]; then
+        echo "$isp"
+    else
+        echo "${node_prefix}-${isp}"
+    fi
+}
+
 # 刷新本地 sub.txt（base64 节点列表，兼容 GNU / BusyBox base64；HTTP 由 Nginx /s/<token> 提供）
 refresh_sub() {
     local src="${1:-$client_dir}"
@@ -442,6 +493,45 @@ refresh_sub() {
         base64 "$src" | tr -d '\n\r' > "${work_dir}/sub.txt"
     fi
     chmod 644 "${work_dir}/sub.txt" 2>/dev/null || true
+}
+
+# ---------- [v2.6.0新增] sing-box config 变更的统一"校验+回滚"封装 ----------
+# 用法: apply_json_change <jq命令字符串数组...> 由调用方在外部完成 jq 写 tmp 文件，
+# 这里只负责: 备份原文件 -> mv tmp 覆盖 -> sing-box check -> 失败则回滚并返回非0。
+# 所有会修改 inbounds.json / route.json / outbounds.json 并且随后要 restart_singbox
+# 的地方，统一改为调用这个函数，避免"改坏配置但没有回滚"的问题。
+safe_apply_conf() {
+    local target_file="$1"   # 要覆盖的正式配置文件，例如 ${conf_dir}/inbounds.json
+    local tmp_file="$2"      # jq 已经写好的临时文件
+    local label="${3:-配置}"
+
+    if [ ! -s "$tmp_file" ]; then
+        red "${label} 生成失败（临时文件为空），已取消本次修改"
+        rm -f "$tmp_file"
+        return 1
+    fi
+
+    # jq 输出必须是合法 JSON，防止半截写坏
+    if command_exists jq && ! jq empty "$tmp_file" >/dev/null 2>&1; then
+        red "${label} 生成的 JSON 不合法，已取消本次修改"
+        rm -f "$tmp_file"
+        return 1
+    fi
+
+    local backup_file="${target_file}.bak.safeapply"
+    cp -f "$target_file" "$backup_file" 2>/dev/null || true
+    mv -f "$tmp_file" "$target_file"
+
+    if [ -x "${work_dir}/sing-box" ] && ! "${work_dir}/sing-box" check -C "${conf_dir}" >/dev/null 2>&1; then
+        red "${label} 校验失败（sing-box check 未通过），已自动回滚"
+        if [ -f "$backup_file" ]; then
+            mv -f "$backup_file" "$target_file"
+        fi
+        return 1
+    fi
+
+    rm -f "$backup_file"
+    return 0
 }
 
 # 订阅：令牌 + 独立端口 + 开关，写入 install.conf
@@ -715,15 +805,34 @@ install_singbox() {
         "${work_dir}/sing-box" version >/dev/null 2>&1
     }
 
+    # [v2.6.0] GitHub API 未认证限速约 60次/小时/IP，命中限流时给出明确提示，
+    # 并把上一次成功获取到的版本号缓存到本地，作为 API 失败时的 fallback，
+    # 避免"版本号拿不到就直接跳去镜像、用户却不知道发生了限流"的静默行为。
+    _sb_version_cache="${work_dir}/.sb_latest_version_cache"
     _sb_get_latest_version() {
-        local ver
-        ver=$(curl -sL --connect-timeout 10 --max-time 30 \
-            "https://api.github.com/repos/SagerNet/sing-box/releases/latest" 2>/dev/null \
-            | grep -o '"tag_name":[[:space:]]*"[^"]*"' | head -1 | cut -d'"' -f4 | sed 's/^v//')
+        local ver api_out
+        api_out=$(curl -sL --connect-timeout 10 --max-time 30 -w '\n%{http_code}' \
+            "https://api.github.com/repos/SagerNet/sing-box/releases/latest" 2>/dev/null)
+        local http_code="${api_out##*$'\n'}"
+        local body="${api_out%$'\n'*}"
+
+        if [ "$http_code" = "403" ] || [ "$http_code" = "429" ]; then
+            yellow "GitHub API 限流(HTTP ${http_code})，可能是当前出口 IP 请求过于频繁"
+        fi
+
+        ver=$(printf '%s' "$body" | grep -o '"tag_name":[[:space:]]*"[^"]*"' | head -1 | cut -d'"' -f4 | sed 's/^v//')
         if [ -z "$ver" ]; then
             ver=$(curl -sL --connect-timeout 10 --max-time 30 \
                 "https://github.com/SagerNet/sing-box/releases/latest" 2>/dev/null \
                 | grep -oE 'tag/v[0-9]+\.[0-9]+\.[0-9]+' | head -1 | sed 's|tag/v||')
+        fi
+
+        if [ -n "$ver" ]; then
+            mkdir -p "$(dirname "$_sb_version_cache")" 2>/dev/null || true
+            printf '%s' "$ver" > "$_sb_version_cache" 2>/dev/null || true
+        elif [ -f "$_sb_version_cache" ]; then
+            ver=$(cat "$_sb_version_cache" 2>/dev/null)
+            [ -n "$ver" ] && yellow "使用本地缓存的版本号: ${ver}（上次成功获取时记录）"
         fi
         printf '%s' "$ver"
     }
@@ -940,7 +1049,7 @@ install_singbox() {
     fi
 
     # ---------- 直连协议端口（vless_port ~ +3）----------
-    # SKIP_DIRECT=1 时不安装 Reality / HY2 / TUIC / VLESS-WS 直连
+    # SKIP_DIRECT=1 时不安装 Reality / HY2 / TUIC / AnyTLS
     export SKIP_DIRECT="${SKIP_DIRECT:-0}"
     while true; do
         if [ -z "$vless_port" ] && [ -t 0 ]; then
@@ -1017,10 +1126,10 @@ install_singbox() {
         vless_port=""
         hy2_port=""
         tuic_port=""
-        vless_ws_direct_port=""
+        anytls_port=""
         green "直连协议: 已跳过（不占用公网端口）"
     else
-        green "直连端口: Reality=${purple}${vless_port}${re}  HY2=$((vless_port+1))  TUIC=$((vless_port+2))  WS直连=$((vless_port+3))"
+        green "直连端口: Reality=${purple}${vless_port}${re}  HY2=$((vless_port+1))  TUIC=$((vless_port+2))  AnyTLS=$((vless_port+3))"
     fi
 
     # ---------- Argo 端口（ARGO_PORT 及 +10~+12；订阅另用 SUB_PORT）----------
@@ -1171,7 +1280,7 @@ install_singbox() {
     if [ "${SKIP_DIRECT:-0}" = "1" ]; then
         green "将使用端口: 仅 Argo=${ARGO_PORT}（已跳过直连）"
     else
-        green "将使用端口: Reality=${vless_port}  HY2=$((vless_port+1))  TUIC=$((vless_port+2))  WS直连=$((vless_port+3))  Argo=${ARGO_PORT}"
+        green "将使用端口: Reality=${vless_port}  HY2=$((vless_port+1))  TUIC=$((vless_port+2))  AnyTLS=$((vless_port+3))  Argo=${ARGO_PORT}"
     fi
 
     # ---------- 交互式输入：隧道类型 / 固定隧道域名 / 隧道令牌 ----------
@@ -1256,10 +1365,10 @@ install_singbox() {
     private_key=""
     public_key=""
     if [ "${SKIP_DIRECT:-0}" != "1" ]; then
-        # 公网协议端口：Reality / Hysteria2 / TUIC / VLESS-WS直连
+        # 公网协议端口：Reality / Hysteria2 / TUIC / AnyTLS
         hy2_port=$(($vless_port + 1))
         tuic_port=$(($vless_port + 2))
-        vless_ws_direct_port=$(($vless_port + 3))
+        anytls_port=$(($vless_port + 3))
         output=$(/etc/sing-box/sing-box generate reality-keypair 2>/dev/null)
         private_key=$(echo "${output}" | grep -i 'PrivateKey' | awk '{print $NF}' | tr -d '\r')
         public_key=$(echo "${output}" | grep -i 'PublicKey' | awk '{print $NF}' | tr -d '\r')
@@ -1280,7 +1389,7 @@ install_singbox() {
             printf 'PRIVATE_KEY=%s\n' "$private_key"
         } > "${work_dir}/reality.keys"
         chmod 600 "${work_dir}/reality.keys" 2>/dev/null || true
-        allow_port $vless_port/tcp $hy2_port/udp $tuic_port/udp $vless_ws_direct_port/tcp ${ARGO_PORT}/tcp > /dev/null 2>&1
+        allow_port $vless_port/tcp $hy2_port/udp $tuic_port/udp $anytls_port/tcp ${ARGO_PORT}/tcp > /dev/null 2>&1
     else
         allow_port ${ARGO_PORT}/tcp > /dev/null 2>&1
         green "已跳过 Reality 密钥与直连端口放行"
@@ -1291,9 +1400,13 @@ install_singbox() {
     ensure_sub_token
     SUB_ENABLED=1
     export SUB_ENABLED
-    # 若 SUB_PORT 与 Argo 冲突则自动错开
+    # 若 SUB_PORT 与 Argo 冲突则自动错开；同时避开直连端口区间（vless_port ~ +3）
     if [ "${SUB_PORT}" = "${ARGO_PORT}" ] || [ "${SUB_PORT}" = "$((ARGO_PORT + 10))" ] || [ "${SUB_PORT}" = "$((ARGO_PORT + 11))" ] || [ "${SUB_PORT}" = "$((ARGO_PORT + 12))" ]; then
         SUB_PORT=$((ARGO_PORT + 20))
+        export SUB_PORT
+    fi
+    if [ -n "${vless_port:-}" ] && [ "${SUB_PORT}" -ge "${vless_port}" ] 2>/dev/null && [ "${SUB_PORT}" -le "$((vless_port + 3))" ] 2>/dev/null; then
+        SUB_PORT=$((ARGO_PORT + 21))
         export SUB_PORT
     fi
     save_sub_conf
@@ -1498,18 +1611,19 @@ EOF
       }
     },
     {
-      "type": "vless",
-      "tag": "vless-ws-direct",
+      "type": "anytls",
+      "tag": "anytls",
       "listen": "::",
-      "listen_port": $vless_ws_direct_port,
+      "listen_port": $anytls_port,
       "users": [
         {
-          "uuid": "$uuid"
+          "password": "$uuid"
         }
       ],
-      "transport": {
-        "type": "ws",
-        "path": "/vless-ws"
+      "tls": {
+        "enabled": true,
+        "certificate_path": "$work_dir/cert.pem",
+        "key_path": "$work_dir/private.key"
       }
     },
     {
@@ -1869,11 +1983,11 @@ get_info() {
     fi
 
     # 若未在安装流程中赋值，从配置读取端口
-    if [ -z "$vless_port" ] || [ -z "$hy2_port" ] || [ -z "$tuic_port" ] || [ -z "$vless_ws_direct_port" ]; then
+    if [ -z "$vless_port" ] || [ -z "$hy2_port" ] || [ -z "$tuic_port" ] || [ -z "$anytls_port" ]; then
         [ -z "$vless_port" ] && vless_port=$(jq -r '.inbounds[] | select(.tag=="vless-reality") | .listen_port // empty' "${conf_dir}/inbounds.json" 2>/dev/null)
         [ -z "$hy2_port" ] && hy2_port=$(jq -r '.inbounds[] | select(.tag=="hysteria2") | .listen_port // empty' "${conf_dir}/inbounds.json" 2>/dev/null)
         [ -z "$tuic_port" ] && tuic_port=$(jq -r '.inbounds[] | select(.tag=="tuic") | .listen_port // empty' "${conf_dir}/inbounds.json" 2>/dev/null)
-        [ -z "$vless_ws_direct_port" ] && vless_ws_direct_port=$(jq -r '.inbounds[] | select(.tag=="vless-ws-direct") | .listen_port // empty' "${conf_dir}/inbounds.json" 2>/dev/null)
+        [ -z "$anytls_port" ] && anytls_port=$(jq -r '.inbounds[] | select(.tag=="anytls") | .listen_port // empty' "${conf_dir}/inbounds.json" 2>/dev/null)
     fi
 
     # Reality SNI 以配置为准（用户可能已修改伪装域名）
@@ -1911,8 +2025,8 @@ get_info() {
                 echo "tuic://${uuid}:${uuid}@${server_ip}:${tuic_port}?sni=www.bing.com&congestion_control=bbr&udp_relay_mode=native&alpn=h3&allow_insecure=1#${prefix}-tuic"
                 echo ""
             fi
-            if [ -n "$vless_ws_direct_port" ]; then
-                echo "vless://${uuid}@${server_ip}:${vless_ws_direct_port}?encryption=none&security=none&type=ws&host=${server_ip}&path=%2Fvless-ws#${prefix}-vless-ws"
+            if [ -n "$anytls_port" ]; then
+                echo "anytls://${uuid}@${server_ip}:${anytls_port}?insecure=1&sni=bing.com#${prefix}-anytls"
                 echo ""
             fi
         fi
@@ -1946,6 +2060,13 @@ get_info() {
     send_tg_nodes 2>/dev/null || true
 }
 
+# ---------- [v2.6.0] nginx.conf / mime.types 备份只保留最近一份 ----------
+_prune_nginx_backup() {
+    local pattern="$1"   # 例如 /etc/nginx/nginx.conf.bak.sb.*
+    # shellcheck disable=SC2086
+    ls -1t ${pattern} 2>/dev/null | tail -n +2 | xargs -r rm -f
+}
+
 # Nginx：Argo 隧道路径分流 + /s/<token> 订阅；独立订阅见 sb-sub.conf
 add_nginx_conf() {
     if ! command_exists nginx; then
@@ -1977,6 +2098,8 @@ add_nginx_conf() {
     # 历史问题：系统 mime.types 可能缺失、截断、缺 }，导致 nginx -t 失败
     if [ -f /etc/nginx/mime.types ]; then
         cp -f /etc/nginx/mime.types "/etc/nginx/mime.types.bak.sb.$(date +%s)" 2>/dev/null || true
+        # [v2.6.0] 只保留最近一份备份，避免反复重装后堆积
+        _prune_nginx_backup "/etc/nginx/mime.types.bak.sb.*"
     fi
     cat > /etc/nginx/mime.types << 'MIMEOF'
 types {
@@ -2208,15 +2331,26 @@ _fix_nginx_user_directive() { :; }
 _write_minimal_nginx_conf() { :; }
 
 # 从已安装配置中获取UUID
+# [优化] 原实现按 .type == "vless" 模糊匹配，若同时存在
+# vless-reality / vless-ws(argo) / vless-ws-direct 三个 inbound，
+# jq 会把三条 UUID 都选出来，最终靠 head -1 只取数组里排在前面的一条，
+# 一旦某个 inbound 的 UUID 被单独改过就会取错。
+# 这里改为按明确的 tag 优先级依次尝试，取不到才降级到按 type 兜底。
 get_current_uuid() {
     local inbounds_file="${conf_dir}/inbounds.json"
-    if [ -f "$inbounds_file" ]; then
-        local uuid
-        uuid=$(jq -r '.inbounds[] | select(.type == "vless") | .users[0].uuid // empty' "$inbounds_file" 2>/dev/null | head -1)
-        [ -z "$uuid" ] && uuid=$(jq -r '.inbounds[] | select(.type == "vmess") | .users[0].uuid // empty' "$inbounds_file" 2>/dev/null | head -1)
-        [ -z "$uuid" ] && uuid=$(jq -r '.inbounds[] | select(.type == "hysteria2") | .users[0].password // empty' "$inbounds_file" 2>/dev/null | head -1)
-        echo "$uuid"
-    fi
+    [ -f "$inbounds_file" ] || return 0
+    local uuid tag
+    for tag in vless-reality vmess-ws vless-ws vless-ws-direct trojan-ws; do
+        uuid=$(jq -r --arg tag "$tag" \
+            '.inbounds[] | select(.tag == $tag) | .users[0].uuid // .users[0].password // empty' \
+            "$inbounds_file" 2>/dev/null | head -1)
+        [ -n "$uuid" ] && { echo "$uuid"; return 0; }
+    done
+    # 兜底：按 type 模糊匹配（旧逻辑，仅在上面全部找不到时使用）
+    uuid=$(jq -r '.inbounds[] | select(.type == "vless") | .users[0].uuid // empty' "$inbounds_file" 2>/dev/null | head -1)
+    [ -z "$uuid" ] && uuid=$(jq -r '.inbounds[] | select(.type == "vmess") | .users[0].uuid // empty' "$inbounds_file" 2>/dev/null | head -1)
+    [ -z "$uuid" ] && uuid=$(jq -r '.inbounds[] | select(.type == "hysteria2") | .users[0].password // empty' "$inbounds_file" 2>/dev/null | head -1)
+    echo "$uuid"
 }
 
 # 通用服务管理函数
@@ -3079,7 +3213,7 @@ change_config() {
             skyblue "----------------"
             green "4. 修改Argo对外端口（Nginx入口，三协议共用）"
             skyblue "----------------"
-            green "5. 修改VLESS-WS直连端口（无TLS）"
+            green "5. 修改 AnyTLS 端口"
             skyblue "----------------"
             purple "0. 返回上一级"
             skyblue "----------------"
@@ -3103,21 +3237,12 @@ change_config() {
                         break
                     done
                     # 仅修改 tag=vless-reality，避免误改 vless-ws
-                    cp -f "$inbounds_file" "${inbounds_file}.bak.port" 2>/dev/null || true
-                    if ! jq --argjson port "$new_port" \
+                    jq --argjson port "$new_port" \
                         '(.inbounds[] | select(.tag == "vless-reality")).listen_port = $port' \
-                        "$inbounds_file" > "${inbounds_file}.tmp"; then
-                        red "配置修改失败，请检查 jq 与配置文件"
-                        rm -f "${inbounds_file}.tmp"
+                        "$inbounds_file" > "${inbounds_file}.tmp"
+                    if ! safe_apply_conf "$inbounds_file" "${inbounds_file}.tmp" "vless-reality 端口"; then
                         return 1
                     fi
-                    mv "${inbounds_file}.tmp" "$inbounds_file"
-                    if ! "${work_dir}/sing-box" check -C "${conf_dir}" >/dev/null 2>&1; then
-                        red "配置校验失败，已回滚"
-                        [ -f "${inbounds_file}.bak.port" ] && mv -f "${inbounds_file}.bak.port" "$inbounds_file"
-                        return 1
-                    fi
-                    rm -f "${inbounds_file}.bak.port"
                     allow_port $new_port/tcp > /dev/null 2>&1
                     restart_singbox
                     # 仅更新 reality 直连节点端口（排除 argo 的 vless-ws）；用端口后紧跟 ? 定位，兼容 IPv6 主机地址
@@ -3142,21 +3267,12 @@ change_config() {
                         fi
                         break
                     done
-                    cp -f "$inbounds_file" "${inbounds_file}.bak.port" 2>/dev/null || true
-                    if ! jq --argjson port "$new_port" \
+                    jq --argjson port "$new_port" \
                         '(.inbounds[] | select(.tag == "hysteria2")).listen_port = $port' \
-                        "$inbounds_file" > "${inbounds_file}.tmp"; then
-                        red "配置修改失败"
-                        rm -f "${inbounds_file}.tmp"
+                        "$inbounds_file" > "${inbounds_file}.tmp"
+                    if ! safe_apply_conf "$inbounds_file" "${inbounds_file}.tmp" "hysteria2 端口"; then
                         return 1
                     fi
-                    mv "${inbounds_file}.tmp" "$inbounds_file"
-                    if ! "${work_dir}/sing-box" check -C "${conf_dir}" >/dev/null 2>&1; then
-                        red "配置校验失败，已回滚"
-                        [ -f "${inbounds_file}.bak.port" ] && mv -f "${inbounds_file}.bak.port" "$inbounds_file"
-                        return 1
-                    fi
-                    rm -f "${inbounds_file}.bak.port"
                     allow_port $new_port/udp > /dev/null 2>&1
                     restart_singbox
                     # 用端口后紧跟 /? 定位，兼容 IPv6 主机地址
@@ -3181,21 +3297,12 @@ change_config() {
                         fi
                         break
                     done
-                    cp -f "$inbounds_file" "${inbounds_file}.bak.port" 2>/dev/null || true
-                    if ! jq --argjson port "$new_port" \
+                    jq --argjson port "$new_port" \
                         '(.inbounds[] | select(.tag == "tuic")).listen_port = $port' \
-                        "$inbounds_file" > "${inbounds_file}.tmp"; then
-                        red "配置修改失败"
-                        rm -f "${inbounds_file}.tmp"
+                        "$inbounds_file" > "${inbounds_file}.tmp"
+                    if ! safe_apply_conf "$inbounds_file" "${inbounds_file}.tmp" "tuic 端口"; then
                         return 1
                     fi
-                    mv "${inbounds_file}.tmp" "$inbounds_file"
-                    if ! "${work_dir}/sing-box" check -C "${conf_dir}" >/dev/null 2>&1; then
-                        red "配置校验失败，已回滚"
-                        [ -f "${inbounds_file}.bak.port" ] && mv -f "${inbounds_file}.bak.port" "$inbounds_file"
-                        return 1
-                    fi
-                    rm -f "${inbounds_file}.bak.port"
                     allow_port $new_port/udp > /dev/null 2>&1
                     restart_singbox
                     # 用端口后紧跟 ? 定位，兼容 IPv6 主机地址
@@ -3242,13 +3349,13 @@ change_config() {
                     green "\nArgo对外端口已修改为：${purple}${new_port}${re}（三个协议仍共用此入口）\n"
                     ;;
                 5)
-                    # VLESS-WS 直连（无 TLS）
-                    if ! jq -e '.inbounds[] | select(.tag=="vless-ws-direct")' "$inbounds_file" >/dev/null 2>&1; then
-                        red "当前未安装 VLESS-WS 直连协议（可能已选择跳过直连）"
+                    # AnyTLS
+                    if ! jq -e '.inbounds[] | select(.tag=="anytls")' "$inbounds_file" >/dev/null 2>&1; then
+                        red "当前未安装 AnyTLS 协议（可能已选择跳过直连）"
                         break
                     fi
                     while true; do
-                        reading "\n请输入 VLESS-WS 直连端口 (回车随机): " new_port
+                        reading "\n请输入 AnyTLS 端口 (回车随机): " new_port
                         [ -z "$new_port" ] && new_port=$(shuf -i 2000-65000 -n 1)
                         if ! [[ "$new_port" =~ ^[0-9]+$ ]] || [ "$new_port" -lt 1 ] || [ "$new_port" -gt 65535 ]; then
                             red "端口无效"; continue
@@ -3262,28 +3369,19 @@ change_config() {
                         fi
                         break
                     done
-                    cp -f "$inbounds_file" "${inbounds_file}.bak.port" 2>/dev/null || true
-                    if ! jq --argjson port "$new_port" \
-                        '(.inbounds[] | select(.tag == "vless-ws-direct")).listen_port = $port' \
-                        "$inbounds_file" > "${inbounds_file}.tmp"; then
-                        red "配置修改失败"
-                        rm -f "${inbounds_file}.tmp"
+                    jq --argjson port "$new_port" \
+                        '(.inbounds[] | select(.tag == "anytls")).listen_port = $port' \
+                        "$inbounds_file" > "${inbounds_file}.tmp"
+                    if ! safe_apply_conf "$inbounds_file" "${inbounds_file}.tmp" "AnyTLS 端口"; then
                         return 1
                     fi
-                    mv "${inbounds_file}.tmp" "$inbounds_file"
-                    if ! "${work_dir}/sing-box" check -C "${conf_dir}" >/dev/null 2>&1; then
-                        red "配置校验失败，已回滚"
-                        [ -f "${inbounds_file}.bak.port" ] && mv -f "${inbounds_file}.bak.port" "$inbounds_file"
-                        return 1
-                    fi
-                    rm -f "${inbounds_file}.bak.port"
                     allow_port $new_port/tcp > /dev/null 2>&1
                     restart_singbox
-                    # 仅更新无 TLS 的 vless-ws 直连节点（path=/vless-ws），兼容 IPv6
-                    sed -i -E "/path=%2Fvless-ws|path=\/vless-ws/ s/:[0-9]+\?/:${new_port}?/" "$client_dir"
+                    # 仅更新 anytls 节点，兼容 IPv6
+                    sed -i -E "/^anytls:\/\// s/:[0-9]+\?/:${new_port}?/" "$client_dir"
                     refresh_sub
                     while IFS= read -r line; do yellow "$line"; done < ${work_dir}/url.txt
-                    green "\nVLESS-WS 直连端口已修改为：${purple}${new_port}${re}\n"
+                    green "\nAnyTLS 端口已修改为：${purple}${new_port}${re}\n"
                     ;;
                 0) change_config ;;
                 *) red "无效的选项，请输入 1 到 5" ;;
@@ -3299,23 +3397,15 @@ change_config() {
             local sk_user sk_pass
             sk_user=$(printf '%s' "${new_uuid:0:8}")
             sk_pass=$(printf '%s' "${new_uuid: -12}")
-            cp -f "${conf_dir}/inbounds.json" "${conf_dir}/inbounds.json.bak.uuid" 2>/dev/null || true
-            if ! jq --arg uuid "$new_uuid" --arg sk_user "$sk_user" --arg sk_pass "$sk_pass" '
+            jq --arg uuid "$new_uuid" --arg sk_user "$sk_user" --arg sk_pass "$sk_pass" '
                 (.inbounds[] | select(.users != null) | .users[] | select(.uuid != null).uuid) = $uuid |
                 (.inbounds[] | select(.tag != "socks5-in" and .users != null) | .users[] | select(.password != null).password) = $uuid |
                 (.inbounds[] | select(.tag == "socks5-in") | .users[0].username) = $sk_user |
                 (.inbounds[] | select(.tag == "socks5-in") | .users[0].password) = $sk_pass
-            ' "${conf_dir}/inbounds.json" > "${conf_dir}/inbounds.json.tmp"; then
-                red "配置修改失败"; rm -f "${conf_dir}/inbounds.json.tmp"; return 1
-            fi
-            # 先替换再校验，确保 check 针对的是新配置
-            mv "${conf_dir}/inbounds.json.tmp" "${conf_dir}/inbounds.json"
-            if ! "${work_dir}/sing-box" check -C "${conf_dir}" >/dev/null 2>&1; then
-                red "配置校验失败，已回滚"
-                [ -f "${conf_dir}/inbounds.json.bak.uuid" ] && mv -f "${conf_dir}/inbounds.json.bak.uuid" "${conf_dir}/inbounds.json"
+            ' "${conf_dir}/inbounds.json" > "${conf_dir}/inbounds.json.tmp"
+            if ! safe_apply_conf "${conf_dir}/inbounds.json" "${conf_dir}/inbounds.json.tmp" "UUID"; then
                 return 1
             fi
-            rm -f "${conf_dir}/inbounds.json.bak.uuid"
             restart_singbox
             sed -i -E 's/(vless:\/\/|hysteria2:\/\/|anytls:\/\/|trojan:\/\/)[^@]*(@.*)/\1'"$new_uuid"'\2/' $client_dir
             sed -i -E "s#tuic://[0-9a-f-]{36}:[0-9a-f-]{36}@#tuic://$new_uuid:$new_uuid@#g" $client_dir
@@ -3331,7 +3421,7 @@ change_config() {
             while IFS= read -r _vm_line; do
                 [ -z "$_vm_line" ] && continue
                 _vm_enc="${_vm_line#vmess://}"
-                _vm_dec=$(echo "$_vm_enc" | base64 --decode 2>/dev/null) || continue
+                _vm_dec=$(echo "$_vm_enc" | b64_decode) || continue
                 _vm_upd=$(echo "$_vm_dec" | jq --arg id "$new_uuid" '.id = $id' 2>/dev/null) || continue
                 [ -z "$_vm_upd" ] && continue
                 _vm_new=$(echo "$_vm_upd" | base64 -w0 2>/dev/null || echo "$_vm_upd" | base64 | tr -d '\n')
@@ -3355,22 +3445,15 @@ change_config() {
                 "4") new_sni="www.cerebrium.ai" ;;
                 "5") new_sni="www.nazhumi.com" ;;
             esac
-            cp -f "${conf_dir}/inbounds.json" "${conf_dir}/inbounds.json.bak.sni" 2>/dev/null || true
-            if ! jq --arg sni "$new_sni" \
+            jq --arg sni "$new_sni" \
                '(.inbounds[] | select(.tag == "vless-reality") | .tls.server_name) = $sni |
                 (.inbounds[] | select(.tag == "vless-reality") | .tls.reality.handshake.server) = $sni' \
-               "${conf_dir}/inbounds.json" > "${conf_dir}/inbounds.json.tmp"; then
-                red "配置修改失败"; rm -f "${conf_dir}/inbounds.json.tmp"; return 1
-            fi
-            mv "${conf_dir}/inbounds.json.tmp" "${conf_dir}/inbounds.json"
-            if ! "${work_dir}/sing-box" check -C "${conf_dir}" >/dev/null 2>&1; then
-                red "配置校验失败，已回滚"
-                [ -f "${conf_dir}/inbounds.json.bak.sni" ] && mv -f "${conf_dir}/inbounds.json.bak.sni" "${conf_dir}/inbounds.json"
+               "${conf_dir}/inbounds.json" > "${conf_dir}/inbounds.json.tmp"
+            if ! safe_apply_conf "${conf_dir}/inbounds.json" "${conf_dir}/inbounds.json.tmp" "Reality SNI"; then
                 return 1
             fi
-            rm -f "${conf_dir}/inbounds.json.bak.sni"
             restart_singbox
-            # 仅更新 Reality 节点的 sni，避免误改无 TLS 的 vless-ws 直连
+            # 仅更新 Reality 节点的 sni
             sed -i -E "/flow=xtls-rprx-vision/s/(sni=)[^&]*/\1${new_sni}/" $client_dir
             refresh_sub
             while IFS= read -r line; do yellow "$line"; done < ${work_dir}/url.txt
@@ -3412,10 +3495,13 @@ IEOF
             ip=$(get_realip)
             fingerprint=$(openssl x509 -noout -fingerprint -sha256 -in "${work_dir}/cert.pem" | cut -d'=' -f2 | sed 's/:/%3A/g')
             uuid=$(sed -n 's/.*hysteria2:\/\/\([^@]*\)@.*/\1/p' $client_dir)
-            line_number=$(grep -n 'hysteria2://' $client_dir | cut -d':' -f1)
             isp=$(get_isp "node")
+            # [修复] 原实现在删除旧 hysteria2 行之前先记下它的行号，
+            # 但 sed 删除后文件整体少了一行，再按旧行号插入会导致新行
+            # 比预期位置晚插入一行（off-by-one，纯展示顺序问题，不影响功能）。
+            # 改为直接删除后追加到文件末尾，不依赖行号计算。
             sed -i.bak "/hysteria2:/d" $client_dir
-            sed -i "${line_number}i hysteria2://$uuid@$ip:$listen_port?peer=www.bing.com&insecure=1&pinSHA256=${fingerprint}&alpn=h3&obfs=none&mport=$listen_port,$min_port-$max_port#$isp" $client_dir
+            echo "hysteria2://$uuid@$ip:$listen_port?peer=www.bing.com&insecure=1&pinSHA256=${fingerprint}&alpn=h3&obfs=none&mport=$listen_port,$min_port-$max_port#$isp" >> $client_dir
             refresh_sub
             while IFS= read -r line; do yellow "$line"; done < ${work_dir}/url.txt
             green "\nhysteria2端口跳跃已开启：${purple}$min_port-$max_port${re}\n"
@@ -3454,7 +3540,7 @@ IEOF
             if grep -Eq '^(vless|hysteria2|tuic|anytls|socks|ss)://[^@]+@\[[0-9a-fA-F:]+\]' "$client_dir"; then
                 # 替换 @ 后的 IPv6 主机
                 sed -i -E "/^(vless|hysteria2|tuic|anytls|socks|ss):\/\// s#@\[[0-9a-fA-F:]+\]#@${new_ipv4}#g" "$client_dir"
-                # 同步直连节点 host=（无 TLS 的 vless-ws 依赖 Host 头；仅改 path=/vless-ws 行，不动 argo）
+                # 同步直连节点 host=（可选 vless-ws 依赖 Host 头；仅改 path=/vless-ws 行，不动 argo）
                 sed -i -E "/path=%2Fvless-ws|path=\/vless-ws/ s#(host=)\[[0-9a-fA-F:]+\]#\1${new_ipv4}#g" "$client_dir"
                 green "\n已将 IPv6 修改为 IPv4: $new_ipv4 可复制以下节点或更新订阅\n"
                 check_nodes
@@ -3540,7 +3626,7 @@ IEOF
             while IFS= read -r _vm_line; do
                 [ -z "$_vm_line" ] && continue
                 _vm_enc="${_vm_line#vmess://}"
-                _vm_dec=$(echo "$_vm_enc" | base64 -d 2>/dev/null || echo "$_vm_enc" | base64 --decode 2>/dev/null) || continue
+                _vm_dec=$(echo "$_vm_enc" | b64_decode) || continue
                 _vm_upd=$(echo "$_vm_dec" | jq --arg ps "${prefix}-argo-vmess" '.ps = $ps' 2>/dev/null) || continue
                 [ -z "$_vm_upd" ] && continue
                 _vm_new=$(echo "$_vm_upd" | base64 -w0 2>/dev/null || echo "$_vm_upd" | base64 | tr -d '\n')
@@ -3764,7 +3850,7 @@ change_argo_domain() {
     while IFS= read -r _vm_line; do
         [ -z "$_vm_line" ] && continue
         _vm_enc="${_vm_line#vmess://}"
-        _vm_dec=$(echo "$_vm_enc" | base64 --decode 2>/dev/null) || continue
+        _vm_dec=$(echo "$_vm_enc" | b64_decode) || continue
         _vm_upd=$(echo "$_vm_dec" | jq --arg d "$ArgoDomain" '.host = $d | .sni = $d' 2>/dev/null) || continue
         [ -z "$_vm_upd" ] && continue
         _vm_new=$(echo "$_vm_upd" | base64 -w0 2>/dev/null || echo "$_vm_upd" | base64 | tr -d '\n')
@@ -4179,7 +4265,7 @@ change_cfip() {
     while IFS= read -r _vm_line; do
         [ -z "$_vm_line" ] && continue
         _vm_enc="${_vm_line#vmess://}"
-        _vm_dec=$(echo "$_vm_enc" | base64 --decode 2>/dev/null) || continue
+        _vm_dec=$(echo "$_vm_enc" | b64_decode) || continue
         _vm_upd=$(echo "$_vm_dec" | jq --arg cfip "$cfip" --argjson cfport "$cfport" '.add = $cfip | .port = ($cfport|tonumber)' 2>/dev/null) || continue
         [ -z "$_vm_upd" ] && continue
         _vm_new=$(echo "$_vm_upd" | base64 -w0 2>/dev/null || echo "$_vm_upd" | base64 | tr -d '\n')
@@ -4322,7 +4408,10 @@ add_rule_menu() {
         else
             .route.rules += [{"rule_set": [$tag], "outbound": $out}]
         end
-    ' "$route_file" > "${route_file}.tmp" && mv "${route_file}.tmp" "$route_file"
+    ' "$route_file" > "${route_file}.tmp"
+    if ! safe_apply_conf "$route_file" "${route_file}.tmp" "分流规则(${rule_tag})"; then
+        warp_manage; return
+    fi
 
     restart_singbox
     green "'${rule_tag}' 已分流至出站 '${selected_out}'"
@@ -4356,13 +4445,20 @@ set_global_outbound() {
     fi
     local selected_out="${proxy_tags[$((out_choice-1))]}"
 
-    # 将路由 final 设为所选代理，并暂时移除 direct，避免流量绕过
-    # 保留 route.json / endpoints.json，避免后续分流菜单操作已删除文件
-    jq 'del(.outbounds[] | select(.tag == "direct"))' \
-        "$outbound_file" > "${outbound_file}.tmp" && mv "${outbound_file}.tmp" "$outbound_file"
+    # [修复] 原实现先 `del direct` 再校验，但 route.json 里每条 rule_set 都写死了
+    # "download_detour":"direct"，direct 一旦被删掉，sing-box check 会因为
+    # route 引用了不存在的 outbound 而失败，safe_apply_conf 随即自动回滚——
+    # 也就是说这个"全局代理"功能此前大概率从未真正生效过，只是静默失败退出。
+    #
+    # 修复思路：不删除 direct（它仍要留着给 rule_set 下载用，属于控制面而非
+    # 用户数据面），只把 route.final 指向所选代理，即可让所有未被其它规则
+    # 匹配到的流量走全局代理，效果等价且不会破坏 rule_set 下载。
     if [ -f "$route_file" ]; then
         jq --arg out "$selected_out" '.route.final = $out' \
-            "$route_file" > "${route_file}.tmp" && mv "${route_file}.tmp" "$route_file"
+            "$route_file" > "${route_file}.tmp"
+        if ! safe_apply_conf "$route_file" "${route_file}.tmp" "全局代理出站(route)"; then
+            warp_manage; return
+        fi
     else
         # 若 route 已不存在，写入最小可用配置
         cat > "$route_file" << EOF
@@ -4387,11 +4483,19 @@ restore_direct_outbound() {
     # 恢复 outbounds.json 中的 direct 出站（不存在则插入到数组最前面）
     if ! jq -e '.outbounds[] | select(.tag == "direct")' "$outbound_file" > /dev/null 2>&1; then
         jq '.outbounds = [{"type": "direct", "tag": "direct"}] + .outbounds' \
-            "$outbound_file" > "${outbound_file}.tmp" && mv "${outbound_file}.tmp" "$outbound_file"
+            "$outbound_file" > "${outbound_file}.tmp"
+        if ! safe_apply_conf "$outbound_file" "${outbound_file}.tmp" "恢复 direct 出站"; then
+            warp_manage; return
+        fi
     fi
 
+    # [修复] 原实现直接 `cat >` 覆盖 route.json / endpoints.json，没有走脚本
+    # 自己定义的"备份→改→check→失败回滚"(safe_apply_conf)流程，一旦这段
+    # 静态内容以后被改动引入变量插值出错，就没有校验和回滚兜底。
+    # 这里改为先写临时文件，再统一走 safe_apply_conf 校验落地。
+
     # 恢复默认 route.json
-    cat > "${route_file}" << 'EOF'
+    cat > "${route_file}.tmp" << 'EOF'
 {
   "route": {
     "rule_set": [
@@ -4410,9 +4514,12 @@ restore_direct_outbound() {
   }
 }
 EOF
+    if ! safe_apply_conf "$route_file" "${route_file}.tmp" "恢复默认路由(route.json)"; then
+        warp_manage; return
+    fi
 
     # 恢复默认 endpoints.json
-    cat > "${conf_dir}/endpoints.json" << EOF
+    cat > "${conf_dir}/endpoints.json.tmp" << EOF
 {
   "endpoints": [
     {
@@ -4437,6 +4544,10 @@ EOF
   ]
 }
 EOF
+    if ! safe_apply_conf "${conf_dir}/endpoints.json" "${conf_dir}/endpoints.json.tmp" "恢复默认出站端点(endpoints.json)"; then
+        warp_manage; return
+    fi
+
     restart_singbox
     green "\n已恢复服务器原IP出站，所有流量走 direct。\n"
     sleep 2; warp_manage
@@ -4458,7 +4569,10 @@ delete_rule_menu() {
     jq --arg tag "$tag" \
        'del(.route.rules[] | select(.rule_set != null) | .rule_set[] | select(. == $tag)) |
         .route.rules = [.route.rules[] | select(.rule_set != null and (.rule_set | length) > 0)]' \
-       "$route_file" > "${route_file}.tmp" && mv "${route_file}.tmp" "$route_file"
+       "$route_file" > "${route_file}.tmp"
+    if ! safe_apply_conf "$route_file" "${route_file}.tmp" "删除分流规则(${tag})"; then
+        warp_manage; return
+    fi
     restart_singbox
     green "规则集 '${tag}' 已禁用。"
     sleep 1; warp_manage
@@ -4469,7 +4583,9 @@ add_socks5_proxy() {
     reading "请输入代理URL (支持socks://,socks5://,http:// 支持v2rayN导出的节点链接): " proxy_url
     [ -z "$proxy_url" ] && { red "输入为空！"; sleep 1; return; }
 
-    proto=$(echo "$proxy_url" | grep -oP '^[a-zA-Z0-9]+(?=://)')
+    # [v2.6.0] 原来用 grep -oP，busybox grep（Alpine 默认）不支持 -P，这里改为
+    # sed 提取 "://" 之前的协议名，纯 POSIX 正则，Alpine/Debian/CentOS 通用。
+    proto=$(printf '%s' "$proxy_url" | sed -n 's#^\([a-zA-Z0-9]*\)://.*#\1#p')
     [[ ! "$proto" =~ ^(socks5|socks|http)$ ]] && { red "不支持的协议"; sleep 2; return; }
     case "$proto" in
         socks|socks5) outbound_type="socks" ;;
@@ -4557,19 +4673,23 @@ add_socks5_proxy() {
         jq --arg type "$outbound_type" --arg tag "$tag" --arg server "$server" \
            --arg port "$port" --arg user "$user" --arg password "$password" \
            '.outbounds += [{"type":$type,"tag":$tag,"server":$server,"server_port":($port|tonumber),"username":$user,"password":$password}]' \
-           "$outbound_file" > "${outbound_file}.tmp" && mv "${outbound_file}.tmp" "$outbound_file"
+           "$outbound_file" > "${outbound_file}.tmp"
     else
         # 无账号密码：不写 username/password 字段
         jq --arg type "$outbound_type" --arg tag "$tag" --arg server "$server" \
            --arg port "$port" \
            '.outbounds += [{"type":$type,"tag":$tag,"server":$server,"server_port":($port|tonumber)}]' \
-           "$outbound_file" > "${outbound_file}.tmp" && mv "${outbound_file}.tmp" "$outbound_file"
+           "$outbound_file" > "${outbound_file}.tmp"
+    fi
+    if ! safe_apply_conf "$outbound_file" "${outbound_file}.tmp" "Socks5/HTTP出站(${tag})"; then
+        sleep 2; return
     fi
 
     if jq -e '.route.rules | length > 0' "$route_file" >/dev/null 2>&1; then
-        jq --arg tag "$tag" '.route.rules[].outbound = $tag' "$route_file" > "${route_file}.tmp" \
-            && mv "${route_file}.tmp" "$route_file"
-        yellow "已将现有分流规则出站切换为 '${tag}'。"
+        jq --arg tag "$tag" '.route.rules[].outbound = $tag' "$route_file" > "${route_file}.tmp"
+        if safe_apply_conf "$route_file" "${route_file}.tmp" "切换分流出站为${tag}"; then
+            yellow "已将现有分流规则出站切换为 '${tag}'。"
+        fi
     fi
 
     restart_singbox
@@ -4594,8 +4714,12 @@ delete_socks5_proxy() {
     fi
     [ "$tag" == "wireguard-out" ] && { red "wireguard-out 为系统内置，不可删除！"; sleep 2; return; }
 
-    jq --arg tag "$tag" 'del(.outbounds[] | select(.tag == $tag))' "$outbound_file" > "${outbound_file}.tmp" && mv "${outbound_file}.tmp" "$outbound_file"
-    jq --arg tag "$tag" '.route.rules = [.route.rules[] | select(.outbound != $tag)]' "$route_file" > "${route_file}.tmp" && mv "${route_file}.tmp" "$route_file"
+    jq --arg tag "$tag" 'del(.outbounds[] | select(.tag == $tag))' "$outbound_file" > "${outbound_file}.tmp"
+    if ! safe_apply_conf "$outbound_file" "${outbound_file}.tmp" "删除出站(${tag})"; then
+        sleep 1; return
+    fi
+    jq --arg tag "$tag" '.route.rules = [.route.rules[] | select(.outbound != $tag)]' "$route_file" > "${route_file}.tmp"
+    safe_apply_conf "$route_file" "${route_file}.tmp" "清理分流规则(${tag})" || true
 
     restart_singbox
     green "${tag} 代理出站已删除。"
@@ -4603,7 +4727,7 @@ delete_socks5_proxy() {
 }
 
 # ============================================================
-# 协议管理模块 - 增加/删除 socks5 / anytls / shadowsocks-2022
+# 协议管理模块 - 增加/删除 socks5 / vless-ws直连(无TLS) / shadowsocks-2022
 # ============================================================
 
 # 检查指定 tag 是否已在 inbounds 中存在
@@ -4612,10 +4736,21 @@ proto_exists() {
     jq -e --arg tag "$tag" '.inbounds[] | select(.tag == $tag)' "${conf_dir}/inbounds.json" > /dev/null 2>&1
 }
 
-# 更新订阅文件
+# [v2.6.0] 只允许出现在协议标签里的字符（字母/数字/短横线），
+# 防止 tag 被拼进 sed 正则时因为特殊字符（如 / . * [ ]）导致匹配错误甚至删错内容。
+_safe_proto_tag() {
+    local t="$1"
+    [[ "$t" =~ ^[A-Za-z0-9_-]+$ ]]
+}
+
+# 更新订阅文件（[v2.6.0] 用 # 做 sed 定界符并显式校验 tag，避免特殊字符注入/语法出错）
 remove_url_by_tag() {
     local tag="$1"
-    sed -i '/'^${tag}':\/\//d' "$client_dir"
+    if ! _safe_proto_tag "$tag"; then
+        red "内部错误：非法的协议标签 '${tag}'，已跳过订阅清理"
+        return 1
+    fi
+    sed -i "\\#^${tag}://#d" "$client_dir"
     sed -i '/^$/{N; /\n$/D}' "$client_dir"
 }
 
@@ -4642,7 +4777,10 @@ remove_protocol() {
     fi
 
     jq --arg tag "$tag" 'del(.inbounds[] | select(.tag == $tag))' \
-        "$inbounds_file" > "${inbounds_file}.tmp" && mv "${inbounds_file}.tmp" "$inbounds_file"
+        "$inbounds_file" > "${inbounds_file}.tmp"
+    if ! safe_apply_conf "$inbounds_file" "${inbounds_file}.tmp" "删除${label}"; then
+        sleep 1; return
+    fi
 
     remove_url_by_tag "$url_prefix"
     update_sub
@@ -4705,16 +4843,22 @@ add_socks5_inbound() {
            "listen": "::",
            "listen_port": $port,
            "users": [{"username": $user, "password": $pass}]
-       }]' "$inbounds_file" > "${inbounds_file}.tmp" && mv "${inbounds_file}.tmp" "$inbounds_file"
+       }]' "$inbounds_file" > "${inbounds_file}.tmp"
+    if ! safe_apply_conf "$inbounds_file" "${inbounds_file}.tmp" "Socks5 入站"; then
+        sleep 1; return
+    fi
 
     allow_port ${sk_port}/tcp ${sk_port}/udp > /dev/null 2>&1
 
     local server_ip
     server_ip=$(get_realip)
-    local isp
-    isp=$(get_isp "Socks5")
+    # [修复] 原来直接用裸 isp 命名，既不带 node_prefix 也没有协议后缀，
+    # 和默认协议 ${prefix}-协议名 的命名风格不一致；这里对齐"改前缀"工具
+    # (菜单6→9)已经假定的格式 ${prefix}-socks5。
+    local prefix
+    prefix=$(build_node_prefix "Socks5")
 
-    local url_line="socks://$(printf '%s' "${sk_user}:${sk_pass}" | base64 -w0)@${server_ip}:${sk_port}#${isp}"
+    local url_line="socks://$(printf '%s' "${sk_user}:${sk_pass}" | base64 -w0)@${server_ip}:${sk_port}#${prefix}-socks5"
 
     publish_node_url "$url_line"
 
@@ -4728,63 +4872,83 @@ remove_socks5_inbound() {
     remove_protocol "socks5-in" "socks" "Socks5"
 }
 
-# ---- AnyTLS ----
-add_anytls() {
+# ---- VLESS-WS 直连（无 TLS）----
+add_vless_ws_direct() {
     local inbounds_file="${conf_dir}/inbounds.json"
-    local tag="anytls"
+    local tag="vless-ws-direct"
 
     if proto_exists "$tag"; then
-        yellow "AnyTLS 协议已存在，无需重复添加。"; sleep 1; return
+        yellow "VLESS-WS 直连（无 TLS）已存在，无需重复添加。"; sleep 1; return
     fi
 
-    # 使用已安装协议的UUID作为密码
     local current_uuid
     current_uuid=$(get_current_uuid)
     if [ -z "$current_uuid" ]; then
         red "无法获取当前UUID，请确认 sing-box 已正确安装并配置。"; sleep 2; return
     fi
 
-    # 端口输入验证（含占用检测，复用通用端口选择函数）
-    read_available_port "请输入 AnyTLS 监听端口 (回车随机生成): " at_port
-    green "Anytls监听端口：${purple}${at_port}${re}"
+    read_available_port "请输入 VLESS-WS 直连端口 (回车随机生成): " ws_port
+    green "VLESS-WS 直连端口：${purple}${ws_port}${re}"
 
     jq --arg tag "$tag" \
-       --argjson port "$at_port" \
-       --arg pass "$current_uuid" \
-       --arg cert "${work_dir}/cert.pem" \
-       --arg key "${work_dir}/private.key" \
+       --argjson port "$ws_port" \
+       --arg uid "$current_uuid" \
        '.inbounds += [{
-           "type": "anytls",
+           "type": "vless",
            "tag": $tag,
            "listen": "::",
            "listen_port": $port,
-           "users": [{"password": $pass}],
-           "tls": {
-               "enabled": true,
-               "certificate_path": $cert,
-               "key_path": $key
+           "users": [{"uuid": $uid}],
+           "transport": {
+               "type": "ws",
+               "path": "/vless-ws"
            }
-       }]' "$inbounds_file" > "${inbounds_file}.tmp" && mv "${inbounds_file}.tmp" "$inbounds_file"
+       }]' "$inbounds_file" > "${inbounds_file}.tmp"
+    if ! safe_apply_conf "$inbounds_file" "${inbounds_file}.tmp" "VLESS-WS 直连"; then
+        sleep 1; return
+    fi
 
-    allow_port ${at_port}/tcp > /dev/null 2>&1
+    allow_port ${ws_port}/tcp > /dev/null 2>&1
 
     local server_ip
     server_ip=$(get_realip)
-    local isp
-    isp=$(get_isp "AnyTLS")
+    # [修复] 对齐"改前缀"工具(菜单6→9)已假定的格式 ${prefix}-vless-ws
+    local prefix
+    prefix=$(build_node_prefix "VLESS-WS")
 
-    local url_line="anytls://${current_uuid}@${server_ip}:${at_port}?insecure=1&sni=bing.com#${isp}"
+    local url_line="vless://${current_uuid}@${server_ip}:${ws_port}?encryption=none&security=none&type=ws&host=${server_ip}&path=%2Fvless-ws#${prefix}-vless-ws"
 
     publish_node_url "$url_line"
 
-    green "\nAnyTLS 协议已添加！"
-    green "密码(UUID): ${purple}${current_uuid}${re}"
-    green "端口: ${purple}${at_port}${re}"
+    green "\nVLESS-WS 直连（无 TLS）已添加！"
+    green "UUID: ${purple}${current_uuid}${re}"
+    green "端口: ${purple}${ws_port}${re}"
     green "节点链接:\n${purple}${url_line}${re}\n"
 }
 
-remove_anytls() {
-    remove_protocol "anytls" "anytls" "AnyTLS"
+remove_vless_ws_direct() {
+    local tag="vless-ws-direct"
+    local inbounds_file="${conf_dir}/inbounds.json"
+    local label="VLESS-WS直连"
+
+    if ! proto_exists "$tag"; then
+        yellow "${label} 协议未添加，无需删除。"; sleep 1; return
+    fi
+
+    jq --arg tag "$tag" 'del(.inbounds[] | select(.tag == $tag))' \
+        "$inbounds_file" > "${inbounds_file}.tmp"
+    if ! safe_apply_conf "$inbounds_file" "${inbounds_file}.tmp" "删除${label}"; then
+        sleep 1; return
+    fi
+
+    # 只删无 TLS 直连（path=/vless-ws），不动 Reality 与 Argo 的 vless://
+    if [ -f "$client_dir" ]; then
+        sed -i -E '/^vless:\/\// { /path=%2Fvless-ws|path=\/vless-ws/ d; }' "$client_dir"
+        sed -i '/^$/{N; /\n$/D}' "$client_dir"
+    fi
+    update_sub
+    restart_singbox
+    green "\n${label} 协议已删除\n"
 }
 
 # ---- Shadowsocks-2022 ----
@@ -4828,18 +4992,22 @@ add_ss2022() {
            "method": $method,
            "password": $key,
            "multiplex": {"enabled": true}
-       }]' "$inbounds_file" > "${inbounds_file}.tmp" && mv "${inbounds_file}.tmp" "$inbounds_file"
+       }]' "$inbounds_file" > "${inbounds_file}.tmp"
+    if ! safe_apply_conf "$inbounds_file" "${inbounds_file}.tmp" "Shadowsocks-2022"; then
+        sleep 1; return
+    fi
 
     allow_port ${ss_port}/tcp ${ss_port}/udp > /dev/null 2>&1
 
     local server_ip
     server_ip=$(get_realip)
-    local isp
-    isp=$(get_isp "SS2022")
+    # [修复] 对齐"改前缀"工具(菜单6→9)已假定的格式 ${prefix}-ss2022
+    local prefix
+    prefix=$(build_node_prefix "SS2022")
 
     local ss_userinfo
     ss_userinfo=$(printf '%s:%s' "${ss_method}" "${ss_key}" | base64 -w0)
-    local url_line="ss://${ss_userinfo}@${server_ip}:${ss_port}#${isp}"
+    local url_line="ss://${ss_userinfo}@${server_ip}:${ss_port}#${prefix}-ss2022"
 
     publish_node_url "$url_line"
 
@@ -4872,14 +5040,13 @@ show_extra_proto_status() {
         echo -e " Socks5:           ${yellow}未启用${re}"
     fi
 
-    # AnyTLS
-    if jq -e '.inbounds[] | select(.tag == "anytls")' "$inbounds_file" > /dev/null 2>&1; then
-        local at_port at_pass
-        at_port=$(jq -r '.inbounds[] | select(.tag == "anytls") | .listen_port' "$inbounds_file")
-        at_pass=$(jq -r '.inbounds[] | select(.tag == "anytls") | .users[0].password // "N/A"' "$inbounds_file")
-        echo -e " AnyTLS:           ${green}已启用${re} (端口: ${skyblue}${at_port}${re}, 密码: ${skyblue}${at_pass}${re})"
+    # VLESS-WS 直连（无 TLS）
+    if jq -e '.inbounds[] | select(.tag == "vless-ws-direct")' "$inbounds_file" > /dev/null 2>&1; then
+        ws_port=$(jq -r '.inbounds[] | select(.tag == "vless-ws-direct") | .listen_port' "$inbounds_file")
+        ws_uuid=$(jq -r '.inbounds[] | select(.tag == "vless-ws-direct") | .users[0].uuid // "N/A"' "$inbounds_file")
+        echo -e " VLESS-WS直连:     ${green}已启用${re} (端口: ${skyblue}${ws_port}${re}, UUID: ${skyblue}${ws_uuid}${re})"
     else
-        echo -e " AnyTLS:           ${yellow}未启用${re}"
+        echo -e " VLESS-WS直连:     ${yellow}未启用${re}"
     fi
 
     # Shadowsocks-2022
@@ -4910,9 +5077,9 @@ manage_protocols() {
     green "1. 添加 Socks5 协议"
     red   "2. 删除 Socks5 协议"
     skyblue "----------------"
-    green "--- AnyTLS 协议 ---"
-    green "3. 添加 AnyTLS 协议"
-    red   "4. 删除 AnyTLS 协议"
+    green "--- VLESS-WS 直连（无 TLS）---"
+    green "3. 添加 VLESS-WS 直连（无 TLS）"
+    red   "4. 删除 VLESS-WS 直连（无 TLS）"
     skyblue "----------------"
     green "--- Shadowsocks-2022 协议 ---"
     green "5. 添加 Shadowsocks-2022 协议"
@@ -4925,8 +5092,8 @@ manage_protocols() {
     case "${proto_choice}" in
         1) add_socks5_inbound ;;
         2) remove_socks5_inbound ;;
-        3) add_anytls ;;
-        4) remove_anytls ;;
+        3) add_vless_ws_direct ;;
+        4) remove_vless_ws_direct ;;
         5) add_ss2022 ;;
         6) remove_ss2022 ;;
         0) menu; return ;;
