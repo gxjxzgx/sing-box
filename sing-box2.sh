@@ -1,39 +1,37 @@
 #!/bin/bash
 
 # =========================
-# 老王sing-box多协议安装脚本（个人修改版）
-# 协议: vless-reality | hysteria2 | tuic | vless-ws(直连, 无TLS)
-#       vmess-ws / vless-ws / trojan-ws (Argo 隧道)
-# 可额外添加: anytls / socks5 / ss2022
+# 老王 sing-box 多协议安装脚本（个人修改版）
+#
+# 协议:
+#   直连: vless-reality | hysteria2 | tuic | vless-ws（无 TLS）
+#   Argo: vmess-ws | vless-ws | trojan-ws（经 Nginx + cloudflared）
+#   可选: anytls | socks5 | shadowsocks-2022
 #
 # 端口规划:
-#   直连: Reality=vless_port  HY2=+1  TUIC=+2  VLESS-WS直连=+3
-#   Argo: ARGO_PORT(入口)  内部WS=+10~+12 (仅本机，不对外)
-#   订阅: Nginx 同端口路径 /s/<token>（base64）与 /s/<token>/raw（明文），无独立订阅端口
+#   直连  Reality=vless_port  HY2=+1  TUIC=+2  VLESS-WS直连=+3
+#   Argo  ARGO_PORT 为 Nginx 对外入口；内部 WS 为 ARGO_PORT+10~+12（仅本机）
+#   订阅  独立端口 SUB_PORT（默认可改）+ Argo 入口路径 /s/<token>
+#         直连: http://IP:SUB_PORT/s/<token>
+#         Argo: https://域名/s/<token>
 #
-# 本修改版变更摘要:
+# 主要特性:
 #   1. sing-box / cloudflared 优先官方下载，失败回退镜像
-#      - Alpine/musl：优先官方 -musl 构建 → 默认官方 → 镜像
-#      - 其它系统：优先官方默认 → 镜像
-#   2. 节点 IP 优先使用 IPv4
-#   3. 去除终端订阅链接与二维码输出；本地仍写 url.txt / sub.txt
-#   4. 端口冲突时明确提示占用端口，并支持交互修改
-#   5. 去掉 ARGO_PORT+13 独立订阅监听
-#   6. 安装时支持交互式输入：隧道端口、固定隧道域名、隧道令牌(Token/JSON)
-#   7. 固定隧道：域名留空直接回退临时隧道，不再询问令牌；令牌留空同样回退
-#   8. 令牌输入支持自动剥离前缀：sudo cloudflared service install / cloudflared.exe ... 等，仅保留 eyJ 开头有效 Token
-#   9. 保持 Argo→Nginx→三WS 架构；统一 Argo 配置辅助函数，清理重复代码
-#  10. 移除 qrencode（已无订阅二维码需求，额外协议也不再输出终端二维码）
-#  11. 清理废弃 HTTP 订阅菜单；cloudflared 增加可执行校验；Token 配置安全转义
-#  12. 移除主菜单「Nginx管理」（Nginx 仍由安装/Argo 自动配置，状态仅展示）
+#      Alpine/musl 优先官方 -musl 构建
+#   2. 节点地址优先 IPv4；支持菜单切换 IPv4/IPv6（同步 host=）
+#   3. 端口占用用 port_really_in_use 判定，减少 TIME_WAIT 误报
+#   4. Argo 固定隧道 / 临时隧道；Token 自动剥离 cloudflared 安装前缀
+#   5. 安装可选跳过直连协议（仅 Argo）；SKIP_DIRECT / 密钥持久化
+#   6. HTTP 订阅：独立端口 SUB_PORT + Argo 路径 /s/<token>；主菜单5查看、7管理
+#   7. 支持 WARP 分流、Telegram 推送、额外协议增删
 #
-# 基于: eooce/sing-box  修改日期: 2026.9.22
-# 版本: v2.5.12
-#   - v2.5.9~11: 端口误报 / IPv6 改端口 / host= 同步 / WS直连改端口 / 配置回读
-#   - v2.5.12: get_info 无公钥时仍输出 HY2/TUIC/WS；恢复 HTTP 订阅链接
-#              (Nginx 路径 /s/<token> 与 /s/<token>/raw，经 Argo 或直连端口可访问)
+# 基于: eooce/sing-box
+# 修改日期: 2026.9.27
+# 版本: v2.5.14
+#   v2.5.9~13  端口/IPv6/host=/WS直连/回读/订阅/文件头
+#   v2.5.14  主菜单: 5=直接查看节点与订阅链接；7=管理节点订阅(+Nginx)
+#            独立订阅端口 SUB_PORT（默认可改），可开关/改端口/重启
 # =========================
-
 export LANG=en_US.UTF-8
 # 定义颜色
 re="\033[0m"
@@ -435,7 +433,7 @@ get_isp() {
     echo "${result:-$fallback}"
 }
 
-# 刷新本地 sub.txt（base64 节点列表，兼容 GNU / BusyBox base64；不再对外提供 HTTP 订阅）
+# 刷新本地 sub.txt（base64 节点列表，兼容 GNU / BusyBox base64；HTTP 由 Nginx /s/<token> 提供）
 refresh_sub() {
     local src="${1:-$client_dir}"
     [ -f "$src" ] || return 1
@@ -447,14 +445,35 @@ refresh_sub() {
     chmod 644 "${work_dir}/sub.txt" 2>/dev/null || true
 }
 
-# 订阅路径令牌：安装时生成并写入 install.conf；已有则复用
-ensure_sub_token() {
-    local tok=""
+# 订阅：令牌 + 独立端口 + 开关，写入 install.conf
+load_sub_conf() {
+    SKIP_DIRECT="${SKIP_DIRECT:-0}"
+    SUB_TOKEN="${SUB_TOKEN:-}"
+    SUB_PORT="${SUB_PORT:-}"
+    SUB_ENABLED="${SUB_ENABLED:-1}"
     if [ -f "${work_dir}/install.conf" ]; then
         # shellcheck source=/dev/null
         source "${work_dir}/install.conf" 2>/dev/null || true
-        tok="${SUB_TOKEN:-}"
     fi
+    SUB_ENABLED="${SUB_ENABLED:-1}"
+}
+
+save_sub_conf() {
+    local skip="${SKIP_DIRECT:-0}"
+    load_sub_conf
+    skip="${SKIP_DIRECT:-$skip}"
+    {
+        printf 'SKIP_DIRECT=%s\n' "$skip"
+        printf 'SUB_TOKEN=%s\n' "${SUB_TOKEN:-}"
+        printf 'SUB_PORT=%s\n' "${SUB_PORT:-2096}"
+        printf 'SUB_ENABLED=%s\n' "${SUB_ENABLED:-1}"
+    } > "${work_dir}/install.conf"
+    chmod 644 "${work_dir}/install.conf" 2>/dev/null || true
+}
+
+ensure_sub_token() {
+    load_sub_conf
+    local tok="${SUB_TOKEN:-}"
     if [ -z "$tok" ] || ! echo "$tok" | grep -Eq '^[A-Za-z0-9_-]{8,64}$'; then
         if command_exists openssl; then
             tok=$(openssl rand -hex 12 2>/dev/null)
@@ -463,30 +482,64 @@ ensure_sub_token() {
         [ -z "$tok" ] && tok=$(tr -dc 'a-f0-9' </dev/urandom 2>/dev/null | head -c 24)
         [ -z "$tok" ] && tok="sb$(date +%s)"
         SUB_TOKEN="$tok"
-        # 合并写入 install.conf，保留已有 SKIP_DIRECT
-        local skip="${SKIP_DIRECT:-0}"
-        if [ -f "${work_dir}/install.conf" ]; then
-            # shellcheck source=/dev/null
-            source "${work_dir}/install.conf" 2>/dev/null || true
-            skip="${SKIP_DIRECT:-$skip}"
-        fi
-        {
-            printf 'SKIP_DIRECT=%s\n' "$skip"
-            printf 'SUB_TOKEN=%s\n' "$SUB_TOKEN"
-        } > "${work_dir}/install.conf"
-        chmod 644 "${work_dir}/install.conf" 2>/dev/null || true
-    else
-        SUB_TOKEN="$tok"
     fi
     export SUB_TOKEN
+    # 默认订阅端口
+    if [ -z "${SUB_PORT:-}" ] || ! [[ "${SUB_PORT}" =~ ^[0-9]+$ ]]; then
+        SUB_PORT=2096
+    fi
+    export SUB_PORT
+    SUB_ENABLED="${SUB_ENABLED:-1}"
+    export SUB_ENABLED
+    save_sub_conf
 }
 
-# 打印订阅链接（直连端口 + Argo 域名）
+# 写入/更新独立订阅 Nginx 配置（sb-sub.conf）；关闭时删除
+write_sub_nginx_conf() {
+    ensure_sub_token
+    local conf="/etc/nginx/conf.d/sb-sub.conf"
+    if [ "${SUB_ENABLED:-1}" != "1" ]; then
+        rm -f "$conf" 2>/dev/null || true
+        return 0
+    fi
+    mkdir -p /etc/nginx/conf.d 2>/dev/null || true
+    cat > "$conf" << EOF
+server {
+    listen ${SUB_PORT};
+    listen [::]:${SUB_PORT};
+    server_name _;
+
+    location = /s/${SUB_TOKEN} {
+        default_type text/plain;
+        charset utf-8;
+        alias ${work_dir}/sub.txt;
+        add_header Cache-Control "no-store";
+        add_header Access-Control-Allow-Origin *;
+    }
+    location = /s/${SUB_TOKEN}/raw {
+        default_type text/plain;
+        charset utf-8;
+        alias ${work_dir}/url.txt;
+        add_header Cache-Control "no-store";
+        add_header Access-Control-Allow-Origin *;
+    }
+    location / { return 404; }
+}
+EOF
+}
+
+# 打印订阅链接（独立 SUB_PORT + Argo 域名）
 print_sub_urls() {
     ensure_sub_token
-    local ip domain argo_port
+    local ip domain argo_port host_for_url
     ip=$(get_realip 2>/dev/null || echo "服务器IP")
-    # 去掉 IPv6 方括号用于 URL 时需保留或改用 [ip]
+    host_for_url="$ip"
+    if echo "$ip" | grep -q '^\[.*\]$'; then
+        host_for_url="$ip"
+    elif echo "$ip" | grep -q ':'; then
+        host_for_url="[$ip]"
+    fi
+
     argo_port="${ARGO_PORT:-}"
     if [ -z "$argo_port" ] && [ -f "${work_dir}/argo_fixed.conf" ]; then
         # shellcheck source=/dev/null
@@ -506,29 +559,31 @@ print_sub_urls() {
     fi
     if [ -z "$domain" ] && [ -f "${work_dir}/argo.log" ]; then
         domain=$(sed -n 's|.*https://\([^/]*trycloudflare\.com\).*|\1|p' "${work_dir}/argo.log" 2>/dev/null | head -1)
-        [ -z "$domain" ] && domain=$(grep -oE '[[:alnum:]+\.-]+\.trycloudflare\.com' "${work_dir}/argo.log" 2>/dev/null | head -1)
+        [ -z "$domain" ] && domain=$(grep -oE '[[:alnum:]+.-]+\.trycloudflare\.com' "${work_dir}/argo.log" 2>/dev/null | head -1)
     fi
 
     echo ""
     green "=== 订阅链接（客户端直接导入） ==="
-    yellow "路径令牌已固定，改节点后无需更换链接；勿泄露给他人"
-    # 直连：经 Nginx 入口端口
-    # IPv6 主机需方括号
-    local host_for_url="$ip"
-    if echo "$ip" | grep -q '^\[.*\]$'; then
-        host_for_url="$ip"
-    elif echo "$ip" | grep -q ':'; then
-        host_for_url="[$ip]"
+    if [ "${SUB_ENABLED:-1}" != "1" ]; then
+        red "节点订阅当前已关闭（主菜单 7 → 开启节点订阅）"
+        yellow "本地文件仍可用: ${work_dir}/sub.txt  |  ${work_dir}/url.txt"
+        echo ""
+        return 0
     fi
-    green "Base64 订阅(推荐):"
-    purple "  http://${host_for_url}:${argo_port}/s/${SUB_TOKEN}"
+    yellow "令牌固定，改节点后无需换链接；勿泄露。订阅端口: ${SUB_PORT}"
+    green "Base64 订阅(推荐·直连端口):"
+    purple "  http://${host_for_url}:${SUB_PORT}/s/${SUB_TOKEN}"
     green "明文节点列表:"
-    purple "  http://${host_for_url}:${argo_port}/s/${SUB_TOKEN}/raw"
+    purple "  http://${host_for_url}:${SUB_PORT}/s/${SUB_TOKEN}/raw"
     if [ -n "$domain" ] && [ "$domain" != "未获取到域名" ]; then
         green "Argo/HTTPS 订阅(推荐外网):"
         purple "  https://${domain}/s/${SUB_TOKEN}"
         green "Argo 明文节点:"
         purple "  https://${domain}/s/${SUB_TOKEN}/raw"
+    else
+        yellow "Argo 域名未就绪时，仍可用上方直连端口订阅"
+        green "备用(经 Argo 入口端口 ${argo_port}):"
+        purple "  http://${host_for_url}:${argo_port}/s/${SUB_TOKEN}"
     fi
     yellow "本地文件: ${work_dir}/sub.txt  |  ${work_dir}/url.txt"
     echo ""
@@ -1147,13 +1202,17 @@ install_singbox() {
         rm -f "${work_dir}/reality.keys" 2>/dev/null || true
     fi
 
-    # 持久化 SKIP_DIRECT + 订阅令牌
+    # 持久化 SKIP_DIRECT + 订阅令牌/端口/开关
     ensure_sub_token
-    {
-        printf 'SKIP_DIRECT=%s\n' "${SKIP_DIRECT:-0}"
-        printf 'SUB_TOKEN=%s\n' "${SUB_TOKEN}"
-    } > "${work_dir}/install.conf"
-    chmod 644 "${work_dir}/install.conf" 2>/dev/null || true
+    SUB_ENABLED=1
+    export SUB_ENABLED
+    # 若 SUB_PORT 与 Argo 冲突则自动错开
+    if [ "${SUB_PORT}" = "${ARGO_PORT}" ] || [ "${SUB_PORT}" = "$((ARGO_PORT + 10))" ] || [ "${SUB_PORT}" = "$((ARGO_PORT + 11))" ] || [ "${SUB_PORT}" = "$((ARGO_PORT + 12))" ]; then
+        SUB_PORT=$((ARGO_PORT + 20))
+        export SUB_PORT
+    fi
+    save_sub_conf
+    allow_port ${SUB_PORT}/tcp > /dev/null 2>&1
 
     openssl ecparam -genkey -name prime256v1 -out "${work_dir}/private.key"
     openssl req -new -x509 -days 3650 -key "${work_dir}/private.key" -out "${work_dir}/cert.pem" -subj "/CN=bing.com"
@@ -1652,7 +1711,7 @@ EOF
     rc-update add argo default >/dev/null 2>&1 || true
 }
 
-# 生成节点链接并写入 url.txt / sub.txt（不再打印 HTTP 订阅地址）
+# 生成节点链接并写入 url.txt / sub.txt，并打印 HTTP 订阅地址
 get_info() {
     yellow "\nip检测中,请稍等...\n"
     server_ip=$(get_realip)
@@ -1947,6 +2006,9 @@ server {
     location / { return 404; }
 }
 EOF
+
+    # 独立订阅端口配置
+    write_sub_nginx_conf
 
     # ---------- 4. 检测并启动 ----------
     local nginx_test_out nginx_test_rc
@@ -2397,7 +2459,7 @@ uninstall_singbox() {
             fi
             rm -rf "${work_dir}" || true
             rm -f /etc/systemd/system/sing-box.service /etc/systemd/system/argo.service
-            rm -f /etc/nginx/conf.d/sing-box.conf /etc/nginx/conf.d/argo-ws.conf
+            rm -f /etc/nginx/conf.d/sing-box.conf /etc/nginx/conf.d/argo-ws.conf /etc/nginx/conf.d/sb-sub.conf
 
             reading "\n是否卸载 Nginx？${green}(卸载请输入 ${yellow}y${re} ${green}回车将跳过卸载Nginx) (y/n): ${re}" choice
             case "${choice}" in
@@ -2871,7 +2933,7 @@ auto_uninstall() {
             systemctl stop    nginx > /dev/null 2>&1
             systemctl disable nginx > /dev/null 2>&1
         fi
-        rm -f /etc/nginx/conf.d/sing-box.conf /etc/nginx/conf.d/argo-ws.conf
+        rm -f /etc/nginx/conf.d/sing-box.conf /etc/nginx/conf.d/argo-ws.conf /etc/nginx/conf.d/sb-sub.conf
         manage_packages uninstall nginx
         [ -f /etc/nginx/nginx.conf.bak.sb ] && \
             mv /etc/nginx/nginx.conf.bak.sb /etc/nginx/nginx.conf > /dev/null 2>&1
@@ -3403,7 +3465,7 @@ IEOF
     esac
 }
 
-# 本修改版已取消独立 HTTP 订阅端口；仅提示本地节点文件位置
+# 展示本地节点文件与 HTTP 订阅链接（与 check_nodes 共用 print_sub_urls）
 show_node_files() {
     clear; echo ""
     green "=== 节点文件 / 订阅链接 ===\n"
@@ -3699,29 +3761,119 @@ change_argo_domain() {
     send_tg_nodes 2>/dev/null || true
 }
 
-# 查看当前节点信息（仅打印节点链接）
+# 查看当前节点信息（节点链接 + 订阅 URL）
 
 
-# 主菜单 5：节点信息 / Nginx 管理 子菜单
-menu_nodes_nginx() {
+# 主菜单 7：管理节点订阅（含 Nginx）
+menu_sub_manage() {
     while true; do
         clear; echo ""
-        green "=== 节点信息 / Nginx 管理 ===\n"
-        green "1. 查看节点信息"
-        skyblue "------------"
-        green "2. Nginx管理"
-        skyblue "----------"
+        load_sub_conf
+        ensure_sub_token
+        local sub_st="已开启"
+        [ "${SUB_ENABLED:-1}" != "1" ] && sub_st="已关闭"
+        green "=== 管理节点订阅 ===\n"
+        yellow "状态: ${purple}${sub_st}${re}  端口: ${purple}${SUB_PORT:-2096}${re}  令牌: ${purple}${SUB_TOKEN:0:8}...${re}\n"
+        skyblue "----------------"
+        green "1. 关闭节点订阅"
+        skyblue "----------------"
+        green "2. 开启节点订阅"
+        skyblue "----------------"
+        green "3. 更换订阅端口"
+        skyblue "----------------"
+        green "4. 重启订阅服务"
+        skyblue "----------------"
+        green "5. Nginx管理"
+        skyblue "----------------"
         purple "0. 返回主菜单"
-        skyblue "-----------"
-        reading "\n请输入选择: " sub_choice
+        skyblue "----------------"
+        reading "请输入选择: " sub_choice
         echo ""
         case "${sub_choice}" in
             1)
-                check_nodes
-                echo ""
-                read -n 1 -s -r -p $'\033[1;91m按任意键继续...\033[0m'
+                SUB_ENABLED=0
+                export SUB_ENABLED
+                save_sub_conf
+                write_sub_nginx_conf
+                # 同步去掉 Argo 入口上的 /s/ 路径（重写 argo-ws 时会按 token 再写入；此处仅关独立端口）
+                if command_exists nginx; then
+                    nginx -t >/dev/null 2>&1 && restart_nginx >/dev/null 2>&1 || true
+                fi
+                green "节点订阅已关闭（独立端口不再对外提供）"
+                sleep 1
                 ;;
             2)
+                SUB_ENABLED=1
+                export SUB_ENABLED
+                ensure_sub_token
+                save_sub_conf
+                allow_port ${SUB_PORT}/tcp > /dev/null 2>&1
+                write_sub_nginx_conf
+                if command_exists nginx; then
+                    if nginx -t >/dev/null 2>&1; then
+                        restart_nginx >/dev/null 2>&1 || true
+                        green "节点订阅已开启"
+                        print_sub_urls
+                    else
+                        red "nginx -t 失败，请到「Nginx管理」查看"
+                        nginx -t 2>&1 | tail -5
+                    fi
+                else
+                    red "nginx 未安装，请先安装/生成配置"
+                fi
+                read -n 1 -s -r -p $'\033[1;91m按任意键继续...\033[0m'
+                ;;
+            3)
+                ensure_sub_token
+                reading "请输入新的订阅端口 (当前 ${SUB_PORT}，回车取消): " new_sp
+                if [ -z "$new_sp" ]; then
+                    yellow "已取消"; sleep 1; continue
+                fi
+                if ! [[ "$new_sp" =~ ^[0-9]+$ ]] || [ "$new_sp" -lt 1 ] || [ "$new_sp" -gt 65535 ]; then
+                    red "端口无效"; sleep 1; continue
+                fi
+                port_really_in_use "$new_sp"
+                _rc=$?
+                if [ "$_rc" -eq 0 ]; then
+                    # 若占用者是本机 nginx 监听旧 SUB_PORT，允许更换
+                    if [ "$new_sp" = "${SUB_PORT}" ]; then
+                        yellow "与当前端口相同"; sleep 1; continue
+                    fi
+                    red "端口 ${new_sp} 已被占用"; sleep 1; continue
+                fi
+                SUB_PORT="$new_sp"
+                export SUB_PORT
+                SUB_ENABLED=1
+                export SUB_ENABLED
+                save_sub_conf
+                allow_port ${SUB_PORT}/tcp > /dev/null 2>&1
+                write_sub_nginx_conf
+                if command_exists nginx && nginx -t >/dev/null 2>&1; then
+                    restart_nginx >/dev/null 2>&1 || true
+                    green "订阅端口已改为: ${purple}${SUB_PORT}${re}"
+                    print_sub_urls
+                else
+                    red "配置写入后 nginx -t 失败"
+                    command_exists nginx && nginx -t
+                fi
+                read -n 1 -s -r -p $'\033[1;91m按任意键继续...\033[0m'
+                ;;
+            4)
+                ensure_sub_token
+                write_sub_nginx_conf
+                if ! command_exists nginx; then
+                    red "nginx 未安装"; sleep 1; continue
+                fi
+                if nginx -t >/dev/null 2>&1; then
+                    restart_nginx && green "订阅服务(Nginx)已重启" || red "重启失败"
+                    [ "${SUB_ENABLED:-1}" = "1" ] && print_sub_urls
+                else
+                    red "nginx -t 失败，无法重启"
+                    nginx -t
+                fi
+                read -n 1 -s -r -p $'\033[1;91m按任意键继续...\033[0m'
+                ;;
+            5)
                 manage_nginx
                 ;;
             0)
@@ -3905,9 +4057,10 @@ check_nodes() {
         echo -e "${purple}${line}${re}\n"
     done < "${work_dir}/url.txt"
 
-    yellow "\n温馨提醒: 若 hysteria2/tuic 不通，请将客户端「跳过证书验证」设为 true 或更换内核\n"
-    yellow "节点文件: ${work_dir}/url.txt"
-    yellow "本地 base64: ${work_dir}/sub.txt\n"
+    # 与安装结束、节点文件说明一致：始终展示订阅链接
+    print_sub_urls
+
+    yellow "温馨提醒: 若 hysteria2/tuic 不通，请将客户端「跳过证书验证」设为 true 或更换内核\n"
 }
 
 change_cfip() {
@@ -4709,16 +4862,16 @@ menu() {
     purple "---Argo 状态: ${argo_status}"
     purple "--Nginx 状态: ${nginx_status}"
     purple "singbox 状态: ${singbox_status}\n"
-    yellow "节点优先 IPv4 | 官方优先(Alpine用musl) | 无独立订阅端口 | 支持固定隧道交互配置\n"
+    yellow "节点优先 IPv4 | 官方优先(Alpine用musl) | 独立订阅端口 | 支持固定隧道\n"
     green "1. 安装sing-box"
     red   "2. 卸载sing-box"
     echo "==============="
     green "3. sing-box管理"
     green "4. Argo隧道管理"
     echo "==============="
-    green "5. 节点信息 / Nginx管理"
+    green "5. 查看节点信息 / 订阅链接"
     green "6. 修改节点配置"
-    green "7. 查看节点文件说明"
+    green "7. 管理节点订阅"
     green "8. WARP分流管理"
     echo "==============="
     green "9. 增加/删除协议"
@@ -4819,11 +4972,14 @@ case "$1" in
                 3)  manage_singbox;     need_pause=false ;;
                 4)  manage_argo;        need_pause=true ;;
                 5)
-                    menu_nodes_nginx
-                    need_pause=false
+                    check_nodes
+                    need_pause=true
                     ;;
                 6)  change_config;      need_pause=true ;;
-                7)  show_node_files;    need_pause=true ;;
+                7)
+                    menu_sub_manage
+                    need_pause=false
+                    ;;
                 8)  warp_manage;        need_pause=false ;;
                 9)  manage_protocols;   need_pause=false ;;
                 10) setup_telegram;     need_pause=false ;;
