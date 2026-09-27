@@ -28,7 +28,7 @@
 #  12. 移除主菜单「Nginx管理」（Nginx 仍由安装/Argo 自动配置，状态仅展示）
 #
 # 基于: eooce/sing-box  修改日期: 2026.9.22
-# 版本: v2.5.8 (port_in_use 恢复 UDP 检测; TCP 仍仅认 EADDRINUSE)
+# 版本: v2.5.9 (统一端口误报判定: port_really_in_use，直连端口与Argo端口检测标准一致)
 # =========================
 
 export LANG=en_US.UTF-8
@@ -213,6 +213,22 @@ port_holder_info() {
     fi
 }
 
+# 统一的"真实冲突"判断：port_in_use 为真时，再用 ss/lsof 交叉验证是否有实际监听进程。
+# 有实际监听进程才算真冲突；查不到则视为 TIME_WAIT 等误报，不阻断安装。
+# 脚本内所有端口冲突检测（直连端口、Argo端口等）统一走此函数，避免检测标准不一致。
+# 返回: 0=真实冲突  1=空闲  2=误报（port_in_use为真但查无实际监听进程）
+port_really_in_use() {
+    local port="$1"
+    port_in_use "$port" || return 1
+    local holder
+    holder=$(port_holder_info "$port" 2>/dev/null || true)
+    if [ -n "$holder" ]; then
+        return 0
+    else
+        return 2
+    fi
+}
+
 # 交互获取可用端口；参数: 提示语 默认空则随机
 # 返回值写入变量名（第三个参数，默认 new_port）
 read_available_port() {
@@ -228,9 +244,13 @@ read_available_port() {
             red "端口必须为 1-65535 的数字"
             continue
         fi
-        if port_in_use "$port"; then
+        port_really_in_use "$port"
+        local _rc=$?
+        if [ "$_rc" -eq 0 ]; then
             red "端口 ${port} 已被占用，请重新输入"
             continue
+        elif [ "$_rc" -eq 2 ]; then
+            yellow "端口 ${port} 检测曾报占用，但系统无实际监听进程，按空闲处理"
         fi
         green "端口 ${purple}${port}${re} 可用"
         eval "$varname=\"$port\""
@@ -725,12 +745,21 @@ install_singbox() {
             vless_port=""
             continue
         fi
+        # 统一走 port_really_in_use：仅有实际监听进程才算真冲突，TIME_WAIT 等误报直接放行
         conflict_list=""
+        false_positive_direct_list=""
         for p in "$vless_port" "$((vless_port+1))" "$((vless_port+2))" "$((vless_port+3))"; do
-            if port_in_use "$p"; then
+            port_really_in_use "$p"
+            _rc=$?
+            if [ "$_rc" -eq 0 ]; then
                 conflict_list="${conflict_list} ${p}"
+            elif [ "$_rc" -eq 2 ]; then
+                false_positive_direct_list="${false_positive_direct_list} ${p}"
             fi
         done
+        if [ -n "$false_positive_direct_list" ] && [ -z "$conflict_list" ]; then
+            yellow "直连端口检测对${false_positive_direct_list} 曾报占用，但系统无实际监听进程，已按空闲处理"
+        fi
         if [ -n "$conflict_list" ]; then
             red "以下直连端口已被占用:${conflict_list}"
             yellow "说明: 起始端口 ${vless_port} 会同时占用 Reality/HY2/TUIC/WS = ${vless_port}~$((vless_port+3))"
@@ -789,8 +818,9 @@ install_singbox() {
         fi
     fi
     # Argo 端口冲突检测：
-    # - 与直连重叠 / ss 能看到监听进程 → 真实冲突，需换端口
-    # - port_in_use 为真但 ss 无监听进程 → 视为误报，直接沿用当前端口，不打断安装
+    # - 与直连重叠 / port_really_in_use 判为真实冲突（有实际监听进程） → 需换端口
+    # - port_really_in_use 判为误报（无实际监听进程） → 沿用当前端口，不打断安装
+    # 与直连端口检测使用同一套 port_really_in_use 标准，避免两处判断不一致
     while true; do
         base="${ARGO_PORT:-8001}"
         real_conflict_list=""
@@ -808,15 +838,13 @@ install_singbox() {
                 real_conflict_detail="${real_conflict_detail}\n  - ${p} (${name}) 与直连端口重叠"
                 continue
             fi
-            if port_in_use "$p"; then
-                _holder=$(port_holder_info "$p" 2>/dev/null || true)
-                if [ -n "$_holder" ]; then
-                    real_conflict_list="${real_conflict_list} ${p}"
-                    real_conflict_detail="${real_conflict_detail}\n  - ${p} (${name}) 已被占用"
-                else
-                    # 检测器认为占用，但 ss 看不到 LISTEN → 误报，忽略
-                    false_positive_list="${false_positive_list} ${p}"
-                fi
+            port_really_in_use "$p"
+            _rc=$?
+            if [ "$_rc" -eq 0 ]; then
+                real_conflict_list="${real_conflict_list} ${p}"
+                real_conflict_detail="${real_conflict_detail}\n  - ${p} (${name}) 已被占用"
+            elif [ "$_rc" -eq 2 ]; then
+                false_positive_list="${false_positive_list} ${p}"
             fi
         done
         if [ -n "$false_positive_list" ] && [ -z "$real_conflict_list" ]; then
@@ -860,11 +888,9 @@ install_singbox() {
                         }; then
                             ok=0; break
                         fi
-                        # 自动分配时同样：仅 ss 能看到占用才算冲突
-                        if port_in_use "$p"; then
-                            _h=$(port_holder_info "$p" 2>/dev/null || true)
-                            [ -n "$_h" ] && { ok=0; break; }
-                        fi
+                        # 自动分配时同样统一走 port_really_in_use：误报(rc=2)不算冲突
+                        port_really_in_use "$p"
+                        [ $? -eq 0 ] && { ok=0; break; }
                     done
                     if [ "$ok" -eq 1 ]; then
                         found=$cand
@@ -892,10 +918,8 @@ install_singbox() {
                     }; then
                         ok=0; break
                     fi
-                    if port_in_use "$p"; then
-                        _h=$(port_holder_info "$p" 2>/dev/null || true)
-                        [ -n "$_h" ] && { ok=0; break; }
-                    fi
+                    port_really_in_use "$p"
+                    [ $? -eq 0 ] && { ok=0; break; }
                 done
                 [ "$ok" -eq 1 ] && { found=$cand; break; }
             done
@@ -2750,8 +2774,12 @@ change_config() {
                         if ! [[ "$new_port" =~ ^[0-9]+$ ]] || [ "$new_port" -lt 1 ] || [ "$new_port" -gt 65535 ]; then
                             red "端口无效"; continue
                         fi
-                        if port_in_use "$new_port"; then
+                        port_really_in_use "$new_port"
+                        _rc=$?
+                        if [ "$_rc" -eq 0 ]; then
                             red "端口 ${new_port} 已被占用，请重新输入"; continue
+                        elif [ "$_rc" -eq 2 ]; then
+                            yellow "端口 ${new_port} 检测曾报占用，但系统无实际监听进程，按空闲处理"
                         fi
                         break
                     done
@@ -2786,8 +2814,12 @@ change_config() {
                         if ! [[ "$new_port" =~ ^[0-9]+$ ]] || [ "$new_port" -lt 1 ] || [ "$new_port" -gt 65535 ]; then
                             red "端口无效"; continue
                         fi
-                        if port_in_use "$new_port"; then
+                        port_really_in_use "$new_port"
+                        _rc=$?
+                        if [ "$_rc" -eq 0 ]; then
                             red "端口 ${new_port} 已被占用，请重新输入"; continue
+                        elif [ "$_rc" -eq 2 ]; then
+                            yellow "端口 ${new_port} 检测曾报占用，但系统无实际监听进程，按空闲处理"
                         fi
                         break
                     done
@@ -2820,8 +2852,12 @@ change_config() {
                         if ! [[ "$new_port" =~ ^[0-9]+$ ]] || [ "$new_port" -lt 1 ] || [ "$new_port" -gt 65535 ]; then
                             red "端口无效"; continue
                         fi
-                        if port_in_use "$new_port"; then
+                        port_really_in_use "$new_port"
+                        _rc=$?
+                        if [ "$_rc" -eq 0 ]; then
                             red "端口 ${new_port} 已被占用，请重新输入"; continue
+                        elif [ "$_rc" -eq 2 ]; then
+                            yellow "端口 ${new_port} 检测曾报占用，但系统无实际监听进程，按空闲处理"
                         fi
                         break
                     done
@@ -2855,8 +2891,12 @@ change_config() {
                         if ! [[ "$new_port" =~ ^[0-9]+$ ]] || [ "$new_port" -lt 1 ] || [ "$new_port" -gt 65535 ]; then
                             red "端口无效"; continue
                         fi
-                        if port_in_use "$new_port"; then
+                        port_really_in_use "$new_port"
+                        _rc=$?
+                        if [ "$_rc" -eq 0 ]; then
                             red "端口 ${new_port} 已被占用，请重新输入"; continue
+                        elif [ "$_rc" -eq 2 ]; then
+                            yellow "端口 ${new_port} 检测曾报占用，但系统无实际监听进程，按空闲处理"
                         fi
                         break
                     done
@@ -3242,10 +3282,13 @@ manage_argo() {
             reading "请输入 Argo 入口端口 (当前: ${current_argo_port}，回车保持): " input_port
             if [ -n "$input_port" ]; then
                 if [[ "$input_port" =~ ^[0-9]+$ ]] && [ "$input_port" -ge 1 ] && [ "$input_port" -le 65535 ]; then
-                    if port_in_use "$input_port"; then
+                    port_really_in_use "$input_port"
+                    _rc=$?
+                    if [ "$_rc" -eq 0 ]; then
                         red "端口 ${input_port} 已被占用，保持 ${current_argo_port}"
                         ARGO_PORT="$current_argo_port"
                     else
+                        [ "$_rc" -eq 2 ] && yellow "端口 ${input_port} 检测曾报占用，但系统无实际监听进程，按空闲处理"
                         ARGO_PORT="$input_port"
                         export ARGO_PORT
                         if [ -f /etc/nginx/conf.d/argo-ws.conf ]; then
@@ -3579,38 +3622,43 @@ manage_nginx() {
                     yellow "已取消"
                 elif ! [[ "$new_ap" =~ ^[0-9]+$ ]] || [ "$new_ap" -lt 1 ] || [ "$new_ap" -gt 65535 ]; then
                     red "端口无效"
-                elif port_in_use "$new_ap"; then
-                    red "端口 ${new_ap} 已被占用"
                 else
-                    ARGO_PORT="$new_ap"
-                    export ARGO_PORT
-                    if [ -f /etc/nginx/conf.d/argo-ws.conf ]; then
-                        sed -i "s/listen [0-9]\\+;/listen ${ARGO_PORT};/g" /etc/nginx/conf.d/argo-ws.conf
-                        sed -i "s/listen \\[::\\]:[0-9]\\+;/listen [::]:${ARGO_PORT};/g" /etc/nginx/conf.d/argo-ws.conf
+                    port_really_in_use "$new_ap"
+                    _rc=$?
+                    if [ "$_rc" -eq 0 ]; then
+                        red "端口 ${new_ap} 已被占用"
                     else
-                        add_nginx_conf
-                    fi
-                    allow_port ${ARGO_PORT}/tcp >/dev/null 2>&1
-                    if nginx -t 2>/dev/null; then
-                        restart_nginx
-                        # 持久化并同步 cloudflared 指向新端口（与 change_config 一致）
-                        if [ -f "${work_dir}/argo_fixed.conf" ]; then
-                            if grep -q '^ARGO_PORT=' "${work_dir}/argo_fixed.conf" 2>/dev/null; then
-                                sed -i "s/^ARGO_PORT=.*/ARGO_PORT=\"${ARGO_PORT}\"/" "${work_dir}/argo_fixed.conf"
-                            else
-                                echo "ARGO_PORT=\"${ARGO_PORT}\"" >> "${work_dir}/argo_fixed.conf"
+                        [ "$_rc" -eq 2 ] && yellow "端口 ${new_ap} 检测曾报占用，但系统无实际监听进程，按空闲处理"
+                        ARGO_PORT="$new_ap"
+                        export ARGO_PORT
+                        if [ -f /etc/nginx/conf.d/argo-ws.conf ]; then
+                            sed -i "s/listen [0-9]\\+;/listen ${ARGO_PORT};/g" /etc/nginx/conf.d/argo-ws.conf
+                            sed -i "s/listen \\[::\\]:[0-9]\\+;/listen [::]:${ARGO_PORT};/g" /etc/nginx/conf.d/argo-ws.conf
+                        else
+                            add_nginx_conf
+                        fi
+                        allow_port ${ARGO_PORT}/tcp >/dev/null 2>&1
+                        if nginx -t 2>/dev/null; then
+                            restart_nginx
+                            # 持久化并同步 cloudflared 指向新端口（与 change_config 一致）
+                            if [ -f "${work_dir}/argo_fixed.conf" ]; then
+                                if grep -q '^ARGO_PORT=' "${work_dir}/argo_fixed.conf" 2>/dev/null; then
+                                    sed -i "s/^ARGO_PORT=.*/ARGO_PORT=\"${ARGO_PORT}\"/" "${work_dir}/argo_fixed.conf"
+                                else
+                                    echo "ARGO_PORT=\"${ARGO_PORT}\"" >> "${work_dir}/argo_fixed.conf"
+                                fi
                             fi
+                            rewrite_argo_service
+                            restart_argo
+                            sleep 2
+                            if [ -f "${work_dir}/argo-start.sh" ] && grep -q -- '--url http://localhost' "${work_dir}/argo-start.sh" 2>/dev/null; then
+                                get_quick_tunnel && change_argo_domain
+                            fi
+                            green "Argo 入口端口已更新为 ${purple}${ARGO_PORT}${re}（Nginx + Argo 隧道已同步）"
+                        else
+                            red "配置检测失败"
+                            nginx -t
                         fi
-                        rewrite_argo_service
-                        restart_argo
-                        sleep 2
-                        if [ -f "${work_dir}/argo-start.sh" ] && grep -q -- '--url http://localhost' "${work_dir}/argo-start.sh" 2>/dev/null; then
-                            get_quick_tunnel && change_argo_domain
-                        fi
-                        green "Argo 入口端口已更新为 ${purple}${ARGO_PORT}${re}（Nginx + Argo 隧道已同步）"
-                    else
-                        red "配置检测失败"
-                        nginx -t
                     fi
                 fi
                 ;;
