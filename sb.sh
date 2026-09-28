@@ -66,6 +66,8 @@
 #           19) 脚本最前面增加 bash 检测：被 sh/ash 启动时自动装 bash 并 exec 重新执行
 #           20) 「增加/删除协议」菜单新增直连四协议(Reality/Hysteria2/TUIC/AnyTLS)的单独添加与删除，
 #               并显示其启用状态；「跳过直连」安装后也可按需补装
+#           21) 「增加/删除协议」菜单排版统一：额外协议与直连协议均为「分组标题 + 添加/删除左右并排」，
+#               VLESS-WS 直连状态行不再显示 UUID，改为只显示端口/协议
 
 # =========================
 export LANG=en_US.UTF-8
@@ -5262,8 +5264,7 @@ show_extra_proto_status() {
     # VLESS-WS 直连（无 TLS）
     if jq -e '.inbounds[] | select(.tag == "vless-ws-direct")' "$inbounds_file" > /dev/null 2>&1; then
         ws_port=$(jq -r '.inbounds[] | select(.tag == "vless-ws-direct") | .listen_port' "$inbounds_file")
-        ws_uuid=$(jq -r '.inbounds[] | select(.tag == "vless-ws-direct") | .users[0].uuid // "N/A"' "$inbounds_file")
-        echo -e " VLESS-WS直连:     ${green}已启用${re} (端口: ${skyblue}${ws_port}${re}, UUID: ${skyblue}${ws_uuid}${re})"
+        echo -e " VLESS-WS直连:     ${green}已启用${re} (端口: ${skyblue}${ws_port}${re}/tcp)"
     else
         echo -e " VLESS-WS直连:     ${yellow}未启用${re}"
     fi
@@ -5293,23 +5294,16 @@ manage_protocols() {
     show_direct_proto_status
     show_extra_proto_status
 
-    green "--- Socks5 协议 ---"
-    green "1. 添加 Socks5 协议"
-    red   "2. 删除 Socks5 协议"
-    skyblue "----------------"
-    green "--- VLESS-WS 直连（无 TLS）---"
-    green "3. 添加 VLESS-WS 直连（无 TLS）"
-    red   "4. 删除 VLESS-WS 直连（无 TLS）"
-    skyblue "----------------"
-    green "--- Shadowsocks-2022 协议 ---"
-    green "5. 添加 Shadowsocks-2022 协议"
-    red   "6. 删除 Shadowsocks-2022 协议"
+    green "--- 额外协议（VLESS-WS 直连为无 TLS）---"
+    green "1.  添加 Socks5             2.  删除 Socks5"
+    green "3.  添加 VLESS-WS直连       4.  删除 VLESS-WS直连"
+    green "5.  添加 Shadowsocks-2022   6.  删除 Shadowsocks-2022"
     skyblue "----------------"
     green "--- 直连协议（默认安装的四个协议）---"
-    green "7.  添加 VLESS-Reality    8.  删除 VLESS-Reality"
-    green "9.  添加 Hysteria2        10. 删除 Hysteria2"
-    green "11. 添加 TUIC             12. 删除 TUIC"
-    green "13. 添加 AnyTLS           14. 删除 AnyTLS"
+    green "7.  添加 VLESS-Reality      8.  删除 VLESS-Reality"
+    green "9.  添加 Hysteria2          10. 删除 Hysteria2"
+    green "11. 添加 TUIC               12. 删除 TUIC"
+    green "13. 添加 AnyTLS             14. 删除 AnyTLS"
     skyblue "----------------"
     purple "0. 返回主菜单"
     skyblue "----------------"
