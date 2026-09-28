@@ -27,7 +27,7 @@
 #
 # 基于: eooce/sing-box
 # 修改日期: 2026.9.27
-# 版本: v2.6.0（全面优化版）
+# 版本: v2.6.1（bug修复 + 代码优化版）
 #   v2.5.9~19 功能累积（端口/订阅/小磁盘/菜单/直连第4协议等）
 #   v2.6.0   1) 协议增删/WARP分流类函数统一走"备份→改配置→sing-box check→失败回滚"
 #            2) add_socks5_proxy 的协议解析改用纯 POSIX 正则，去掉 grep -P（Alpine busybox 兼容）
@@ -35,8 +35,54 @@
 #            4) remove_url_by_tag 的 sed 定界符改为 # 并对 tag 做安全校验，避免特殊字符注入
 #            5) nginx.conf / mime.types 备份文件只保留最近一份，不再无限堆积
 #            6) sing-box 最新版本获取增加 GitHub API 限流提示与本地缓存版本号 fallback
+#   v2.6.1   1) get_current_uuid 改按 tag 优先级精确取值，不再靠 head -1 猜第一条 vless
+#            2) 新增 b64_decode 封装，修复 Alpine/busybox 下 base64 --decode 无效导致
+#               改UUID/改Argo域名/改优选IP时 vmess 节点静默更新失败的问题
+#            3) set_global_outbound 不再删除 direct 出站（原实现会被 sing-box check
+#               判定引用不存在的 outbound 而自动回滚，功能此前大概率从未真正生效）
+#            4) restore_direct_outbound 的 route.json/endpoints.json 写入改走
+#               safe_apply_conf，和脚本自身"备份→改→校验→回滚"原则保持一致
+#            5) Socks5/VLESS-WS直连/SS2022 三个新增协议节点命名统一加上 node_prefix
+#               和协议后缀，和"改节点前缀"工具(菜单6→9)已假定的格式对齐
+#            6) 修复 hysteria2 端口跳跃插入行号的 off-by-one
+#            7) 新增 update_all_vmess 统一函数，合并三处重复的 vmess 批量更新循环
+#            8) 修复 change_config(菜单6)/manage_argo(菜单4) 顶层菜单输入错误时
+#               静默跳回主菜单的问题，统一改为重新显示当前子菜单
+#            9) 去掉 change_config/manage_argo/warp_manage/manage_protocols 等多处
+#               子菜单在"返回主菜单"时冗余调用 menu 导致主菜单横幅连续打印两遍的问题
+#           10) WARP 分流子树：add_socks5_proxy 的 8 处提前返回、delete_socks5_proxy
+#               的所有出口，统一回到 warp_manage（此前失败路径会直接掉回主菜单）
+#           11) 修复 AnyTLS 改端口"未安装仍报修改成功"（循环外的 break 改为 return 1）
+#           12) 已开启 hysteria2 端口跳跃时禁止直接改端口（mport 与 DNAT 会失效）
+#           13) 开启端口跳跃后的节点名补上 node_prefix 与 -hysteria2 后缀；
+#               不再用 sed -i.bak（避免遗留含全部 UUID/密码的 url.txt.bak）
+#           14) b64_decode 先缓存 stdin，避免两条命令共用 stdin 使回退分支失效，
+#               同时避免缺 padding 时 -d 有输出但返回 1 造成的重复输出
+#           15) safe_apply_conf 目标文件原本不存在时，校验失败也能清理坏文件
+#           16) 关闭节点订阅时同步移除 Argo 入口(argo-ws.conf)上的 /s/<token> 路径
+#               （此前只关独立端口，通过 Argo 域名仍可拉取全部节点）；开启/换令牌同步重写
+#           17) HY2 端口跳跃取 UUID 加 head -1，避免多行 hysteria2 链接导致新链接损坏
+#           18) 改端口子菜单输入无效时回到「修改节点配置」菜单，不再静默结束
+#           19) 脚本最前面增加 bash 检测：被 sh/ash 启动时自动装 bash 并 exec 重新执行
+#           20) 「增加/删除协议」菜单新增直连四协议(Reality/Hysteria2/TUIC/AnyTLS)的单独添加与删除，
+#               并显示其启用状态；「跳过直连」安装后也可按需补装
+
 # =========================
 export LANG=en_US.UTF-8
+
+# [v2.6.1] 若被 sh/ash 等非 bash 解释器启动（如 `sh script.sh`），脚本里大量 bash 专属语法
+# 会在解析阶段就失败，等不到后面的 ensure_bash_on_alpine。这里在最前面处理：
+# 装好 bash 后用 bash 重新执行自身；无法重执行（如管道/进程替换传入）则给出明确提示。
+if [ -z "${BASH_VERSION:-}" ]; then
+    if ! command -v bash >/dev/null 2>&1 && command -v apk >/dev/null 2>&1; then
+        apk add --no-cache bash >/dev/null 2>&1
+    fi
+    if command -v bash >/dev/null 2>&1 && [ -f "$0" ]; then
+        exec bash "$0" "$@"
+    fi
+    echo "本脚本需要 bash 运行。Alpine 请先执行: apk add bash && bash $0" >&2
+    exit 1
+fi
 # 定义颜色
 re="\033[0m"
 red="\033[1;91m"
@@ -81,7 +127,38 @@ command_exists() {
 # 导致 Alpine 上这几个操作会让 vmess 节点悄悄更新失败而不报错。
 # 统一用这个函数：优先 -d（两种实现都支持标准短选项），失败再退回 --decode。
 b64_decode() {
-    base64 -d 2>/dev/null || base64 --decode 2>/dev/null
+    # 先把 stdin 存入变量（两条命令共用同一 stdin 时，第一条读完后第二条只会读到空）。
+    # 注意：GNU base64 -d 遇到缺 padding 的输入会"输出正确内容但返回 1"，
+    # 所以不能用 || 串联（会重复输出），改为：取到非空输出就用，否则再试 --decode。
+    local in out
+    in=$(cat)
+    out=$(printf '%s' "$in" | base64 -d 2>/dev/null)
+    [ -z "$out" ] && out=$(printf '%s' "$in" | base64 --decode 2>/dev/null)
+    [ -n "$out" ] || return 1
+    printf '%s' "$out"
+}
+
+# [优化新增] 统一批量更新 vmess 节点字段
+# 原脚本在"改UUID"/"改节点前缀"/"改优选IP"三处，各自重复写了一遍几乎相同的
+# "读取所有 vmess:// 行 → base64解码 → jq改字段 → 重新编码写回 $client_dir"
+# 循环（9行左右/处）。这里抽成通用函数，用法与直接调用 jq 一致：
+#   update_all_vmess --arg id "$new_uuid" '.id = $id'
+#   update_all_vmess --arg cfip "$cfip" --argjson cfport "$cfport" '.add=$cfip|.port=($cfport|tonumber)'
+# 保留原有的 --arg/--argjson 传参方式（不做字符串拼接），避免变量注入风险。
+# 直接原地更新 $client_dir，echo 输出成功更新的条数，调用方按需接收。
+update_all_vmess() {
+    local _vm_line _vm_enc _vm_dec _vm_upd _vm_new _count=0
+    while IFS= read -r _vm_line; do
+        [ -z "$_vm_line" ] && continue
+        _vm_enc="${_vm_line#vmess://}"
+        _vm_dec=$(echo "$_vm_enc" | b64_decode) || continue
+        _vm_upd=$(echo "$_vm_dec" | jq "$@" 2>/dev/null) || continue
+        [ -z "$_vm_upd" ] && continue
+        _vm_new=$(echo "$_vm_upd" | base64 -w0 2>/dev/null || echo "$_vm_upd" | base64 | tr -d '\n')
+        sed -i "s|${_vm_line}|vmess://${_vm_new}|" "$client_dir"
+        _count=$((_count + 1))
+    done < <(grep -o 'vmess://[^[:space:]]*' "$client_dir" 2>/dev/null || true)
+    echo "$_count"
 }
 
 # ---------- [v2.6.0新增] Alpine 下确保 bash 已安装 ----------
@@ -519,13 +596,21 @@ safe_apply_conf() {
     fi
 
     local backup_file="${target_file}.bak.safeapply"
-    cp -f "$target_file" "$backup_file" 2>/dev/null || true
+    # [修复] 目标文件原本不存在时没有备份，校验失败后坏文件会留在原地。
+    # 这里记录"原本是否存在"，不存在则失败时直接删除新文件。
+    local had_original=0
+    if [ -f "$target_file" ]; then
+        had_original=1
+        cp -f "$target_file" "$backup_file" 2>/dev/null || true
+    fi
     mv -f "$tmp_file" "$target_file"
 
     if [ -x "${work_dir}/sing-box" ] && ! "${work_dir}/sing-box" check -C "${conf_dir}" >/dev/null 2>&1; then
         red "${label} 校验失败（sing-box check 未通过），已自动回滚"
-        if [ -f "$backup_file" ]; then
+        if [ "$had_original" -eq 1 ] && [ -f "$backup_file" ]; then
             mv -f "$backup_file" "$target_file"
+        elif [ "$had_original" -eq 0 ]; then
+            rm -f "$target_file"
         fi
         return 1
     fi
@@ -601,20 +686,14 @@ regenerate_sub_token() {
     allow_port ${SUB_PORT}/tcp >/dev/null 2>&1
     write_sub_nginx_conf
 
-    local argo_conf="/etc/nginx/conf.d/argo-ws.conf"
-    if [ -f "$argo_conf" ] && [ -n "$old_tok" ]; then
-        sed -i "s|/s/${old_tok}|/s/${SUB_TOKEN}|g" "$argo_conf" 2>/dev/null || true
-    elif [ -f "$argo_conf" ]; then
-        _load_argo_port_for_nginx 2>/dev/null || true
-        add_nginx_conf >/dev/null 2>&1 || true
-    fi
-
     if command_exists nginx; then
-        if nginx -t >/dev/null 2>&1; then
-            restart_nginx >/dev/null 2>&1 || true
+        # [修复] 原先用 sed 替换旧令牌：若此前订阅处于关闭状态，argo-ws.conf 里没有 /s/ 块，
+        # sed 什么都不会改，新令牌就不会生效。统一重写 argo-ws.conf 更可靠。
+        _load_argo_port_for_nginx 2>/dev/null || true
+        if add_nginx_conf >/dev/null 2>&1; then
             return 0
         fi
-        red "nginx -t 失败，新令牌已写入但可能未生效："
+        red "Nginx 配置重写失败，新令牌已写入但可能未生效："
         nginx -t 2>&1 | tail -5
         return 1
     fi
@@ -2151,6 +2230,29 @@ EOF
     # ---------- 3. Argo 路径分流 + HTTP 订阅 ----------
     ensure_sub_token
     local sub_tok="${SUB_TOKEN}"
+    # [修复] 关闭订阅时 argo-ws.conf 里不再生成 /s/<token> 路径，
+    # 否则界面提示"已关闭"，实际通过 Argo 域名仍可拉取全部节点。
+    local sub_blocks=""
+    if [ "${SUB_ENABLED:-1}" = "1" ]; then
+        sub_blocks="
+    # Base64 订阅（客户端导入）
+    location = /s/${sub_tok} {
+        default_type text/plain;
+        charset utf-8;
+        alias ${work_dir}/sub.txt;
+        add_header Cache-Control \"no-store\";
+        add_header Access-Control-Allow-Origin *;
+    }
+    # 明文节点列表
+    location = /s/${sub_tok}/raw {
+        default_type text/plain;
+        charset utf-8;
+        alias ${work_dir}/url.txt;
+        add_header Cache-Control \"no-store\";
+        add_header Access-Control-Allow-Origin *;
+    }
+"
+    fi
     cat > /etc/nginx/conf.d/argo-ws.conf << EOF
 server {
     listen ${ARGO_PORT};
@@ -2193,23 +2295,7 @@ server {
         proxy_send_timeout 300s;
     }
 
-    # Base64 订阅（客户端导入）
-    location = /s/${sub_tok} {
-        default_type text/plain;
-        charset utf-8;
-        alias ${work_dir}/sub.txt;
-        add_header Cache-Control "no-store";
-        add_header Access-Control-Allow-Origin *;
-    }
-    # 明文节点列表
-    location = /s/${sub_tok}/raw {
-        default_type text/plain;
-        charset utf-8;
-        alias ${work_dir}/url.txt;
-        add_header Cache-Control "no-store";
-        add_header Access-Control-Allow-Origin *;
-    }
-
+${sub_blocks}
     location / { return 404; }
 }
 EOF
@@ -3175,7 +3261,7 @@ change_config() {
     local singbox_installed=$?
 
     if [ $singbox_installed -eq 2 ]; then
-        yellow "sing-box 尚未安装！"; sleep 1; menu; return
+        yellow "sing-box 尚未安装！"; sleep 1; return
     fi
 
     clear; echo ""
@@ -3219,23 +3305,15 @@ change_config() {
             skyblue "----------------"
             reading "请输入选择: " choice
             local inbounds_file="${conf_dir}/inbounds.json"
+            # [优化] 下面 1/2/3/5 四个端口修改分支，原来各自手写了一遍
+            # "输入→随机兜底→范围校验→port_really_in_use占用检测→重试"的循环，
+            # 脚本自己已经定义了完全等价的通用函数 read_available_port，这里改
+            # 为直接复用。注意：read_available_port 的随机端口范围是
+            # 10000-65000（原手写循环是 2000-65000），范围收窄但依然是安全的
+            # 非特权高位端口，不影响功能。
             case "${choice}" in
                 1)
-                    while true; do
-                        reading "\n请输入vless-reality端口 (回车跳过将使用随机端口): " new_port
-                        [ -z "$new_port" ] && new_port=$(shuf -i 2000-65000 -n 1)
-                        if ! [[ "$new_port" =~ ^[0-9]+$ ]] || [ "$new_port" -lt 1 ] || [ "$new_port" -gt 65535 ]; then
-                            red "端口无效"; continue
-                        fi
-                        port_really_in_use "$new_port"
-                        _rc=$?
-                        if [ "$_rc" -eq 0 ]; then
-                            red "端口 ${new_port} 已被占用，请重新输入"; continue
-                        elif [ "$_rc" -eq 2 ]; then
-                            yellow "端口 ${new_port} 检测曾报占用，但系统无实际监听进程，按空闲处理"
-                        fi
-                        break
-                    done
+                    read_available_port "\n请输入vless-reality端口 (回车跳过将使用随机端口): " new_port
                     # 仅修改 tag=vless-reality，避免误改 vless-ws
                     jq --argjson port "$new_port" \
                         '(.inbounds[] | select(.tag == "vless-reality")).listen_port = $port' \
@@ -3252,21 +3330,14 @@ change_config() {
                     green "\nvless-reality端口已修改成：${purple}$new_port${re}\n"
                     ;;
                 2)
-                    while true; do
-                        reading "\n请输入hysteria2端口 (回车跳过将使用随机端口): " new_port
-                        [ -z "$new_port" ] && new_port=$(shuf -i 2000-65000 -n 1)
-                        if ! [[ "$new_port" =~ ^[0-9]+$ ]] || [ "$new_port" -lt 1 ] || [ "$new_port" -gt 65535 ]; then
-                            red "端口无效"; continue
-                        fi
-                        port_really_in_use "$new_port"
-                        _rc=$?
-                        if [ "$_rc" -eq 0 ]; then
-                            red "端口 ${new_port} 已被占用，请重新输入"; continue
-                        elif [ "$_rc" -eq 2 ]; then
-                            yellow "端口 ${new_port} 检测曾报占用，但系统无实际监听进程，按空闲处理"
-                        fi
-                        break
-                    done
+                    # [修复] 若已开启端口跳跃，链接里的 mport=旧端口,起-止 和 iptables DNAT
+                    # 都指向旧端口，只改监听端口会让跳跃失效。检测到时提示先关闭再改。
+                    if grep -q 'hysteria2://.*mport=' "$client_dir" 2>/dev/null; then
+                        red "检测到已开启 hysteria2 端口跳跃，直接改端口会导致跳跃失效"
+                        yellow "请先在「修改节点配置 → 5. 删除hysteria2端口跳跃」关闭，改完端口后再重新开启"
+                        return 1
+                    fi
+                    read_available_port "\n请输入hysteria2端口 (回车跳过将使用随机端口): " new_port
                     jq --argjson port "$new_port" \
                         '(.inbounds[] | select(.tag == "hysteria2")).listen_port = $port' \
                         "$inbounds_file" > "${inbounds_file}.tmp"
@@ -3282,21 +3353,7 @@ change_config() {
                     green "\nhysteria2端口已修改为：${purple}${new_port}${re}\n"
                     ;;
                 3)
-                    while true; do
-                        reading "\n请输入tuic端口 (回车跳过将使用随机端口): " new_port
-                        [ -z "$new_port" ] && new_port=$(shuf -i 2000-65000 -n 1)
-                        if ! [[ "$new_port" =~ ^[0-9]+$ ]] || [ "$new_port" -lt 1 ] || [ "$new_port" -gt 65535 ]; then
-                            red "端口无效"; continue
-                        fi
-                        port_really_in_use "$new_port"
-                        _rc=$?
-                        if [ "$_rc" -eq 0 ]; then
-                            red "端口 ${new_port} 已被占用，请重新输入"; continue
-                        elif [ "$_rc" -eq 2 ]; then
-                            yellow "端口 ${new_port} 检测曾报占用，但系统无实际监听进程，按空闲处理"
-                        fi
-                        break
-                    done
+                    read_available_port "\n请输入tuic端口 (回车跳过将使用随机端口): " new_port
                     jq --argjson port "$new_port" \
                         '(.inbounds[] | select(.tag == "tuic")).listen_port = $port' \
                         "$inbounds_file" > "${inbounds_file}.tmp"
@@ -3313,21 +3370,7 @@ change_config() {
                     ;;
                 4)
                     # Argo 对外端口 = Nginx 监听端口（内部三个协议端口不变）
-                    while true; do
-                        reading "\n请输入Argo对外端口 (当前Nginx入口, 回车跳过将使用随机端口): " new_port
-                        [ -z "$new_port" ] && new_port=$(shuf -i 2000-65000 -n 1)
-                        if ! [[ "$new_port" =~ ^[0-9]+$ ]] || [ "$new_port" -lt 1 ] || [ "$new_port" -gt 65535 ]; then
-                            red "端口无效"; continue
-                        fi
-                        port_really_in_use "$new_port"
-                        _rc=$?
-                        if [ "$_rc" -eq 0 ]; then
-                            red "端口 ${new_port} 已被占用，请重新输入"; continue
-                        elif [ "$_rc" -eq 2 ]; then
-                            yellow "端口 ${new_port} 检测曾报占用，但系统无实际监听进程，按空闲处理"
-                        fi
-                        break
-                    done
+                    read_available_port "\n请输入Argo对外端口 (当前Nginx入口, 回车跳过将使用随机端口): " new_port
                     allow_port $new_port/tcp > /dev/null 2>&1
                     if [ -f /etc/nginx/conf.d/argo-ws.conf ]; then
                         sed -i "s/listen [0-9]\+;/listen ${new_port};/g" /etc/nginx/conf.d/argo-ws.conf
@@ -3352,23 +3395,9 @@ change_config() {
                     # AnyTLS
                     if ! jq -e '.inbounds[] | select(.tag=="anytls")' "$inbounds_file" >/dev/null 2>&1; then
                         red "当前未安装 AnyTLS 协议（可能已选择跳过直连）"
-                        break
+                        return 1
                     fi
-                    while true; do
-                        reading "\n请输入 AnyTLS 端口 (回车随机): " new_port
-                        [ -z "$new_port" ] && new_port=$(shuf -i 2000-65000 -n 1)
-                        if ! [[ "$new_port" =~ ^[0-9]+$ ]] || [ "$new_port" -lt 1 ] || [ "$new_port" -gt 65535 ]; then
-                            red "端口无效"; continue
-                        fi
-                        port_really_in_use "$new_port"
-                        _rc=$?
-                        if [ "$_rc" -eq 0 ]; then
-                            red "端口 ${new_port} 已被占用，请重新输入"; continue
-                        elif [ "$_rc" -eq 2 ]; then
-                            yellow "端口 ${new_port} 检测曾报占用，但系统无实际监听进程，按空闲处理"
-                        fi
-                        break
-                    done
+                    read_available_port "\n请输入 AnyTLS 端口 (回车随机): " new_port
                     jq --argjson port "$new_port" \
                         '(.inbounds[] | select(.tag == "anytls")).listen_port = $port' \
                         "$inbounds_file" > "${inbounds_file}.tmp"
@@ -3384,7 +3413,7 @@ change_config() {
                     green "\nAnyTLS 端口已修改为：${purple}${new_port}${re}\n"
                     ;;
                 0) change_config ;;
-                *) red "无效的选项，请输入 1 到 5" ;;
+                *) red "无效的选项，请输入 0-5"; sleep 1; change_config; return ;;
             esac
             ;;
         2)
@@ -3417,16 +3446,7 @@ change_config() {
                 sed -i -E "s#socks://[^@]+@#socks://${sk_b64}@#g" "$client_dir"
             fi
             # 更新全部 vmess 的 id，保留 ps/add/port/host/sni 等
-            local _vm_line _vm_enc _vm_dec _vm_upd _vm_new
-            while IFS= read -r _vm_line; do
-                [ -z "$_vm_line" ] && continue
-                _vm_enc="${_vm_line#vmess://}"
-                _vm_dec=$(echo "$_vm_enc" | b64_decode) || continue
-                _vm_upd=$(echo "$_vm_dec" | jq --arg id "$new_uuid" '.id = $id' 2>/dev/null) || continue
-                [ -z "$_vm_upd" ] && continue
-                _vm_new=$(echo "$_vm_upd" | base64 -w0 2>/dev/null || echo "$_vm_upd" | base64 | tr -d '\n')
-                sed -i "s|${_vm_line}|vmess://${_vm_new}|" "$client_dir"
-            done < <(grep -o 'vmess://[^[:space:]]*' "$client_dir" 2>/dev/null || true)
+            update_all_vmess --arg id "$new_uuid" '.id = $id' >/dev/null
             refresh_sub
             while IFS= read -r line; do yellow "$line"; done < ${work_dir}/url.txt
             green "\nUUID已修改为：${purple}${new_uuid}${re}\n"
@@ -3494,14 +3514,14 @@ IEOF
             restart_singbox
             ip=$(get_realip)
             fingerprint=$(openssl x509 -noout -fingerprint -sha256 -in "${work_dir}/cert.pem" | cut -d'=' -f2 | sed 's/:/%3A/g')
-            uuid=$(sed -n 's/.*hysteria2:\/\/\([^@]*\)@.*/\1/p' $client_dir)
-            isp=$(get_isp "node")
-            # [修复] 原实现在删除旧 hysteria2 行之前先记下它的行号，
-            # 但 sed 删除后文件整体少了一行，再按旧行号插入会导致新行
-            # 比预期位置晚插入一行（off-by-one，纯展示顺序问题，不影响功能）。
-            # 改为直接删除后追加到文件末尾，不依赖行号计算。
-            sed -i.bak "/hysteria2:/d" $client_dir
-            echo "hysteria2://$uuid@$ip:$listen_port?peer=www.bing.com&insecure=1&pinSHA256=${fingerprint}&alpn=h3&obfs=none&mport=$listen_port,$min_port-$max_port#$isp" >> $client_dir
+            uuid=$(sed -n 's/.*hysteria2:\/\/\([^@]*\)@.*/\1/p' $client_dir | head -1)
+            # [修复] 节点名统一用 build_node_prefix + 协议后缀（原来只有裸 isp，丢了 node_prefix）
+            local hy_prefix
+            hy_prefix=$(build_node_prefix "node")
+            # 原实现在删除前记行号再按旧行号插入会 off-by-one，改为删除后追加到末尾。
+            # 不再使用 sed -i.bak：.bak 会在 /etc/sing-box/ 下遗留含全部 UUID/密码的 url.txt.bak。
+            sed -i "/hysteria2:/d" $client_dir
+            echo "hysteria2://$uuid@$ip:$listen_port?peer=www.bing.com&insecure=1&pinSHA256=${fingerprint}&alpn=h3&obfs=none&mport=$listen_port,$min_port-$max_port#${hy_prefix}-hysteria2" >> $client_dir
             refresh_sub
             while IFS= read -r line; do yellow "$line"; done < ${work_dir}/url.txt
             green "\nhysteria2端口跳跃已开启：${purple}$min_port-$max_port${re}\n"
@@ -3622,23 +3642,20 @@ IEOF
             sed -i -E "s|(vless://[^#]*flow=xtls-rprx-vision[^#]*)#.*|\1#${prefix}-vless-reality|" "$client_dir"
 
             # 更新全部 vmess 的 ps 字段
-            local _vm_line _vm_enc _vm_dec _vm_upd _vm_new
-            while IFS= read -r _vm_line; do
-                [ -z "$_vm_line" ] && continue
-                _vm_enc="${_vm_line#vmess://}"
-                _vm_dec=$(echo "$_vm_enc" | b64_decode) || continue
-                _vm_upd=$(echo "$_vm_dec" | jq --arg ps "${prefix}-argo-vmess" '.ps = $ps' 2>/dev/null) || continue
-                [ -z "$_vm_upd" ] && continue
-                _vm_new=$(echo "$_vm_upd" | base64 -w0 2>/dev/null || echo "$_vm_upd" | base64 | tr -d '\n')
-                sed -i "s|${_vm_line}|vmess://${_vm_new}|" "$client_dir"
-            done < <(grep -o 'vmess://[^[:space:]]*' "$client_dir" 2>/dev/null || true)
+            update_all_vmess --arg ps "${prefix}-argo-vmess" '.ps = $ps' >/dev/null
 
             refresh_sub
             green "\n节点前缀已更新，可复制以下节点或更新订阅\n"
             while IFS= read -r line; do yellow "$line"; done < "$client_dir"
             ;;
-        0) menu ;;
-        *) red "无效的选项！\n" ;;
+        0) return ;;
+        *)
+            # [修复] 原来这里什么都不做，case结束后函数静默返回，
+            # 主循环会 pause 然后重画主菜单——等于"输入错误直接跳回主菜单"，
+            # 和 setup_telegram/manage_protocols 等"输入错误留在本菜单重试"
+            # 的行为不一致。这里改为重新显示本菜单，保持一致。
+            red "无效的选项！\n"; sleep 1; change_config; return
+            ;;
     esac
 }
 
@@ -3705,7 +3722,7 @@ manage_argo() {
             elif [ ! -f "${work_dir}/argo_fixed.conf" ]; then
                 get_quick_tunnel && change_argo_domain
             else
-                green "\n当前使用固定隧道,无需获取临时域名"; sleep 2; menu
+                green "\n当前使用固定隧道,无需获取临时域名"; sleep 2
             fi
             ;;
         4)
@@ -3779,11 +3796,13 @@ manage_argo() {
             elif [ ! -f "${work_dir}/argo_fixed.conf" ]; then
                 get_quick_tunnel && change_argo_domain
             else
-                yellow "当前使用固定隧道，无法获取临时隧道"; sleep 2; menu
+                yellow "当前使用固定隧道，无法获取临时隧道"; sleep 2
             fi
             ;;
-        0) menu ;;
-        *) red "无效的选项！" ;;
+        0) return ;;
+        *)
+            red "无效的选项！"; sleep 1; manage_argo; return
+            ;;
     esac
 }
 
@@ -3953,12 +3972,18 @@ menu_sub_manage() {
                 SUB_ENABLED=0
                 export SUB_ENABLED
                 save_sub_conf
-                write_sub_nginx_conf
-                # 同步去掉 Argo 入口上的 /s/ 路径（重写 argo-ws 时会按 token 再写入；此处仅关独立端口）
                 if command_exists nginx; then
-                    nginx -t >/dev/null 2>&1 && restart_nginx >/dev/null 2>&1 || true
+                    # 重新生成 argo-ws.conf + sb-sub.conf：独立端口与 Argo 的 /s/ 路径同时移除
+                    _load_argo_port_for_nginx
+                    if add_nginx_conf; then
+                        green "节点订阅已关闭（独立端口与 Argo /s/ 路径均已停用）"
+                    else
+                        red "Nginx 配置重写失败，订阅可能仍可访问，请到「Nginx管理」检查"
+                    fi
+                else
+                    write_sub_nginx_conf
+                    green "节点订阅已关闭"
                 fi
-                green "节点订阅已关闭（独立端口不再对外提供）"
                 sleep 1
                 ;;
             2)
@@ -3967,16 +3992,16 @@ menu_sub_manage() {
                 export SUB_ENABLED
                 save_sub_conf
                 allow_port ${SUB_PORT}/tcp >/dev/null 2>&1
-                write_sub_nginx_conf
                 if ! command_exists nginx; then
                     red "nginx 未安装，请先安装/生成配置"
-                elif nginx -t >/dev/null 2>&1; then
-                    restart_nginx >/dev/null 2>&1 || true
-                    green "节点订阅已开启"
-                    print_sub_urls
                 else
-                    red "nginx -t 失败，请到「Nginx管理」查看"
-                    nginx -t 2>&1 | tail -5
+                    _load_argo_port_for_nginx
+                    if add_nginx_conf; then
+                        green "节点订阅已开启"
+                        print_sub_urls
+                    else
+                        red "Nginx 配置重写失败，请到「Nginx管理」查看"
+                    fi
                 fi
                 read -n 1 -s -r -p $'\033[1;91m按任意键继续...\033[0m'
                 ;;
@@ -4261,17 +4286,8 @@ change_cfip() {
     esac
 
     # 更新全部 vmess 的 add/port
-    local _vm_line _vm_enc _vm_dec _vm_upd _vm_new _count=0
-    while IFS= read -r _vm_line; do
-        [ -z "$_vm_line" ] && continue
-        _vm_enc="${_vm_line#vmess://}"
-        _vm_dec=$(echo "$_vm_enc" | b64_decode) || continue
-        _vm_upd=$(echo "$_vm_dec" | jq --arg cfip "$cfip" --argjson cfport "$cfport" '.add = $cfip | .port = ($cfport|tonumber)' 2>/dev/null) || continue
-        [ -z "$_vm_upd" ] && continue
-        _vm_new=$(echo "$_vm_upd" | base64 -w0 2>/dev/null || echo "$_vm_upd" | base64 | tr -d '\n')
-        sed -i "s|${_vm_line}|vmess://${_vm_new}|" "$client_dir"
-        _count=$((_count + 1))
-    done < <(grep -o 'vmess://[^[:space:]]*' "$client_dir" 2>/dev/null || true)
+    local _count
+    _count=$(update_all_vmess --arg cfip "$cfip" --argjson cfport "$cfport" '.add = $cfip | .port = ($cfport|tonumber)')
 
     # 同步更新 argo 的 vless/trojan 节点中的 CFIP:CFPORT（仅 argo path 行）
     sed -i -E "/path=%2Fvless-argo|path=\/vless-argo/ s#@[^:?]+(:[0-9]+)?\?#@${cfip}:${cfport}?#" "$client_dir" 2>/dev/null || true
@@ -4286,7 +4302,7 @@ change_cfip() {
 warp_manage() {
     check_singbox &>/dev/null
     if [ $? -eq 2 ]; then
-        yellow "sing-box 尚未安装！"; sleep 1; menu; return
+        yellow "sing-box 尚未安装！"; sleep 1; return
     fi
 
     clear
@@ -4321,7 +4337,7 @@ warp_manage() {
         2)  delete_rule_menu ;;
         3)  add_socks5_proxy ;;
         4)  delete_socks5_proxy ;;
-        0)  menu ;;
+        0)  return ;;
         00) exit 0 ;;
         *)  red "无效选项"; sleep 1; warp_manage ;;
     esac
@@ -4581,12 +4597,12 @@ delete_rule_menu() {
 add_socks5_proxy() {
     clear
     reading "请输入代理URL (支持socks://,socks5://,http:// 支持v2rayN导出的节点链接): " proxy_url
-    [ -z "$proxy_url" ] && { red "输入为空！"; sleep 1; return; }
+    [ -z "$proxy_url" ] && { red "输入为空！"; sleep 1; warp_manage; return; }
 
     # [v2.6.0] 原来用 grep -oP，busybox grep（Alpine 默认）不支持 -P，这里改为
     # sed 提取 "://" 之前的协议名，纯 POSIX 正则，Alpine/Debian/CentOS 通用。
     proto=$(printf '%s' "$proxy_url" | sed -n 's#^\([a-zA-Z0-9]*\)://.*#\1#p')
-    [[ ! "$proto" =~ ^(socks5|socks|http)$ ]] && { red "不支持的协议"; sleep 2; return; }
+    [[ ! "$proto" =~ ^(socks5|socks|http)$ ]] && { red "不支持的协议"; sleep 2; warp_manage; return; }
     case "$proto" in
         socks|socks5) outbound_type="socks" ;;
         http)         outbound_type="http" ;;
@@ -4618,7 +4634,7 @@ add_socks5_proxy() {
     fi
 
     server="${host_port%%:*}"; port="${host_port##*:}"
-    [ -z "$server" ] || [ -z "$port" ] && { red "格式错误：缺少ip或端口"; sleep 2; return; }
+    [ -z "$server" ] || [ -z "$port" ] && { red "格式错误：缺少ip或端口"; sleep 2; warp_manage; return; }
 
     [[ "$proto" == "socks" || "$proto" == "socks5" ]] && check_proto="socks5" || check_proto="$proto"
 
@@ -4641,7 +4657,7 @@ add_socks5_proxy() {
         if [ -z "$test_result" ]; then
             yellow "警告：通过本地代理访问外网失败，请确认代理服务正在运行。"
             reading "是否仍然添加此代理？(y/n): " force_add
-            [[ ! "$force_add" =~ ^[yY]$ ]] && { yellow "已取消"; sleep 1; return; }
+            [[ ! "$force_add" =~ ^[yY]$ ]] && { yellow "已取消"; sleep 1; warp_manage; return; }
         else
             green "本地代理可用，出口IP: $test_result"
         fi
@@ -4652,12 +4668,12 @@ add_socks5_proxy() {
         api_response=$(curl -s --max-time 8 -G \
             --data-urlencode "proxy=${check_proto}://${proxy_auth}${server}:${port}" \
             "https://check.socks5.cmliussss.net/check" 2>/dev/null)
-        [ -z "$api_response" ] && { red "API 请求失败"; sleep 2; return; }
+        [ -z "$api_response" ] && { red "API 请求失败"; sleep 2; warp_manage; return; }
 
         success=$(echo "$api_response" | jq -r '.success')
         if [ "$success" != "true" ]; then
             error_msg=$(echo "$api_response" | jq -r '.error // "未知错误"')
-            red "代理不可用: $error_msg"; sleep 2; return
+            red "代理不可用: $error_msg"; sleep 2; warp_manage; return
         fi
         exit_ip=$(echo "$api_response" | jq -r '.exit.ip // empty')
         green "代理可用"
@@ -4666,7 +4682,7 @@ add_socks5_proxy() {
 
     [ -n "$tag_from_url" ] && tag="$tag_from_url" || tag="${outbound_type}-${server}-${port}"
     jq -e --arg tag "$tag" '.outbounds[] | select(.tag == $tag)' "$outbound_file" >/dev/null 2>&1 \
-        && { red "出站标签 '${tag}' 已存在"; sleep 2; return; }
+        && { red "出站标签 '${tag}' 已存在"; sleep 2; warp_manage; return; }
 
     # 根据是否有账号密码，决定写入字段，避免空字符串导致 sing-box 报错
     if [ -n "$user" ] && [ -n "$password" ]; then
@@ -4682,7 +4698,7 @@ add_socks5_proxy() {
            "$outbound_file" > "${outbound_file}.tmp"
     fi
     if ! safe_apply_conf "$outbound_file" "${outbound_file}.tmp" "Socks5/HTTP出站(${tag})"; then
-        sleep 2; return
+        sleep 2; warp_manage; return
     fi
 
     if jq -e '.route.rules | length > 0' "$route_file" >/dev/null 2>&1; then
@@ -4701,29 +4717,29 @@ delete_socks5_proxy() {
     clear
     green "当前可用出站列表:"
     local out_list=$(jq -r '[.outbounds[] | select(.tag != "direct")] | to_entries | .[] | "\(.key+1). \(.value.tag) [\(.value.type)]"' "$outbound_file" 2>/dev/null)
-    [ -z "$out_list" ] && { yellow "没有可删除的出站。"; sleep 2; return; }
+    [ -z "$out_list" ] && { yellow "没有可删除的出站。"; sleep 2; warp_manage; return; }
     echo "$out_list"
 
     reading "输入要删除的出站编号或标签: " del_input
     if [[ "$del_input" =~ ^[0-9]+$ ]]; then
         tag=$(jq -r --arg idx "$del_input" '.outbounds | map(select(.tag != "direct")) | .[($idx | tonumber)-1].tag // empty' "$outbound_file")
-        [ -z "$tag" ] && { red "编号无效！"; sleep 1; return; }
+        [ -z "$tag" ] && { red "编号无效！"; sleep 1; warp_manage; return; }
     else
         tag="$del_input"
-        jq -e --arg tag "$tag" '.outbounds[] | select(.tag == $tag)' "$outbound_file" > /dev/null 2>&1 || { red "标签 '${tag}' 不存在！"; sleep 1; return; }
+        jq -e --arg tag "$tag" '.outbounds[] | select(.tag == $tag)' "$outbound_file" > /dev/null 2>&1 || { red "标签 '${tag}' 不存在！"; sleep 1; warp_manage; return; }
     fi
-    [ "$tag" == "wireguard-out" ] && { red "wireguard-out 为系统内置，不可删除！"; sleep 2; return; }
+    [ "$tag" == "wireguard-out" ] && { red "wireguard-out 为系统内置，不可删除！"; sleep 2; warp_manage; return; }
 
     jq --arg tag "$tag" 'del(.outbounds[] | select(.tag == $tag))' "$outbound_file" > "${outbound_file}.tmp"
     if ! safe_apply_conf "$outbound_file" "${outbound_file}.tmp" "删除出站(${tag})"; then
-        sleep 1; return
+        sleep 1; warp_manage; return
     fi
     jq --arg tag "$tag" '.route.rules = [.route.rules[] | select(.outbound != $tag)]' "$route_file" > "${route_file}.tmp"
     safe_apply_conf "$route_file" "${route_file}.tmp" "清理分流规则(${tag})" || true
 
     restart_singbox
     green "${tag} 代理出站已删除。"
-    sleep 1
+    sleep 1; warp_manage
 }
 
 # ============================================================
@@ -5022,6 +5038,209 @@ remove_ss2022() {
     remove_protocol "shadowsocks-2022" "ss" "Shadowsocks-2022"
 }
 
+# ============================================================
+# 直连四协议管理：VLESS-Reality / Hysteria2 / TUIC / AnyTLS
+# （与默认安装时的 tag、配置、链接格式保持一致；可在「跳过直连」安装后按需补装）
+# ============================================================
+
+# 按 kind 设置 tag / 显示名 / 传输层（结果放入 _dp_tag _dp_label _dp_net）
+_direct_proto_meta() {
+    case "$1" in
+        reality)   _dp_tag="vless-reality"; _dp_label="VLESS-Reality"; _dp_net="tcp" ;;
+        hysteria2) _dp_tag="hysteria2";     _dp_label="Hysteria2";     _dp_net="udp" ;;
+        tuic)      _dp_tag="tuic";          _dp_label="TUIC";          _dp_net="udp" ;;
+        anytls)    _dp_tag="anytls";        _dp_label="AnyTLS";        _dp_net="tcp" ;;
+        *) return 1 ;;
+    esac
+}
+
+# 从 url.txt 中删除指定直连协议的链接。
+# 注意 Reality 与 Argo 的 vless-ws、VLESS-WS 直连同为 vless://，必须靠 flow=xtls-rprx-vision 区分，
+# 不能像其它协议那样只按 scheme 删除，否则会误删 Argo 节点。
+_remove_direct_url() {
+    [ -f "$client_dir" ] || return 0
+    case "$1" in
+        reality)   sed -i -E '/^vless:\/\/.*flow=xtls-rprx-vision/d' "$client_dir" ;;
+        hysteria2) sed -i -E '/^hysteria2:\/\//d' "$client_dir" ;;
+        tuic)      sed -i -E '/^tuic:\/\//d' "$client_dir" ;;
+        anytls)    sed -i -E '/^anytls:\/\//d' "$client_dir" ;;
+    esac
+    sed -i '/^$/{N; /\n$/D}' "$client_dir"
+}
+
+add_direct_protocol() {
+    local kind="$1"
+    _direct_proto_meta "$kind" || { red "内部错误：未知协议 ${kind}"; return 1; }
+    local tag="$_dp_tag" label="$_dp_label" net="$_dp_net"
+    local inbounds_file="${conf_dir}/inbounds.json"
+
+    if proto_exists "$tag"; then
+        yellow "${label} 协议已存在，无需重复添加。"; sleep 1; return
+    fi
+
+    local uuid
+    uuid=$(get_current_uuid | tr -d '\n\r')
+    if [ -z "$uuid" ]; then
+        red "无法获取当前UUID，请确认 sing-box 已正确安装并配置。"; sleep 2; return
+    fi
+
+    # Hysteria2 / TUIC / AnyTLS 使用安装时生成的自签证书
+    if [ "$kind" != "reality" ] && { [ ! -f "${work_dir}/cert.pem" ] || [ ! -f "${work_dir}/private.key" ]; }; then
+        red "缺少证书文件 ${work_dir}/cert.pem / private.key，无法添加 ${label}"; sleep 2; return
+    fi
+
+    # Reality：优先复用已保存的密钥对（重新添加后公钥不变，客户端无需更新），没有则生成
+    local pub="" priv="" sni=""
+    if [ "$kind" = "reality" ]; then
+        if [ -f "${work_dir}/reality.keys" ]; then
+            pub=$(grep '^PUBLIC_KEY=' "${work_dir}/reality.keys" | head -1 | cut -d= -f2- | tr -d '\r')
+            priv=$(grep '^PRIVATE_KEY=' "${work_dir}/reality.keys" | head -1 | cut -d= -f2- | tr -d '\r')
+        fi
+        if [ -z "$pub" ] || [ -z "$priv" ]; then
+            local kp_out
+            kp_out=$("${work_dir}/sing-box" generate reality-keypair 2>&1)
+            priv=$(echo "$kp_out" | grep -i 'PrivateKey' | awk '{print $NF}' | tr -d '\r')
+            pub=$(echo "$kp_out" | grep -i 'PublicKey' | awk '{print $NF}' | tr -d '\r')
+            if [ -z "$pub" ] || [ -z "$priv" ]; then
+                red "Reality 密钥生成失败: ${kp_out}"; sleep 2; return
+            fi
+            { printf 'PUBLIC_KEY=%s\n' "$pub"; printf 'PRIVATE_KEY=%s\n' "$priv"; } > "${work_dir}/reality.keys"
+            chmod 600 "${work_dir}/reality.keys" 2>/dev/null || true
+            green "Reality 密钥已生成"
+        fi
+        reading "请输入 Reality 伪装域名 (回车默认 www.iij.ad.jp): " sni
+        [ -z "$sni" ] && sni="www.iij.ad.jp"
+        if ! [[ "$sni" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]]; then
+            red "域名格式无效"; sleep 1; return
+        fi
+    fi
+
+    local d_port
+    read_available_port "请输入 ${label} 监听端口 (回车随机生成): " d_port
+    green "${label} 监听端口：${purple}${d_port}${re}"
+
+    local cert="${work_dir}/cert.pem" key="${work_dir}/private.key"
+    local inbound_json
+    case "$kind" in
+        reality)
+            inbound_json=$(jq -n --arg tag "$tag" --argjson port "$d_port" --arg uid "$uuid" \
+                --arg sni "$sni" --arg priv "$priv" '{
+                type:"vless", tag:$tag, listen:"::", listen_port:$port,
+                users:[{uuid:$uid, flow:"xtls-rprx-vision"}],
+                tls:{enabled:true, server_name:$sni,
+                     reality:{enabled:true, handshake:{server:$sni, server_port:443},
+                              private_key:$priv, short_id:[""]}}}') ;;
+        hysteria2)
+            inbound_json=$(jq -n --arg tag "$tag" --argjson port "$d_port" --arg uid "$uuid" \
+                --arg cert "$cert" --arg key "$key" '{
+                type:"hysteria2", tag:$tag, listen:"::", listen_port:$port,
+                users:[{password:$uid}], ignore_client_bandwidth:false, masquerade:"https://bing.com",
+                tls:{enabled:true, alpn:["h3"], min_version:"1.3", max_version:"1.3",
+                     certificate_path:$cert, key_path:$key}}') ;;
+        tuic)
+            inbound_json=$(jq -n --arg tag "$tag" --argjson port "$d_port" --arg uid "$uuid" \
+                --arg cert "$cert" --arg key "$key" '{
+                type:"tuic", tag:$tag, listen:"::", listen_port:$port,
+                users:[{uuid:$uid, password:$uid}], congestion_control:"bbr",
+                tls:{enabled:true, alpn:["h3"], certificate_path:$cert, key_path:$key}}') ;;
+        anytls)
+            inbound_json=$(jq -n --arg tag "$tag" --argjson port "$d_port" --arg uid "$uuid" \
+                --arg cert "$cert" --arg key "$key" '{
+                type:"anytls", tag:$tag, listen:"::", listen_port:$port,
+                users:[{password:$uid}],
+                tls:{enabled:true, certificate_path:$cert, key_path:$key}}') ;;
+    esac
+    if [ -z "$inbound_json" ]; then
+        red "生成 ${label} 入站配置失败"; sleep 2; return
+    fi
+
+    jq --argjson ib "$inbound_json" '.inbounds += [$ib]' "$inbounds_file" > "${inbounds_file}.tmp"
+    if ! safe_apply_conf "$inbounds_file" "${inbounds_file}.tmp" "${label} 入站"; then
+        sleep 2; return
+    fi
+    allow_port ${d_port}/${net} > /dev/null 2>&1
+
+    local server_ip prefix fp url_line
+    server_ip=$(get_realip)
+    prefix=$(build_node_prefix "node")
+    fp=$(openssl x509 -noout -fingerprint -sha256 -in "$cert" 2>/dev/null | cut -d'=' -f2 | sed 's/:/%3A/g')
+    case "$kind" in
+        reality)
+            url_line="vless://${uuid}@${server_ip}:${d_port}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${sni}&fp=firefox&pbk=${pub}&type=tcp&headerType=none#${prefix}-vless-reality" ;;
+        hysteria2)
+            url_line="hysteria2://${uuid}@${server_ip}:${d_port}/?sni=www.bing.com&insecure=1&pinSHA256=${fp}&alpn=h3&obfs=none#${prefix}-hysteria2" ;;
+        tuic)
+            url_line="tuic://${uuid}:${uuid}@${server_ip}:${d_port}?sni=www.bing.com&congestion_control=bbr&udp_relay_mode=native&alpn=h3&allow_insecure=1#${prefix}-tuic" ;;
+        anytls)
+            url_line="anytls://${uuid}@${server_ip}:${d_port}?insecure=1&sni=bing.com#${prefix}-anytls" ;;
+    esac
+
+    _remove_direct_url "$kind"      # 清掉可能残留的旧链接，避免重复
+    publish_node_url "$url_line"
+
+    # 若安装时选择了「跳过直连」，补装后更新标记，避免后续逻辑仍按"无直连协议"处理
+    load_sub_conf
+    if [ "${SKIP_DIRECT:-0}" = "1" ]; then
+        SKIP_DIRECT=0; export SKIP_DIRECT
+        save_sub_conf
+    fi
+
+    green "\n${label} 协议已添加！"
+    green "端口: ${purple}${d_port}${re} (${net})"
+    [ "$kind" = "reality" ] && green "伪装域名: ${purple}${sni}${re}"
+    green "节点链接:\n${purple}${url_line}${re}\n"
+    case "$kind" in
+        hysteria2|tuic) yellow "提示：自签证书，客户端需开启「跳过证书验证」" ;;
+    esac
+}
+
+remove_direct_protocol() {
+    local kind="$1"
+    _direct_proto_meta "$kind" || { red "内部错误：未知协议 ${kind}"; return 1; }
+    local tag="$_dp_tag" label="$_dp_label"
+    local inbounds_file="${conf_dir}/inbounds.json"
+
+    if ! proto_exists "$tag"; then
+        yellow "${label} 协议未添加，无需删除。"; sleep 1; return
+    fi
+
+    # 已开启端口跳跃时，iptables DNAT 规则仍指向该端口，直接删除会留下失效规则
+    if [ "$kind" = "hysteria2" ] && grep -q 'hysteria2://.*mport=' "$client_dir" 2>/dev/null; then
+        red "检测到已开启 hysteria2 端口跳跃，直接删除会遗留失效的 iptables 规则"
+        yellow "请先在「修改节点配置 → 5. 删除hysteria2端口跳跃」关闭后再删除协议"
+        sleep 2; return
+    fi
+
+    jq --arg tag "$tag" 'del(.inbounds[] | select(.tag == $tag))' \
+        "$inbounds_file" > "${inbounds_file}.tmp"
+    if ! safe_apply_conf "$inbounds_file" "${inbounds_file}.tmp" "删除${label}"; then
+        sleep 1; return
+    fi
+
+    _remove_direct_url "$kind"
+    update_sub
+    restart_singbox
+    green "\n${label} 协议已删除\n"
+    [ "$kind" = "reality" ] && yellow "Reality 密钥已保留，重新添加后公钥不变"
+}
+
+# 显示直连四协议当前状态
+show_direct_proto_status() {
+    local inbounds_file="${conf_dir}/inbounds.json"
+    local kind port
+    echo ""
+    green "--- 直连协议状态 ---"
+    for kind in reality hysteria2 tuic anytls; do
+        _direct_proto_meta "$kind"
+        port=$(jq -r --arg tag "$_dp_tag" '.inbounds[] | select(.tag == $tag) | .listen_port // empty' "$inbounds_file" 2>/dev/null | head -1)
+        if [ -n "$port" ]; then
+            printf ' %-16s ' "${_dp_label}:"; echo -e "${green}已启用${re} (端口: ${skyblue}${port}${re}/${_dp_net})"
+        else
+            printf ' %-16s ' "${_dp_label}:"; echo -e "${yellow}未启用${re}"
+        fi
+    done
+}
+
 # 显示当前已启用的额外协议状态
 
 show_extra_proto_status() {
@@ -5066,11 +5285,12 @@ show_extra_proto_status() {
 manage_protocols() {
     check_singbox &>/dev/null
     if [ $? -eq 2 ]; then
-        yellow "sing-box 尚未安装！请先安装 sing-box。"; sleep 2; menu; return
+        yellow "sing-box 尚未安装！请先安装 sing-box。"; sleep 2; return
     fi
 
     clear; echo ""
     green "=== 协议管理 (增加/删除) ===\n"
+    show_direct_proto_status
     show_extra_proto_status
 
     green "--- Socks5 协议 ---"
@@ -5085,6 +5305,12 @@ manage_protocols() {
     green "5. 添加 Shadowsocks-2022 协议"
     red   "6. 删除 Shadowsocks-2022 协议"
     skyblue "----------------"
+    green "--- 直连协议（默认安装的四个协议）---"
+    green "7.  添加 VLESS-Reality    8.  删除 VLESS-Reality"
+    green "9.  添加 Hysteria2        10. 删除 Hysteria2"
+    green "11. 添加 TUIC             12. 删除 TUIC"
+    green "13. 添加 AnyTLS           14. 删除 AnyTLS"
+    skyblue "----------------"
     purple "0. 返回主菜单"
     skyblue "----------------"
     reading "请输入选择: " proto_choice
@@ -5096,7 +5322,15 @@ manage_protocols() {
         4) remove_vless_ws_direct ;;
         5) add_ss2022 ;;
         6) remove_ss2022 ;;
-        0) menu; return ;;
+        7)  add_direct_protocol reality ;;
+        8)  remove_direct_protocol reality ;;
+        9)  add_direct_protocol hysteria2 ;;
+        10) remove_direct_protocol hysteria2 ;;
+        11) add_direct_protocol tuic ;;
+        12) remove_direct_protocol tuic ;;
+        13) add_direct_protocol anytls ;;
+        14) remove_direct_protocol anytls ;;
+        0) return ;;
         *) red "无效的选项！" ;;
     esac
     read -n 1 -s -r -p $'\n\033[1;91m按任意键返回协议管理菜单...\033[0m\n'
