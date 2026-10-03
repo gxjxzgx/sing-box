@@ -1,6 +1,6 @@
 #!/bin/sh
-# VPN Gate (OpenVPN) -> SOCKS5，Alpine + OpenRC 版
-# 用法: sh vpngate-socks5-alpine.sh /root/vpngate.ovpn
+# VPN Gate (OpenVPN) -> SOCKS5，Alpine + OpenRC + dante-server 版（省内存省磁盘）
+# 用法: sh vpngate.sh [/path/to/vpngate.ovpn]   不带参数则自动下载 VPN Gate 节点
 
 set -e
 
@@ -10,7 +10,13 @@ SOCKS_USER="${SOCKS_USER:-zhoo}"
 SOCKS_PASS="${SOCKS_PASS:-$(head -c 8 /dev/urandom | od -An -tx1 | tr -d ' \n')}"
 DIR=/etc/vpngate
 
-# 没给 .ovpn 参数就自动从 VPN Gate 下载（默认选日本评分最高的节点）
+[ -c /dev/net/tun ] || { echo "/dev/net/tun 不存在：容器没开 TUN，需要联系服务商开启"; exit 1; }
+
+# 0. 清理上次编译失败残留的包，释放磁盘
+apk del git build-base binutils jansson 2>/dev/null || true
+rm -rf /tmp/microsocks
+
+# 1. 自动下载 .ovpn（没给参数时，默认日本评分最高的节点）
 if [ -z "$OVPN_SRC" ]; then
   COUNTRY="${COUNTRY:-JP}"
   OVPN_SRC=/root/vpngate.ovpn
@@ -21,18 +27,11 @@ if [ -z "$OVPN_SRC" ]; then
     | awk -F, '{print $15}' | base64 -d > "$OVPN_SRC" || true
 fi
 [ -s "$OVPN_SRC" ] || { echo "没有可用的 .ovpn 文件: $OVPN_SRC"; exit 1; }
-[ -c /dev/net/tun ] || { echo "/dev/net/tun 不存在：容器没开 TUN，需要联系服务商开启"; exit 1; }
 
-# 1. 安装依赖
-apk add --no-cache openvpn iproute2
-if ! apk add --no-cache microsocks; then
-  apk add --no-cache git build-base
-  git clone https://github.com/rofl0r/microsocks /tmp/microsocks
-  make -C /tmp/microsocks
-  install -m 755 /tmp/microsocks/microsocks /usr/local/bin/microsocks
-fi
+# 2. 安装依赖
+apk add --no-cache openvpn iproute2 dante-server
 
-# 2. 配置（去掉 redirect-gateway，不接管默认路由）
+# 3. 配置（去掉 redirect-gateway，不接管默认路由）
 mkdir -p $DIR
 grep -v '^redirect-gateway' "$OVPN_SRC" > $DIR/vpngate.ovpn
 echo "route-nopull" >> $DIR/vpngate.ovpn
@@ -44,15 +43,19 @@ SOCKS_PASS=${SOCKS_PASS}
 EOF
 chmod 600 $DIR/socks.env
 
-# 3. 策略路由：只有来自 tun 地址的流量走 VPN
+# dante 的用户名密码认证用系统账号（无登录权限）
+adduser -D -H -s /sbin/nologin "$SOCKS_USER" 2>/dev/null || true
+echo "${SOCKS_USER}:${SOCKS_PASS}" | chpasswd
+
+# 4. 策略路由：只有来自 tun 地址的流量走 VPN
 cat > $DIR/up.sh <<'EOF'
 #!/bin/sh
 DEV="$1"; LOCAL="$4"
 ip rule del from "$LOCAL" table 100 2>/dev/null || true
 ip rule add from "$LOCAL" table 100
 ip route replace default dev "$DEV" table 100
-# 重连后 tun 地址可能变化，杀掉 microsocks 让它重新绑定
-pkill -x microsocks 2>/dev/null || true
+# 重连后 tun 地址可能变化，杀掉 sockd 让它重新启动
+pkill -x sockd 2>/dev/null || true
 EOF
 
 cat > $DIR/down.sh <<'EOF'
@@ -65,18 +68,27 @@ EOF
 cat > $DIR/socks.sh <<'EOF'
 #!/bin/sh
 . /etc/vpngate/socks.env
-TUNIP=""
 for i in $(seq 1 60); do
-  TUNIP=$(ip -4 -o addr show tun0 2>/dev/null | awk '{print $4}' | cut -d/ -f1)
-  [ -n "$TUNIP" ] && break
+  ip -4 -o addr show tun0 2>/dev/null | grep -q inet && break
   sleep 1
 done
-[ -z "$TUNIP" ] && { echo "tun0 未就绪"; exit 1; }
-exec microsocks -i 0.0.0.0 -p "$SOCKS_PORT" -b "$TUNIP" -u "$SOCKS_USER" -P "$SOCKS_PASS"
+ip -4 -o addr show tun0 2>/dev/null | grep -q inet || { echo "tun0 未就绪"; exit 1; }
+cat > /etc/vpngate/sockd.conf <<CONF
+logoutput: stderr
+internal: 0.0.0.0 port = ${SOCKS_PORT}
+external: tun0
+clientmethod: none
+socksmethod: username
+user.privileged: root
+user.unprivileged: nobody
+client pass { from: 0.0.0.0/0 to: 0.0.0.0/0 }
+socks pass { from: 0.0.0.0/0 to: 0.0.0.0/0 command: connect }
+CONF
+exec sockd -f /etc/vpngate/sockd.conf
 EOF
 chmod +x $DIR/*.sh
 
-# 4. OpenRC 服务（supervise-daemon 自动重启）
+# 5. OpenRC 服务（supervise-daemon 自动重启）
 cat > /etc/init.d/vpngate-ovpn <<'EOF'
 #!/sbin/openrc-run
 description="VPN Gate OpenVPN client"
